@@ -173,7 +173,45 @@ class Events(EventCase):
         self.flaps()
         out = self.report(view="events", window="24h", filter={"port": "5", "by": "port"})
         self.assertEqual(sorted(self.ids(out, "port_id")), [5, 30])
-        self.assertTrue(any("of port_id 5 and of the ports named '5'" in note for note in out["notes"]))
+        self.assertTrue(any("of port_id 5 and of the ports named '5'" in note and "filter.port_id 5" in note
+                            for note in out["notes"]))  # fmt: skip
+
+    def test_one_port_by_its_port_id_alone(self):
+        # access-sw2 also has a port named 9 (port_id 31), which filter.port 9 takes first there; filter.port_id 9 is
+        # its Gi1/0/48, the port the id names, and nothing else
+        port = {"port_id": 31, "device_id": 3, "ifIndex": 9, "ifName": "9", "ifDescr": "9", "ifAlias": ""}
+        self.fake.seed("ports", {**port, "ifOperStatus": "down", "ifAdminStatus": "up"})
+        for port_id, when in ((31, "2026-10-28 11:40:00"), (9, "2026-10-28 11:20:00"), (9, "2026-10-28 11:25:00")):
+            self.event(device_id=3, datetime=when, message="ifOperStatus: up -> down", type="interface",
+                       reference=port_id, severity=3)  # fmt: skip
+        sw2 = {"device": "access-sw2"}
+        by_name = self.report(view="events", window="24h", scope=sw2, filter={"port": 9})
+        self.assertEqual(self.ids(by_name, "port_id"), [31])
+        self.assertIn("filter.port 9 kept the entries of the port named 9 on the device in scope, not those of "
+                      "port_id 9, which logged changes too: give filter.port_id 9 for that port",
+                      [note.replace("'", "") for note in by_name["notes"]])  # fmt: skip
+        for wanted in (9, "9"):
+            out = self.report(view="events", window="24h", scope=sw2, filter={"port_id": wanted})
+            self.assertEqual(self.ids(out, "port_id"), [9, 9], wanted)
+            self.assertEqual(out["rows"][0]["port"], "Gi1/0/48 (to core-sw1)")
+            self.assertFalse(any("filter.port" in note for note in out["notes"]), wanted)
+        self.assertEqual(self.ids(self.report(view="events", window="24h", filter={"port_id": 31}), "port_id"), [31])
+        per_port = self.report(view="events", window="24h", scope=sw2, filter={"port_id": 9, "by": "port"})
+        self.assertEqual([(row["port_id"], row["went_down"]) for row in per_port["rows"]], [(9, 2)])
+        # over the last 30 minutes port_id 9 logged nothing, so the port named 9 is all there is: no note
+        out = self.report(view="events", window="30m", scope=sw2, filter={"port": 9})
+        self.assertEqual(self.ids(out, "port_id"), [31])
+        self.assertFalse(any("filter.port_id" in note for note in out["notes"]))
+        # another device's port_id logged nothing in this scope
+        out = self.report(view="events", window="24h", scope=sw2, filter={"port_id": 2})
+        self.assertEqual(out["count"], 0)
+        self.assertTrue(any(note.startswith("no entry about port_id 2 passed the filter") for note in out["notes"]))
+        for bad in (0, -9, "Gi1/0/48", 9.5, True, None, [9]):
+            out = self.report(view="events", window="24h", filter={"port_id": bad})
+            self.assertIn("filter.port_id takes a row's port_id, a whole number", out["error"], bad)
+        out = self.report(view="events", window="24h", filter={"log": "syslog", "port_id": 9})
+        self.assertIn("filter.port_id is for filter.log eventlog, not syslog", out["error"])
+        self.assertIn("port_id", self.report(view="help", topic="events")["filters"])
 
     def test_per_device(self):
         self.flaps()

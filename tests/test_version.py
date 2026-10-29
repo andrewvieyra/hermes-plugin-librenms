@@ -1,5 +1,5 @@
 """Consistency of what ships beside the code: one version everywhere, a manifest that declares every tool, hook and
-setting the code registers or reads (as Hermes' validate checks), README and SKILL documenting all of them, the
+setting the code registers or reads (as Hermes' validate checks), README and the two skills documenting them, the
 schema budget, the requests floor, and examples that still plan."""
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import unicodedata
 import unittest
 from typing import Any, Dict, List
 
@@ -36,6 +37,24 @@ UNTRUSTED_SOURCES = (
     "notes",
     "autodiscovery",
 )
+
+# The bundled skills: name -> SKILL.md (the workflow's at the root, where earlier releases had it).
+SKILLS = {"workflow": REPO_ROOT / "SKILL.md", "ask": REPO_ROOT / "skills" / "ask" / "SKILL.md"}
+# What Hermes' skill_view logs as possible prompt injection in a plugin skill (tools/skills_tool_plugin.py), and what
+# its SKILL.md preprocessing would run or substitute (agent/skill_preprocessing.py): an inline shell snippet, a
+# template token. A skill holds none of them.
+HERMES_INJECTION_PATTERNS = (
+    "ignore previous instructions",
+    "ignore all previous",
+    "you are now",
+    "disregard your",
+    "forget your instructions",
+    "new instructions:",
+    "system prompt:",
+    "<system>",
+    "]]>",
+)
+HERMES_EXPANDS = ("!`", "${HERMES_")
 
 _LINE = re.compile(r"(?P<indent> *)(?P<dash>- )?(?:(?P<key>[A-Za-z_]\w*):(?: (?P<value>.+))?|(?P<item>.+))")
 
@@ -148,9 +167,9 @@ class VersionConsistency(unittest.TestCase):
         version = submodule("version").__version__
         self.assertEqual(manifest()["version"], version, "plugin.yaml")
         self.assertRegex(project_table(), rf'(?m)^version = "{re.escape(version)}"$', "pyproject.toml [project]")
-        skill = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        frontmatter = skill.split("---\n")[1]
-        self.assertRegex(frontmatter, rf"(?m)^version: {re.escape(version)}$", "SKILL.md")
+        for name, path in SKILLS.items():
+            frontmatter = path.read_text(encoding="utf-8").split("---\n")[1]
+            self.assertRegex(frontmatter, rf"(?m)^version: {re.escape(version)}$", name)
         changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertRegex(changelog, rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", "CHANGELOG.md")
 
@@ -227,7 +246,7 @@ class Registration(PluginTestCase):
         self.assertEqual(sorted(ctx.hooks), sorted(data["provides_hooks"]))
         self.assertEqual(ctx.commands, ["librenms"])
         self.assertEqual(ctx.cli_commands, ["librenms"])
-        self.assertEqual(ctx.skills, ["workflow"])
+        self.assertEqual(ctx.skills, list(SKILLS))
 
     def test_every_hook_callback_takes_keyword_arguments_it_does_not_know(self):
         # Hermes passes hooks more keywords over time; `hermes plugins doctor` fails a callback without **kwargs
@@ -239,13 +258,16 @@ class Registration(PluginTestCase):
 class Documentation(unittest.TestCase):
     def setUp(self):
         self.readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.skill = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.skills = {name: path.read_text(encoding="utf-8") for name, path in SKILLS.items()}
+        self.skill = self.skills["workflow"]
 
     def test_readme_and_skill_document_every_tool(self):
         for schema in submodule("schemas").ALL:
             name = schema["name"]
             self.assertIn(f"| `{name}` |", self.readme, name)  # the README's tool table
             self.assertIn(f"| `{name}` |", self.skill, name)  # the model's own tool table
+        for name in ("librenms_report", "librenms_query"):  # the question skill's: the read tools
+            self.assertIn(f"| `{name}` |", self.skills["ask"], name)
 
     def test_readme_and_skill_document_every_setting(self):
         for name in settings_defaults():
@@ -260,33 +282,62 @@ class Documentation(unittest.TestCase):
         }
         self.assertEqual(shown, settings_defaults())
 
-    def test_the_skill_names_the_untrusted_sources(self):
-        text = section(self.skill, "Untrusted content")
-        for source in UNTRUSTED_SOURCES:
-            self.assertIn(source, text, source)
+    def test_the_skills_name_the_untrusted_sources(self):
+        for name, skill in self.skills.items():
+            text = section(skill, "Untrusted content")
+            for source in UNTRUSTED_SOURCES:
+                self.assertIn(source, text, f"{name}: {source}")
 
     def test_the_skill_frontmatter_names_and_describes_it(self):
-        frontmatter = self.skill.split("---\n")[1]
-        self.assertRegex(frontmatter, r"(?m)^name: librenms-workflow$")
-        self.assertRegex(frontmatter, r"(?m)^description: \S.{40,}$")
-        # Hermes checks these against the tools the model sees directly; under its tool search the librenms tools
-        # are deferred, and the skill would be hidden where it is needed
-        self.assertNotRegex(frontmatter, r"requires_tool|fallback_for")
+        for name, skill in self.skills.items():
+            frontmatter = skill.split("---\n")[1]
+            self.assertRegex(frontmatter, rf"(?m)^name: librenms-{name}$")
+            self.assertRegex(frontmatter, r"(?m)^description: \S.{40,}$")
+            # Hermes checks these against the tools the model sees directly; under its tool search the librenms tools
+            # are deferred, and the skill would be hidden where it is needed
+            self.assertNotRegex(frontmatter, r"requires_tool|fallback_for")
 
-    def test_the_skill_says_how_to_reach_deferred_tools(self):
-        self.assertIn("`tool_describe`", self.skill)
+    def test_each_skill_says_when_to_load_the_other(self):
+        workflow, ask = (" ".join(skill.split("---\n")[1].split()) for skill in self.skills.values())
+        self.assertIn("for questions that change nothing, load librenms:ask", workflow)
+        self.assertIn("load `librenms:workflow`", self.skills["ask"])
+        self.assertIn("Load when the user asks", ask)
+
+    def test_the_skills_hold_nothing_hermes_reads_as_injection_or_runs(self):
+        for name, skill in self.skills.items():
+            for pattern in HERMES_INJECTION_PATTERNS:
+                self.assertNotIn(pattern, skill.lower(), name)
+            for token in HERMES_EXPANDS:
+                self.assertNotIn(token, skill, name)
+            # the escapes it quotes (‮) as text: never the character, which would not show where people read it
+            hidden = [f"U+{ord(c):04X}" for c in skill if unicodedata.category(c) in ("Cf", "Cc") and c not in "\n\t"]
+            self.assertEqual(hidden, [], name)
+
+    def test_the_skills_say_how_to_reach_deferred_tools(self):
+        for name, skill in self.skills.items():
+            self.assertIn("`tool_describe`", skill, name)
+            example = re.search(r'`(\{"calls": \[.*?\]\})`', skill).group(1)
+            [call] = json.loads(example)["calls"]
+            self.assertIn(call["name"], [schema["name"] for schema in submodule("schemas").ALL])
         self.assertIn('`{"calls": [{"name": "librenms_query", "arguments": {"action": "status"}}]}`', self.skill)
 
-    def test_the_skill_names_both_reasons_the_tools_can_be_missing(self):
-        # offered whenever the plugin is enabled, the skill also reaches sessions where the librenms toolset is off
-        # for the platform or task: there, telling the user to set variables that are already set sends them wrong
-        paragraph = re.search(r"(?ms)^If no `librenms_\*` tool is in your tool list.*?(?=\n\n)", self.skill).group(0)
-        paragraph = " ".join(paragraph.split())  # line breaks fall anywhere
-        missing = paragraph[paragraph.index("Treat them as missing only") :]
-        self.assertIn("`tool_search`", missing)  # a catalog listed in groups, or not at all, names no tool
-        for cause in ("`LIBRENMS_URL`", "`LIBRENMS_TOKEN`", "`librenms` toolset", "`hermes tools`"):
-            self.assertIn(cause, missing)
-        self.assertIn("Tell the user both", missing)
+    def test_the_skills_name_both_reasons_the_tools_can_be_missing(self):
+        # offered whenever the plugin is enabled, a skill also reaches sessions where the librenms toolset is off for
+        # the platform or task: there, telling the user to set variables that are already set sends them wrong
+        for name, skill in self.skills.items():
+            paragraph = re.search(r"(?ms)^If no `librenms_\*` tool is in your tool list.*?(?=\n\n)", skill).group(0)
+            paragraph = " ".join(paragraph.split())  # line breaks fall anywhere
+            missing = paragraph[paragraph.index("Treat them as missing only") :]
+            self.assertIn("`tool_search`", missing, name)  # a catalog listed in groups, or not at all, names no tool
+            for cause in ("`LIBRENMS_URL`", "`LIBRENMS_TOKEN`", "`librenms` toolset", "`hermes tools`"):
+                self.assertIn(cause, missing, name)
+            self.assertIn("Tell the user both", missing, name)
+
+    def test_the_readme_shows_asking_questions(self):
+        text = section(self.readme, "Asking questions")
+        for word in ("`librenms:ask`", "/librenms:ask", "examples/conversations/"):
+            self.assertIn(word, text)
+        self.assertGreaterEqual(text.count("you    >"), 4)  # dialogues, with follow-ups
 
 
 # Hermes' rule for a deferred tool's catalog line (tools/tool_search_catalog.py, _short_desc): the description's
@@ -340,9 +391,10 @@ class Examples(PluginTestCase):
                 self.assertGreater(summary["create"] + summary["update"] + summary["delete"] + summary["action"], 0)
 
     def test_the_examples_readme_lists_every_example(self):
-        readme = (REPO_ROOT / "examples" / "README.md").read_text(encoding="utf-8")
-        for path in (REPO_ROOT / "examples").glob("*.json"):
-            self.assertIn(f"`{path.name}`", readme)
+        examples = REPO_ROOT / "examples"
+        readme = (examples / "README.md").read_text(encoding="utf-8")
+        for path in examples.glob("**/*.json"):  # plans, and the conversations tests/test_conversation.py runs
+            self.assertIn(f"`{path.relative_to(examples).as_posix()}`", readme)
 
 
 def _restore_env(name: str, value: str | None) -> None:

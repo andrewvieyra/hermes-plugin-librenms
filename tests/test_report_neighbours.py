@@ -663,6 +663,29 @@ class OperatorQuestions(NeighbourCase):
         [row] = out["rows"]
         self.assertEqual((row["remote_device"]["hostname"], row["remote_port"]), ("core-sw1.example.net", "Gi1/0/2"))
 
+    def test_what_is_connected_to_a_port_by_its_port_id(self):  # 43, a follow-up holding the port_id
+        # access-sw2 also names a port 9, as HP and Aruba switches do: filter.port 9 is both that port and port_id 9
+        # (Gi1/0/48), and says so; filter.port_id 9 is Gi1/0/48 alone
+        printer = self.seed_port(device_id=3, ifIndex=9, ifName="9", ifDescr="9", ifAlias="printer")
+        self.seed_link(local_device_id=3, local_port_id=printer["port_id"], remote_hostname="printer-7",
+                       remote_port="eth0")  # fmt: skip
+        both = self.report(view="neighbours", scope={"device": 3}, filter={"port": 9})
+        self.assertEqual([(row["port_id"], row["remote_hostname"]) for row in both["rows"]],
+                         [(printer["port_id"], "printer-7"), (9, "core-sw1.example.net")])  # fmt: skip
+        self.assertIn("filter.port '9' kept the links of port_id 9 and of the ports named '9': give filter.port_id 9 "
+                      "for the port with that id alone", both["notes"])  # fmt: skip
+        for scope in ({"device": 3}, None):
+            out = self.report(view="neighbours", scope=scope, filter={"port_id": 9})
+            [row] = out["rows"]
+            self.assertEqual((row["port"], row["remote_hostname"], row["remote_port_id"]),
+                             ("Gi1/0/48 (to core-sw1)", "core-sw1.example.net", 2))  # fmt: skip
+            self.assertEqual(out["notes"], [])
+        named = self.report(view="neighbours", scope={"device": 3}, filter={"port": "Gi1/0/48"})
+        self.assertFalse(any("filter.port_id" in note for note in named["notes"]))
+        self.assertEqual(self.report(view="neighbours", filter={"port_id": 4})["count"], 0)  # a port with no link
+        self.assertIn("filter.port_id takes a row's port_id, a whole number (got 'Gi1/0/48')",
+                      self.report(view="neighbours", filter={"port_id": "Gi1/0/48"})["error"])  # fmt: skip
+
     def test_where_is_a_mac(self):  # 44
         access = self.seed_port(device_id=3, ifIndex=5, ifName="Gi1/0/5", ifVlan="10")
         self.fake.touch("ports_fdb", 1, port_id=access["port_id"])

@@ -1,0 +1,47 @@
+{
+  "title": "Which switch? Its busiest port, why there is no history, the other switch, and a long list read on",
+  "turns": [
+    {
+      "user": "How busy is the switch?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "find", "term": "switch"}}
+      ],
+      "answer": "LibreNMS has two switches: `core-sw1.example.net` in `SFO-1` and `access-sw2.example.net` in `NYC-2`. Which one do you mean?"
+    },
+    {
+      "user": "The core one.",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "ports", "scope": {"device": 1}, "sort": "util", "limit": 3}}
+      ],
+      "answer": "On `core-sw1.example.net` the busiest port is `Gi1/0/1 (uplink to edge-rtr1)`: `800 Mbit/s` out of `1G`, `80.0` %, and `100 Mbit/s` in, averaged over the poll at `2026-10-28T11:55:00Z`. `Gi1/0/2` is idle."
+    },
+    {
+      "user": "Was it that busy last week too?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "bills", "scope": {"device": 1}}}
+      ],
+      "answer": "I cannot tell from LibreNMS's API: it keeps a port's last poll, not its history, and no bill covers core-sw1's ports (`0` bills), so there is no 95th percentile either. Its traffic graphs in LibreNMS show last week."
+    },
+    {
+      "user": "And the access switch?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "ports", "scope": {"device": 3}, "sort": "util", "limit": 3}}
+      ],
+      "answer": "`access-sw2.example.net` is quiet: its busiest port, `Gi1/0/5 (desk 5)`, sends `10 Mbit/s`, `1.0` % of `1G`, and its uplink `Gi1/0/48 (to core-sw1)` carries `10 Mbit/s` in and `2 Mbit/s` out."
+    },
+    {
+      "user": "List every port in the network, three at a time.",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "ports", "sort": "name", "limit": 3}}
+      ],
+      "answer": "There are `6`. The first three: `Gi1/0/5 (desk 5)` and `Gi1/0/48 (to core-sw1)` on access-sw2, and `Gi1/0/1 (uplink to edge-rtr1)` on core-sw1, all up. Three more follow."
+    },
+    {
+      "user": "Next.",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "ports", "sort": "name", "limit": 3, "offset": 3}}
+      ],
+      "answer": "`Gi1/0/2` on core-sw1, up, and on edge-rtr1 `Gi0/0/0 (WAN: transit-a)` and `Gi0/0/1 (WAN: transit-b)`, both down. That is all six."
+    }
+  ]
+}

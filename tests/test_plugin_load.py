@@ -19,6 +19,7 @@ from .helpers import load_plugin, submodule
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ("librenms_query", "librenms_report", "librenms_plan", "librenms_apply", "librenms_rollback", "librenms_plans")
 HOOKS = ("pre_tool_call", "pre_llm_call", "post_approval_response")
+SKILLS = {"workflow": REPO_ROOT / "SKILL.md", "ask": REPO_ROOT / "skills" / "ask" / "SKILL.md"}
 ENV = {"LIBRENMS_URL": "https://librenms.test", "LIBRENMS_TOKEN": "0123456789abcdef"}
 
 
@@ -89,8 +90,8 @@ class RegisterWithAFakeContext(PluginTestCase):
         self.plugin._PLUGIN_DIR = path
         self.addCleanup(setattr, self.plugin, "_PLUGIN_DIR", original)
 
-    def test_every_tool_hook_command_cli_and_the_skill_are_registered(self):
-        self.plugin_dir(REPO_ROOT)  # the checkout's SKILL.md, also after the real-loader test removed its copy
+    def test_every_tool_hook_command_cli_and_both_skills_are_registered(self):
+        self.plugin_dir(REPO_ROOT)  # the checkout's skills, also after the real-loader test removed its copy
         ctx = self.register(FakeContext())
         schemas = submodule("schemas")
         self.assertEqual(tuple(ctx.tools), TOOLS)
@@ -115,11 +116,15 @@ class RegisterWithAFakeContext(PluginTestCase):
         self.assertEqual(cli["name"], "librenms")
         self.assertIs(cli["setup_fn"], self.commands.setup_cli)
         self.assertIs(cli["handler_fn"], self.commands.cli_handler)
-        [(name, path, options)] = ctx.skills
-        self.assertEqual((name, path), ("workflow", REPO_ROOT / "SKILL.md"))
-        # no requires_toolsets: under Hermes' tool search the tools are deferred and such a gate hid the skill
-        self.assertEqual(options.get("frontmatter") or {}, {})
-        self.assertIn("ports", options["description"])
+        self.assertEqual([(name, path) for name, path, _options in ctx.skills], list(SKILLS.items()))
+        for name, _path, options in ctx.skills:
+            # no requires_toolsets: under Hermes' tool search the tools are deferred and such a gate hid the skill
+            self.assertEqual(options.get("frontmatter") or {}, {}, name)
+        # what Hermes lists in <available_skills>: when to load each
+        workflow, ask = (options["description"] for _name, _path, options in ctx.skills)
+        self.assertIn("changes", workflow)
+        for subject in ("questions", "down", "ports", "utilisation", "link speeds", "MAC", "alerts", "follow-ups"):
+            self.assertIn(subject, ask)
         self.assertEqual((self.clients, self.fake.calls), ([], []))  # registration makes no client, so no I/O
 
     def test_schemas_fit_the_budget(self):
@@ -192,6 +197,17 @@ class RegisterWithAFakeContext(PluginTestCase):
         # without pre_tool_call nothing would ask before apply or rollback; better no plugin than that
         with self.assertRaises(AttributeError):
             self.register(FakeContext(hookless=True))
+
+    def test_a_skill_hermes_refuses_leaves_the_other(self):
+        class Refusing(FakeContext):
+            def register_skill(self, name, path, **kwargs):
+                if name == "workflow":
+                    raise ValueError("Plugin skill 'librenms:workflow' is already registered")
+                super().register_skill(name, path, **kwargs)
+
+        self.plugin_dir(REPO_ROOT)
+        ctx = self.register(Refusing())
+        self.assertEqual([name for name, _path, _options in ctx.skills], ["ask"])
 
     def test_without_skill_md_no_skill_is_registered(self):
         with tempfile.TemporaryDirectory() as empty:
@@ -278,9 +294,10 @@ class LoadThroughPluginManager(unittest.TestCase):
         for name in TOOLS:
             self.assertIsNotNone(registry.get_schema(name), name)
             self.assertEqual(registry.get_toolset_for_tool(name), "librenms")
-        self.assertIsNotNone(mgr.find_plugin_skill("librenms:workflow"))
-        [skill] = [s for s in mgr.list_plugin_skill_metadata() if s["name"] == "librenms:workflow"]
-        self.assertEqual(skill["frontmatter"], {})
+        for name in SKILLS:
+            self.assertIsNotNone(mgr.find_plugin_skill(f"librenms:{name}"), name)
+            [skill] = [s for s in mgr.list_plugin_skill_metadata() if s["name"] == f"librenms:{name}"]
+            self.assertEqual(skill["frontmatter"], {})
 
         # settings flowed from config.yaml into the plugin, and the bad one fell back
         mod = sys.modules["hermes_plugins.librenms"]
@@ -351,6 +368,36 @@ class LoadThroughPluginManager(unittest.TestCase):
         self.assertEqual(directive["action"], "approve")
         self.assertIn(f"librenms:librenms_apply:{plan_id}:", directive["rule_key"])
         self.assertEqual(fake.writes(), [])
+
+    def test_the_second_skill_is_offered_viewed_and_invoked_like_the_first(self):
+        # the question skill reaches the model as the workflow does: a line in <available_skills>, skill_view by its
+        # qualified name (with Hermes' banner naming its sibling), and a /librenms:ask slash command. (Named to run
+        # after test_registration_through_real_loader: the first manager in a process to load the plugin imports
+        # it as hermes_plugins.librenms, the name that test reads its logs and module by.)
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        self.discovered = True
+        self.mgr = get_plugin_manager()
+        from agent import prompt_builder
+        from agent.skill_commands import get_plugin_skill_commands
+        from tools.skills_tool import skill_view
+
+        index = prompt_builder.build_skills_system_prompt(available_tools=set(), available_toolsets=set())
+        for name in SKILLS:
+            self.assertIn(f"librenms:{name}", index)
+        self.assertIn("Answer questions about the network from LibreNMS", index)
+        with self.assertNoLogs("tools.skills_tool", "WARNING"):  # Hermes warns of a skill that reads like injection
+            views = {name: json.loads(skill_view(f"librenms:{name}")) for name in SKILLS}
+        for name, other in (("workflow", "ask"), ("ask", "workflow")):
+            view = views[name]
+            self.assertTrue(view["success"], view)
+            self.assertIn(f"Sibling skills: {other}.", view["content"])
+            self.assertIn(f"`librenms:{other}`", view["content"])  # and the skill itself says when to load it
+        self.assertIn("## Questions and the call that answers them", views["ask"]["content"])
+        self.assertTrue(views["ask"]["description"].startswith("Answer questions about the network"))
+        command = get_plugin_skill_commands()["/librenms:ask"]
+        self.assertEqual(Path(command["skill_md_path"]).parts[-3:], ("skills", "ask", "SKILL.md"))
 
     def test_report_times_use_the_zone_hermes_uses(self):
         # timefmt rebuilds hermes_time.get_timezone from public modules; both must name the same zone

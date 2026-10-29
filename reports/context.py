@@ -157,10 +157,11 @@ LOGS = {
 @dataclass(frozen=True)
 class View:
     """A report view: its builder and the arguments it takes. ``filters`` maps each filter name to its kind
-    (``bool``, ``duration``, ``number``, ``text``, or a tuple of the values a ``choice`` takes, one or a list of
-    them; :class:`One` for a choice of one alone); ``sorts`` lists the orders, the default first; ``term`` says
-    whether it takes a term (:data:`TERM_VIEWS`); ``window`` is the window a view that takes one reads by default
-    (:data:`WINDOW_VIEWS`). View ``help`` (:mod:`.help`) says what each filter and sort means."""
+    (``bool``, ``duration``, ``number``, ``id`` (a whole number, 1 or more), ``text``, or a tuple of the values a
+    ``choice`` takes, one or a list of them; :class:`One` for a choice of one alone); ``sorts`` lists the orders, the
+    default first; ``term`` says whether it takes a term (:data:`TERM_VIEWS`); ``window`` is the window a view that
+    takes one reads by default (:data:`WINDOW_VIEWS`). View ``help`` (:mod:`.help`) says what each filter and sort
+    means."""
 
     name: str
     build: Callable[[ReportContext, Request], Dict[str, Any]]
@@ -356,7 +357,7 @@ def number_arg(what: str, value: Any) -> float:
 
 
 def filters(view: View, raw: Any) -> Dict[str, Any]:
-    """The ``filter`` argument as typed values: a flag, a duration in seconds, a number, a text, or the set of
+    """The ``filter`` argument as typed values: a flag, a duration in seconds, a number, an id, a text, or the set of
     choices (any letter case; held as the view spells them)."""
     if raw is None or raw == {}:
         return {}
@@ -381,6 +382,11 @@ def filters(view: View, raw: Any) -> Dict[str, Any]:
                 raise ArgumentError(f"filter.{key} takes a duration such as 30m, 24h or 7d (at most a year)")
         elif kind == "number":
             out[key] = number_arg(f"filter.{key}", value)
+        elif kind == "id":
+            text = str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+            if not is_digits(text) or not int(text):
+                raise ArgumentError(f"filter.{key} takes a row's {key}, a whole number (got {_shown(value)})")
+            out[key] = int(text)
         elif kind == "text":
             out[key] = term_arg(f"filter.{key}", value)
         else:

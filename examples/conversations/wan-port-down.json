@@ -1,0 +1,47 @@
+{
+  "title": "A WAN port is down: which, is it alerting, what is on the other end, since when, and its bill",
+  "turns": [
+    {
+      "user": "Which ports on edge-rtr1 are down?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "ports", "scope": {"device": "edge-rtr1"}, "filter": {"state": ["down", "lowerLayerDown", "notPresent"]}}}
+      ],
+      "answer": "Both WAN ports of `edge-rtr1.example.net`: `Gi0/0/0 (WAN: transit-a)` has been down for `2h 5m`, and `Gi0/0/1 (WAN: transit-b)` for `over 50d 0h`, since the router booted. Both are administratively up, so LibreNMS counts them as down. That is as of `2026-10-28T12:00:00Z`."
+    },
+    {
+      "user": "Is anything alerting about them?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "alerts", "scope": {"device": 2}, "filter": {"entity_type": "port"}}}
+      ],
+      "answer": "Yes. `Port down` on `Gi0/0/0` has been active since `2026-10-28T10:02:00Z` (`1h 58m`), and nobody has acknowledged it. The one on transit-b was acknowledged: `2026-10-28 09:15:00 - Ack (alice) carrier ticket 4411`."
+    },
+    {
+      "user": "What is on the other end of transit-a?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "neighbours", "scope": {"device": 2}, "filter": {"port_id": 5}}}
+      ],
+      "answer": "`transit-a-pe1`, port `xe-0/0/1`, which says it is a `Juniper MX204`. LibreNMS does not monitor it, so I cannot see that side: the name and port are what the neighbour advertises about itself."
+    },
+    {
+      "user": "When exactly did it go down?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "events", "scope": {"device": 2}, "window": "24h", "filter": {"port_id": 5, "by": "port"}}}
+      ],
+      "answer": "The eventlog has it going `down` at `2026-10-28T09:55:00Z`, `2h 5m` ago, with no change since."
+    },
+    {
+      "user": "Has it done that before this month?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "events", "scope": {"device": 2}, "window": "30d", "filter": {"port_id": 5, "by": "event"}}}
+      ],
+      "answer": "Once more in the last 30 days: `Interface went down: Gi0/0/0` at `2026-10-20T14:05:00Z`."
+    },
+    {
+      "user": "How close is that circuit to its commit?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "bills", "scope": {"device": 2}, "filter": {"text": "Gi0/0/0"}}}
+      ],
+      "answer": "The `Transit A` bill on that port has a 95th percentile of `812 Mbit/s` against a `1 Gbit/s` commit: `81.2` % of it this period (`2026-10-01` to `2026-10-31`), as LibreNMS last worked it out at `2026-10-28T11:50:02Z`."
+    }
+  ]
+}

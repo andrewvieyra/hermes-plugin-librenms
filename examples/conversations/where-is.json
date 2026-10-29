@@ -1,0 +1,47 @@
+{
+  "title": "Where a host is plugged in, its port, the switch's uplink, the other end of it, and its flaps today and yesterday",
+  "turns": [
+    {
+      "user": "Where is 192.0.2.50?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "locate", "term": "192.0.2.50"}}
+      ],
+      "answer": "On `access-sw2.example.net`, port `Gi1/0/5 (desk 5)`, VLAN `10`: its MAC `00:11:22:33:44:55` was last seen there `1h 0m` ago. core-sw1 learned it too, on `Gi1/0/2`, its trunk to access-sw2, so that is not where it is plugged in."
+    },
+    {
+      "user": "What speed is that port running at?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "port", "scope": {"port": 10}}}
+      ],
+      "answer": "`1G`, `full` duplex, and it is `up`, carrying `10 Mbit/s` out and `1.2 Mbit/s` in, with no open alerts."
+    },
+    {
+      "user": "What is that switch's uplink?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "neighbours", "scope": {"device": 3}}}
+      ],
+      "answer": "`Gi1/0/48 (to core-sw1)`, to `core-sw1.example.net` port `Gi1/0/2`: both ends `1G`, full duplex, MTU `1500`, no mismatches."
+    },
+    {
+      "user": "Is the other end OK?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "port", "scope": {"port": 2}}}
+      ],
+      "answer": "`Gi1/0/2` on core-sw1 is `up`, with no errors and no open alerts, but it last changed state only `29m 0s` ago."
+    },
+    {
+      "user": "Has that link been flapping today?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "events", "scope": {"device": 1}, "window": "today", "filter": {"port_id": 2, "by": "port"}}}
+      ],
+      "answer": "Once: it went down and came back up, the last change at `2026-10-28T11:31:00Z` (`ifOperStatus: down -> up`)."
+    },
+    {
+      "user": "What about yesterday?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "events", "scope": {"device": 1}, "window": "48h", "filter": {"port_id": 2, "by": "event"}}}
+      ],
+      "answer": "Yesterday evening too: down at `2026-10-27T18:00:00Z`, back up at `2026-10-27T18:05:00Z`. With today's drop at `2026-10-28T11:30:00Z`, that is twice in a day. LibreNMS does not say why; the switches' syslog may."
+    }
+  ]
+}

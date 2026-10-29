@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
-description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, neighbours, VLANs, where a MAC or IP address is, alerts, alert rules, sensors, optics, CPU, BGP or OSPF sessions, locations, device groups, services, maintenance windows, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.9.0
+description: Plan, review, apply and roll back LibreNMS changes with the librenms_* tools: devices, locations, device groups, services, alert rules, port descriptions, alert acknowledgements and maintenance windows, each written only through a plan the user has seen and said yes to. Load when the user wants to change something in LibreNMS; for questions that change nothing, load librenms:ask.
+version: 0.10.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -14,7 +14,7 @@ Six tools, one rule: **nothing is written to LibreNMS without a plan the user ha
 | Tool | Writes? | Use it to |
 |---|---|---|
 | `librenms_query` | no | Read any allowed API v0 GET path (devices, ports, faults, rules, logs, ...); `{"action": "status"}` for connectivity, version and write mode |
-| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), `port` (one port in depth), `capacity` (free ports), `neighbours` (LLDP/CDP links and mismatches), `locate` (where an IP or MAC is), `vlans` (VLANs and their ports), `alerts` (what is alerting now), `alert_history` (what alerted over a window), `health` (sensors, optics, CPU, memory against their limits), `routing` (BGP and OSPF sessions), `events` (the eventlog, syslog or logins over a window; port flaps), `bills` (95th percentile against the commit), with a summary and named rows; `help` (with `topic`, a view) says what a view takes and returns |
+| `librenms_report` | no | Answer a question in one call: a view (`find`, `devices`, `ports`, `port`, `capacity`, `neighbours`, `locate`, `vlans`, `alerts`, `alert_history`, `health`, `routing`, `events`, `bills`) returns a summary and named rows; `help` (with `topic`, a view) says what a view takes. `librenms:ask` says which view answers which question |
 | `librenms_plan` | no | Turn desired changes into a diff, preconditions and a `plan_id` |
 | `librenms_apply` | yes | Execute a reviewed plan step by step; automatic rollback on failure; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or failed plan from its journal, newest step first |
@@ -32,160 +32,21 @@ so they can fix the one that applies and start a new session, and stop: do not r
 (a terminal, code, a browser). When only `librenms_apply` and `librenms_rollback` are missing, `write_mode`
 is `read_only` (see Write modes).
 
-## Answering questions
+## Questions
 
-Prefer `librenms_report` to `librenms_query` for questions: it joins ids to names, counts, and keeps the
-answer small.
-
-- When the user names a device by anything but its exact hostname (a short name, sysName, role, site, IP,
-  "the core switch in SFO"), call view `find` with that `term` first. If the result says `ambiguous: true`,
-  or the best candidate's `why` does not fit what the user said, ask them which one they mean; never pick.
-  `count` counts every candidate; past 10 the one they mean may not be shown: ask for more of the name.
-  A `scope.device` phrase that could be several devices answers `ambiguous` with `candidates` and reports
-  nothing: ask, then call again with the hostname or `device_id`.
-- View `devices` answers "which devices are down, and since when" (`filter` `{"status": "down"}`),
-  "what rebooted today" (`rebooted_within`: `24h`), "what has not polled" (`not_polled_for`: `15m`),
-  "hostnames that do not match sysName" (`naming_mismatch`), "devices without a location" (`no_location`)
-  and "how many are down" (`summary.by_status`, over every row that passed the filter, not only those
-  shown). Narrow it with `scope`: `device`, `devices`, `group`, `location` (part of a name), `os`, `type`.
-- View `ports` answers "which ports on sw1 are down" (`scope` `{"device": "sw1"}`, `filter`
-  `{"state": "down"}`; `summary.not_up` counts every port that is administratively up, not up, not
-  ignored and still polled, which is what LibreNMS calls down; rows say `ignored` and
-  `polling_disabled`), "the busiest ports" or "top talkers on core-sw1" (`sort` `util`, `limit` 10),
-  "which links are above 80 %" (`util_above_pct`: 80), "which ports have errors" (`errors`: true, `sort`
-  `errors`), "ports at 100M or half duplex" (`speed_below_mbps`: 1000, or `duplex`: `half`, each with
-  `state` `up`: two calls), "ports without a description" (`no_description`), "how busy is the uplink"
-  (`text`: `uplink`), and the utilisation of a device group or port group (`scope` `group` or
-  `port_group`). View `port` (`scope` `{"device": "sw1", "port": "Gi1/0/5"}`, or a `port_id`) adds, for
-  one port, when it last changed, discards, its LLDP/CDP neighbours, transceiver, optic levels and open
-  alerts. View `capacity` answers "how many free ports on each access switch" (`free`: not up and
-  unchanged for `idle_days`, 30 by default; `free_unknown` when the device has not been up that long).
-- View `neighbours` answers "what are core-sw1's neighbours" (`scope` `{"device": "core-sw1"}`),
-  "what is connected to Gi1/0/48 on sw1" (`filter` `{"port": "Gi1/0/48"}` with the device), "what
-  speed is the link between core-sw1 and edge-rtr1" (`scope` one, `filter` `{"remote": "edge-rtr1"}`:
-  `speed` and `remote_speed`), "speed, duplex or MTU mismatches with neighbours" (`filter`
-  `{"mismatch": ["speed", "duplex", "mtu"]}`, or one of them), "port descriptions that do not match
-  their neighbour" (`mismatch`: `description`) and "LLDP neighbours we do not monitor"
-  (`remote_unmonitored`: true; `summary.unmonitored_neighbours` names them). A mismatch flag is null
-  when it cannot be checked: the far end is not monitored or LibreNMS did not match its port
-  (`remote_port_id` null), or for speed and duplex an end is not up; `summary.remote_port_unknown`
-  counts those links, so say how many could not be checked. Speeds are what the interfaces run at,
-  not a circuit speed from a description. An MTU that differs by 14, 18 or 22 bytes may be one
-  system counting the ethernet header (a note says so): say that rather than call it a fault.
-  `description_mismatch` compares whole names, so "WAN: transit-a" does not name `transit-a-pe1`;
-  read the two before you call a description wrong.
-- View `locate` answers "where is MAC X" and "where is IP Y" (`term`: the address; a MAC in any
-  usual form). `summary.edge` is the likely edge port: of the ports that learned the MAC, the one
-  that learned the fewest MACs, leaving out uplinks (`uplink`: the port's monitored LLDP/CDP
-  neighbour learned the MAC too, so the MAC is behind it); it is a guess, so give the switch,
-  port, VLAN and `last_seen_age`, and when several ports or none qualify say what the notes say.
-  An edge port with a `neighbour` leads to a device LibreNMS monitors that did not learn the MAC:
-  a VM on that hypervisor, a client of that access point, or that server itself; say so.
-  `summary.ips` and the `arp` rows give the IP and the router that holds it; `summary.device` the
-  device LibreNMS monitors at that IP. IPv6 is not in LibreNMS's ARP tables: use view `find` for
-  an IPv6 address.
-- View `vlans` answers "which VLANs are on sw1" (`scope` the device), "where is VLAN 20 defined"
-  (`filter` `{"vlan": 20}`: one row per device that has it) and "which ports are in VLAN 20 on sw1"
-  (both: each row lists its `ports`, `untagged` or `tagged`, for up to 10 devices).
-  `summary.named_differently` names tags with different names on different devices.
-- View `alerts` answers "what is alerting right now" (`summary`: `by_severity`, `unacknowledged`,
-  `by_rule`; rows critical and unacknowledged first), "since when" (`first_seen` and its age; `sort`
-  `oldest` for the longest-standing), "unacknowledged critical alerts" (`filter`
-  `{"severity": "critical", "acked": false}`), "what was acknowledged, with what note" (`acked`: true;
-  `note`) and "which port or sensor is it about" (`entity`, with `port_id` or `sensor_id`: view `port`
-  with that `port_id` gives the port in depth). `alert_id` is the fault's id, for an `alert` `ack` plan.
-  Recovered faults appear only when `filter.state` names `recovered`.
-- View `alert_history` answers "the noisiest rules this week" (`window` `7d`; `summary.top_rules`, or
-  rows per rule with `sort` `fired` or `flaps`), "the alert history of sw1" (`scope` the device,
-  `filter` `{"by": "event"}`: each alert raised, recovered or acknowledged, newest first), "which
-  devices alert most" (`by`: `device`) and "which rules are disabled, or notify no one" (`filter`
-  `{"disabled": true}` or `{"notifies": false}`, for the whole fleet; every rule is listed there, also
-  those that logged nothing). `flaps` counts alerts raised again after they had cleared. `window` is
-  `1h`, `24h` (default), `7d`, `30d` or `today`; when `summary.exact` is false (no `librenms_timezone`)
-  the counts may include up to a day before the window: say so. A `partial` answer read only the newest
-  entries: narrow the window or the scope.
-- View `health` answers "which sensors are over their threshold" (`filter` `{"status": ["warning",
-  "critical"]}`), "is anything running hot" (`{"class": "temperature"}`, `sort` `value`;
-  `summary.hottest`), "the temperature and CPU of core-sw1" (`scope` the device, `filter` `{"class":
-  ["temperature", "processor"]}`; with no class, one device's processors and memory come with its
-  sensors) and "which optics are near their low Rx threshold" (`{"class": "dbm", "direction": "rx"}`,
-  `sort` `low_margin`; `margin_below` 3 keeps those within 3 dB, or past). `status` is LibreNMS's:
-  `critical` past a critical limit, `warning` past a warning limit; a sensor without limits is never
-  either (`summary.without_limits`), and a `state` sensor (PSU or fan state) is `unknown`: view
-  `alerts` shows the ones that alert. `low_margin`/`high_margin` are in the reading's own `unit` (dB,
-  °C, V), negative once past the limit. Processors, memory and storage are read per device, for 5
-  devices at most: narrow the scope for them.
-- View `routing` answers "which BGP sessions are down" (`filter` `{"protocol": "bgp",
-  "not_established": true}`: enabled and not established, as LibreNMS alarms; `enabled` false is a
-  session shut down on purpose, not a fault), "how long has the session to AS65001 been up"
-  (`{"remote_as": "AS65001"}`: `up_for`; `down_for` and `last_error` for one that is down) and "which
-  OSPF neighbours are not Full" (`{"protocol": "ospf", "not_established": true}`). `twoWay` is normal
-  between two routers that are neither DR nor BDR: say so rather than call it down.
-- View `events` answers "what changed on sw1 in the last hour" (`scope` the device, `window` `1h`:
-  the eventlog, newest first, with the port an entry is about and `username` when a person or API
-  token made the change), "how many ports flapped today" (`window` `today`, `filter` `{"type":
-  "interface", "by": "port"}`, `sort` `most`: per port `status_changes`, `went_down` and `flaps`, back up
-  after going down; `summary.ports_flapped`), "when did Gi1/0/5 on sw1 last change state" (`filter`
-  `{"port": "Gi1/0/5", "by": "port"}` with the device and a long enough window: `last_status`,
-  `last_change`; view `port` gives `last_change_age` from the device's own counter too), "syslog
-  errors from edge-rtr1 today" (`filter` `{"log": "syslog", "min_severity": "error"}`: err and worse;
-  `min_severity` puts eventlog and syslog severities on one scale), "which ports went err-disabled"
-  (`{"log": "syslog", "text": "err-disable"}`: only devices that send syslog say so) and "who logged
-  into LibreNMS today" (`{"log": "authlog"}`, no scope: `summary.users` with logins and addresses; API
-  token use is not in it). LibreNMS reads a port's state every poll, about five minutes apart, so a
-  shorter bounce may not be logged; it logs port changes at severity notice, so `min_severity`
-  warning or above leaves them out. `window` is as `alert_history`'s, and so is `exact`.
-- View `bills` answers "95th percentile versus commit for the transit bill" (`filter` `{"text":
-  "transit"}`: `rate_95th`, `commit`, `used_pct`), "which bills are over their commit" (`{"over":
-  true}`; `overuse`), and the same for last month (`{"period": "previous"}`: the last billing period
-  that ended, against the commit it had then). A quota bill counts bytes (`used`, `quota`). The 95th
-  percentile is of the bill's ports together over its billing period (`period_from`, `period_to`),
-  as of `last_calculated`; it is the only traffic history the API keeps.
-- `stale: true` on a health or routing row means its device was not polled lately: the reading or
-  state is the last LibreNMS saw, say so.
-- View `help` lists the views; with `topic` (a view's name) it gives that view's filters, sorts, row
-  keys and examples, without reading LibreNMS. Call it before a view whose filters you do not know: a
-  filter or sort a view does not take is refused, naming those it does.
-- Units are in the key names (`uptime_s` seconds, beside `uptime` "100d 0h"; `in_bps` bit/s beside
-  `in` "812 Mbit/s"; `*_pct` percent); times ending `Z` are UTC. Say how current the data is
-  (`data_as_of`). `truncated` means more rows (read on with `next_offset` as `offset`); `partial` means
-  the data itself is incomplete (`partial_reason`): say so, never present it as complete. `timezone`
-  "unknown" means LibreNMS's server-local times (faults, logs) have no known zone: do not turn them into
-  ages.
-- Ports: `in_pct` and `out_pct` are measured against the circuit speed when the description gives one
-  (`speed_source` `circuit`, which may differ by direction: `100M/20M` is 100 Mbit/s out, 20 Mbit/s in),
-  else the interface speed; null when the speed is not known. Rates are LibreNMS's average over its last
-  poll (about five minutes), not peaks. `stale: true` means the port was not polled lately (its device is
-  down or unreachable): its figures are old, say so. `state` `disabled` is a port shut down on purpose,
-  not a fault. `last_change_age` "over 100d 0h" means it has not changed since the device booted.
-- What LibreNMS's API cannot tell: a port's traffic history, averages or 95th percentile over a week (only
-  bills have that, for their ports over their billing period: view `bills`), a sensor's or CPU's history
-  (only the last reading), what a state sensor's number means, which ports are err-disabled (LibreNMS
-  shows them as down; only the device's syslog says so, when it sends syslog: view `events`), which
-  ports could run faster than they do (it keeps the speed a port runs at, not what it or its optic can
-  do) and IPv6 neighbours. Say so rather than guess.
-- Reading raw port rows with `librenms_query` instead, name the columns in `params.columns` (LibreNMS
-  sends only `ifName` without them), e.g. `port_id,ifName,ifAlias,ifAdminStatus,ifOperStatus,ifSpeed,`
-  `port_descr_speed,ifInOctets_rate,ifOutOctets_rate,ifInErrors_delta,ifOutErrors_delta`, and mind the
-  units below. A device's sensors: `devices/<hostname>/health` lists its classes,
-  `devices/<hostname>/health/device_<class>` their ids, and `.../device_<class>/<sensor_id>` one sensor
-  with its value and limits.
-
-  | Column | Unit |
-  |---|---|
-  | `ifInOctets_rate`, `ifOutOctets_rate` | bytes per second over the last poll (`poll_period`, about 300 s): times 8 for bit/s |
-  | `ifSpeed` | bit/s (0 is not known); `ifHighSpeed`, in older releases, is Mbit/s |
-  | `port_descr_speed` | the circuit speed from the description, `egress/ingress` |
-  | `ifInErrors_delta`, `ifInErrors_rate` | errors in the last poll, and per second |
-  | `ifLastChange` | the device's sysUpTime at the last change, in hundredths of a second: the time since is the device's `uptime` (seconds) minus `ifLastChange` / 100 |
-  | `poll_time`, outages' `going_down` | unix seconds |
-  | `uptime`, `bgpPeerFsmEstablishedTime`, availability `duration` | seconds |
+Questions that change nothing (what is down, how busy a port is, what is alerting, where a MAC or IP
+is, what changed, how a bill stands) are the bundled skill `librenms:ask`'s: its table gives the call that
+answers each, with the units, states and follow-up questions ("that port", "the other end", "what about
+yesterday") and what the API cannot answer. Load it when the user asks rather than changes. This skill is
+for changes; looking up what a change touches is step 1 below.
 
 ## Procedure
 
-1. **Query first.** Find every object the change touches with `librenms_query` and a `path` relative to
-   `/api/v0`: `devices/core-sw1.example.net`, `devices/core-sw1.example.net/ports` (with
-   `"params": {"columns": "port_id,ifName,ifAlias"}`), `resources/locations`, `devicegroups`, `services`,
+1. **Query first.** Find every object the change touches: `librenms_report` view `find` for what a short
+   name, IP or phrase could mean, view `alerts` for the `alert_id` an `ack` needs, view `port` for one
+   port; or `librenms_query` and a `path` relative to `/api/v0`: `devices/core-sw1.example.net`,
+   `devices/core-sw1.example.net/ports` (with `"params": {"columns": "port_id,ifName,ifAlias"}`),
+   `resources/locations`, `devicegroups`, `services`,
    `rules`, `faults` (open alerts; `"params": {"state": "1,2,3,4,5"}` adds acknowledged ones),
    `logs/eventlog/<hostname>`. Use `fields` and `limit` to keep results small. For one device's rows use
    the path form (`logs/eventlog/<hostname>`, `services/<hostname>`): a `hostname` param on a route that

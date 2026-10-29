@@ -1,7 +1,8 @@
 # hermes-plugin-librenms
 
 LibreNMS change management for [Hermes Agent](https://hermes-agent.nousresearch.com/).
-The agent can read devices, ports, alerts, rules and logs, but it can only **write through a plan**:
+The agent can read devices, ports, alerts, rules and logs and answer questions about them over a
+conversation, but it can only **write through a plan**:
 a field-level diff you review, an apply step that verifies and journals every write, and a rollback
 that replays the journal in reverse.
 
@@ -185,6 +186,63 @@ environment):
 | `LIBRENMS_SNMP_*` | no | SNMP credentials a device-create plan names as `{"env": "LIBRENMS_SNMP_<NAME>"}`, read only at apply time. A community's or password's variable ends in `_SECRET`, `_PASS` or `_PASSWORD` (`LIBRENMS_SNMP_COMMUNITY_SECRET`), which Hermes masks in a printed environment |
 | `LIBRENMS_AUDIT_SINK_SECRET` | no | A collector token for an `http` audit sink, written as `${LIBRENMS_AUDIT_SINK_SECRET}` in its headers; the Desktop's `audit_sink_secret` field stores it. Once `audit_sinks` holds the placeholder, edit it in `config.yaml`: the Desktop's form shows and saves it with the token in its place. Any variable works the same way (see [docs/sinks.md](docs/sinks.md)) |
 
+## Asking questions
+
+The plugin answers questions as well as it makes changes. The second bundled skill, `librenms:ask`
+([skills/ask/SKILL.md](skills/ask/SKILL.md)), gives the model the questions operators ask, 57 of them,
+each with the `librenms_report` call that answers it: which ports are down, errors and discards,
+utilisation and the busiest ports, link speeds and duplex, descriptions and device names, LLDP/CDP
+neighbours and mismatches, where a MAC or IP address is, VLANs, what is alerting and what alerted, sensors
+and optics, BGP and OSPF, free ports, bills, the eventlog, syslog and logins. It also gives the units and
+states of what comes back, how to carry a conversation, when to say an answer is stale, cut short or
+incomplete, and what LibreNMS's API cannot answer. Hermes lists both skills in the system prompt: the model
+loads `librenms:ask` when you ask and `librenms:workflow` when you want something changed, and each says
+when to load the other. `/librenms:ask <question>` loads it before your question.
+
+```
+you    > Which ports on edge-rtr1 are down?
+hermes > [librenms_report] ports, scope edge-rtr1, state down
+         Both WAN ports of edge-rtr1.example.net: Gi0/0/0 (WAN: transit-a) has been down for 2h 5m,
+         and Gi0/0/1 (WAN: transit-b) since the router booted, over 50 days ago. Both are
+         administratively up, so LibreNMS counts them as down (as of 12:00 UTC).
+you    > Is anything alerting about them?
+hermes > [librenms_report] alerts, scope device 2, entity_type port
+         Yes: Port down on Gi0/0/0 since 10:02, not acknowledged. The one on transit-b was
+         acknowledged by alice at 09:15: "carrier ticket 4411".
+you    > What is on the other end of transit-a?
+hermes > [librenms_report] neighbours, scope device 2, port_id 5
+         transit-a-pe1, port xe-0/0/1, which says it is a Juniper MX204. LibreNMS does not monitor
+         it, so I cannot see that side; the name and port are what the neighbour advertises.
+you    > When exactly did it go down, and has it before?
+hermes > [librenms_report] events, scope device 2, port_id 5, window 30d
+         At 09:55 today. Before that, once in the last 30 days: on 20 October at 14:05.
+you    > How busy is the switch?
+hermes > [librenms_report] find "switch"
+         There are two: core-sw1.example.net in SFO-1 and access-sw2.example.net in NYC-2. Which one?
+you    > The core one. Was it that busy last week too?
+hermes > [librenms_report] ports, scope device 1, sort util
+         [librenms_report] bills, scope device 1
+         Its busiest port is Gi1/0/1 (uplink to edge-rtr1): 800 Mbit/s out of 1G, 80 %, over the
+         last five-minute poll. Last week I cannot tell: LibreNMS's API keeps a port's last poll, not
+         its history, and no bill covers core-sw1's ports. Its graphs in LibreNMS show last week.
+```
+
+Follow-ups build on the answers before them: the model puts the ids an answer gave in the next call
+instead of the names (a `device_id` as `scope.device`, a `port_id` as view `port`'s `scope.port` or as
+`filter.port_id` of `neighbours` and `events`, a `rule_id` as `filter.rule`), so "that port", "the other
+end" (the far port of the link, when LibreNMS monitors it), "what about yesterday" (the same question
+over a longer `window`) and "the rest" (`next_offset`) need no name looked up again. "The same for
+edge-rtr1" asks the same question of a new device, whose name is resolved like any other, and "is it
+still down?" is asked of LibreNMS again, never answered from the earlier result. A name that could be
+several devices gets a question back, never a guess. Every answer says when its data is from, and says so
+when a device was not polled lately, when rows were cut, or when the data is incomplete. The skill has
+the model say what the API does not hold instead of guessing: a port's traffic history or 95th percentile
+outside bills, a sensor's history, which ports are err-disabled (only syslog says, when the device sends
+it), which ports could run faster than they do, which hosts talk most (there is no flow data), and IPv6
+neighbours. [examples/conversations/](examples/conversations/) holds four whole conversations, which the
+tests run against the fake LibreNMS, checking that every value an answer quotes is a value the tools
+returned, and that each count, percentage and state is the one under the key that holds it.
+
 ## Tools
 
 | Tool | Writes | Purpose |
@@ -198,13 +256,14 @@ environment):
 
 The bundled skill `librenms:workflow` (see [SKILL.md](SKILL.md)) tells the model to query first,
 show the diff, ask, and apply only on an explicit yes, never in unattended contexts. The tool
-descriptions repeat that rule.
+descriptions repeat that rule. The other, `librenms:ask`, is for questions (see
+[Asking questions](#asking-questions)).
 
 Hermes' tool search (`tools.tool_search.enabled`, on by default) defers plugin tools: the model is
 given `tool_search`, `tool_describe` and `tool_call` and one catalog line per tool, the first sentence
 of its description. Each of those sentences says in 60 characters or fewer what the tool answers
-or does ("Look up LibreNMS devices, ports, alerts, sensors and logs."), and the skill, which is offered
-whenever the plugin is enabled, tells the model to reach deferred tools through `tool_call`. The
+or does ("Look up LibreNMS devices, ports, alerts, sensors and logs."), and both skills, which are
+offered whenever the plugin is enabled, tell the model to reach deferred tools through `tool_call`. The
 approval prompt is unaffected: Hermes unwraps `tool_call` before its `pre_tool_call` hooks run.
 
 `librenms_query` takes a `path` relative to `/api/v0` (`devices`, `devices/core-sw1.example.net/ports`,
@@ -291,14 +350,14 @@ approval, and is available in every `write_mode`.
 | `ports` | Per port: `state` (`disabled` when administratively down, else its operational status: `up`, `down`, `lowerLayerDown`, `notPresent`, ...), `speed_bps`/`speed` (the circuit speed parsed from its description, `egress/ingress` such as `100M/20M`, as LibreNMS's web UI measures it; else `ifSpeed`), `in_bps`/`in` and `out_bps`/`out` (the octet rates times 8), `in_pct` against the ingress speed and `out_pct` against the egress speed, `util_pct` (the larger), `duplex`, `mtu`, errors per poll and per second, `last_change_age` (the device's uptime less `ifLastChange`; "over" when the port has not changed since boot, unknown past 497 days of uptime), `polled_at` and `stale` (not polled for two poll periods: the figures are not current), `no_description` (none, or only its own name), `ignored` and `polling_disabled`. `summary` counts states, `not_up` (administratively up, not up, not ignored and still polled: LibreNMS's down), ports over 80 %, with errors, stale and without a description, and names the busiest | `scope` (also `port_group`); `filter` `state`, `util_above_pct`, `errors`, `speed_below_mbps`, `duplex`, `no_description`, `type` (`ethernet` or an ifType), `text` (in its names or description); `sort` `name`, `util`, `util_in`, `util_out`, `errors`, `speed` |
 | `port` | One port, everything `ports` says of it and its ifIndex, MAC, VLAN, packets per second, discards (from its statistics), LLDP/CDP neighbours (named when LibreNMS monitors them), transceivers, the dBm sensors of its optics with their limits and state, and the open faults about it (rule, severity, state, first seen, note; never their details) | `scope.port`: a `port_id`, or with `scope.device` an interface name (`Gi1/0/5`, `GigabitEthernet1/0/5`) or description; without a device, a name is searched among every port (one holding `#`, `?`, `%` or `\` needs `scope.device`) |
 | `capacity` | Per device with physical ethernet ports: how many are `up`, `down` and `disabled`, `used_pct`, `free` (not up and unchanged for `idle_days`, by speed), and `free_unknown` (not up, but the device has not been up that long, or its uptime counter wrapped) | `scope`; `filter` `idle_days` (default 30); `sort` `name`, `free`, `used_pct` |
-| `neighbours` | Per LLDP/CDP link of the devices in scope: the local port (label, description, state, interface speed, duplex, MTU), what the neighbour advertised (`remote_hostname`, `remote_port`, `remote_platform`), whether LibreNMS monitors it (`remote_monitored`, `remote_device`) and, when LibreNMS matched its port (`remote_port_id`), that port's state, speed, duplex and MTU. Checks: `speed_mismatch` and `duplex_mismatch` (both ends up and different; the speed the interfaces run at, never a circuit speed from a description), `mtu_mismatch` (a note when the two differ by an ethernet header, as Junos counts it), `description_mismatch` (the local description names neither the neighbour nor its port, compared as whole words; null without a description); each null when it cannot be checked. `summary` counts links, protocols, unmonitored neighbours (and names them), links whose far port is not known, each mismatch and ports without a description | `scope`; `filter` `mismatch` (`speed`, `duplex`, `mtu`, `description`, or a list: any of them), `remote_unmonitored`, `port` (the local port: its name, long or short, or port_id), `remote` (part of the neighbour's name), `protocol`; `sort` `name`, `remote` |
+| `neighbours` | Per LLDP/CDP link of the devices in scope: the local port (label, description, state, interface speed, duplex, MTU), what the neighbour advertised (`remote_hostname`, `remote_port`, `remote_platform`), whether LibreNMS monitors it (`remote_monitored`, `remote_device`) and, when LibreNMS matched its port (`remote_port_id`), that port's state, speed, duplex and MTU. Checks: `speed_mismatch` and `duplex_mismatch` (both ends up and different; the speed the interfaces run at, never a circuit speed from a description), `mtu_mismatch` (a note when the two differ by an ethernet header, as Junos counts it), `description_mismatch` (the local description names neither the neighbour nor its port, compared as whole words; null without a description); each null when it cannot be checked. `summary` counts links, protocols, unmonitored neighbours (and names them), links whose far port is not known, each mismatch and ports without a description | `scope`; `filter` `mismatch` (`speed`, `duplex`, `mtu`, `description`, or a list: any of them), `remote_unmonitored`, `port` (the local port: its name, long or short, or port_id; a number is both, as HP and Aruba switches name their ports `5`), `port_id` (that port alone, as a follow-up gives a row's `port_id`), `remote` (part of the neighbour's name), `protocol`; `sort` `name`, `remote` |
 | `locate` | Where an IPv4 or MAC address is: the switch ports that learned the MAC (`kind` `port`), with how many MACs each learned (`macs_learned`), the device LibreNMS monitors that its LLDP/CDP neighbour is (`neighbour`), `uplink` (that neighbour learned the MAC too: the MAC is behind it), `likely_edge` (of a MAC's ports that are not uplinks, those that learned the fewest, as LibreNMS guesses; a port to the device at the address looked up is never an uplink), its VLANs, `trunk`, `last_seen` and its age; then the routers' ARP entries (`kind` `arp`: IP, MAC, router interface). `summary` names the likely edge ports, the MACs and IPs found and, for an IP, the device LibreNMS monitors at it. An IPv6 address is refused (the API has no IPv6 neighbour table; `find` matches interface addresses) | `term` (a MAC in any usual form, or an IPv4 address); `sort` `edge` |
 | `vlans` | Per device in scope, each VLAN: tag (`vlan`), `name`, `type`. With `filter.vlan` and on at most 10 devices, the `ports` in it, `untagged` (access, or a trunk's native VLAN) or `tagged`, with their state and counts. `summary` counts VLANs and devices and names tags that are called differently on different devices | `scope`; `filter` `vlan` (a tag, or part of a name); `sort` `vlan` (by tag, then device), `name` (by device, then tag) |
 | `alerts` | What is alerting now: LibreNMS's open faults, one per rule, device and alerted object, each with the rule and its `severity`, `state` (`active`, `acknowledged`, `worse`, `better`, `changed`; `recovered` only when asked for), `acked`, the acknowledgement `note`, `first_seen` and its age, the rule's runbook link (`procedure`) and what alerted: `entity_type` (`port`, `sensor`, ...), `port_id` or `sensor_id`, and `entity`, its label (a port as `ifName (description)`, a sensor by its description and class, with the reading as `value`). The label comes from the rows the rule matched, through an allow-list of label keys; a port fault that holds none is named from its device's ports. Never the fault's `details` (every column the rule joined) or the alert's contacts. `summary` counts states, severities, the unacknowledged alerts, devices and rules, and the rules with the most alerts | `scope`; `filter` `state`, `severity`, `acked`, `rule` (an id, or part of a name), `entity_type` (`port`, `sensor`, ..., `device` for a device-wide rule), `text` (in the device, rule, what alerted or the note); `sort` `severity` (critical and unacknowledged first, newest first), `newest`, `oldest`, `name` |
 | `alert_history` | What alerted over `window` (`1h`, `24h` by default, `7d`, `30d`, any duration up to a year, or `today` with `librenms_timezone`), from LibreNMS's alert log, counted per rule (`filter.by` `rule`, the default; for the whole fleet every rule, also those that logged nothing, with `disabled`, `notifies` and `muted`), per `device` (with the rule that fired most there) or as each `event` (newest first: time, device, rule, `state` `alerted`, `recovered`, `acknowledged`, ..., what alerted). Counts: `fired` (alerts raised), `cleared`, `flaps` (raised again after clearing, within the window), `last_fired` and its age. `summary` gives the window and the bound sent (`from`, server time; `exact` false without `librenms_timezone`), what LibreNMS logged there, the totals, the five rules and devices that fired most and, for the whole fleet, how many rules are disabled or notify no one | `scope`, `window`; `filter` `by`, `rule`, `severity`, `state`, `entity`, `disabled`, `notifies`, `fired`; `sort` `fired`, `flaps`, `last_fired`, `name` |
 | `health` | What each sensor reads against its limits (temperature, optic dBm, voltage, fans, power, ...): `value` in the class's `unit` and as a `reading` (`41 °C`, `-3.2 dBm`), the four limits, `status` as LibreNMS decides it (`critical` past `limit` or below `limit_low`, `warning` past a warning limit; a limit not set never trips; `unknown` without a reading and for a `state` sensor, whose meaning the API does not return), `low_margin` and `high_margin` (how far from the first limit below and above, in the reading's unit, negative past it), `margin` and `nearest`, `alerting`, and for the page the port a sensor is on (measured on its ifIndex or on one of its transceivers, or for a dBm sensor named in its description) and an optic's `direction` (`rx`, `tx`). For at most 5 devices also their processors and memory pools (when `filter.class` names none) or storage, in percent against LibreNMS's warning limit, memory and storage with bytes used of their size. `stale` when the device was not polled lately. `summary` counts statuses and classes and names the hottest temperature and the reading nearest a limit it has not crossed | `scope`; `filter` `class` (sensor classes, `processor`, `mempool`, `storage`), `status`, `margin_below` (within this much of a limit, or past it), `direction`, `text`; `sort` `status` (critical first, nearest a limit first), `margin`, `low_margin`, `high_margin`, `value` (highest first), `name` |
 | `routing` | Per BGP session and OSPF or OSPFv3 neighbour of the devices in scope: BGP's peer (IPv6 written short), `remote_as`, `as_name`, `description`, `state`, `admin_status` and `enabled`, `established`, `up_for` or `down_for` (from the session's established timer at the last poll, plus the time since), `last_error` (LibreNMS's text, else the BGP error code's name); OSPF's peer, `router_id` (dotted: LibreNMS stores an OSPFv3 neighbour's as a number), `state`, `established` (`full`), the port it is on (named for the page), `events`. `not_established` is what LibreNMS alarms on: an enabled BGP session not established, an OSPF neighbour not full (a note says `twoWay` is normal between two routers that are neither DR nor BDR). `summary` counts per protocol, the sessions LibreNMS counts as down and the states | `scope`; `filter` `protocol` (`bgp`, `ospf`, `ospfv3`), `not_established`, `enabled`, `state`, `remote_as` (`65001`, `AS65001`, asdot `1.10`), `text`; `sort` `state` (down first), `name`, `up_for` (shortest first), `remote_as` |
-| `events` | What LibreNMS logged over `window` (`1h`, `24h` by default, `7d`, `30d`, any duration up to a year, or `today` with `librenms_timezone`), newest first: its eventlog (`filter.log` `eventlog`, the default: a device or port changing, a reboot, an edit through the API, with `type`, `severity` `unknown` to `error`, `message`, the port it is about, named, and `username`, who made a change), the syslog the devices send it (`syslog`: `severity` `emerg` to `debug`, from the name or number the collector wrote, `facility`, `program`, `tag`, `message`), or the logins to LibreNMS itself (`authlog`: `user`, `address`, `result`; no scope). Each entry (`filter.by` `event`, with its time and age), counted per `device` (entries, by severity, the type or program logged most, the latest), or per `port` from the eventlog's port changes (`ifOperStatus: up -> down`): `status_changes`, `went_down`, `flaps` (back up after going down within the window), `last_status` and `last_change`. `summary` gives the window and the bound sent (`exact` false without `librenms_timezone`), what LibreNMS logged there, counts per severity and device, the types, programs or results logged most; for the eventlog the ports that changed, went down and flapped and those that changed most; for the authlog who logged in (logins, addresses, the last). LibreNMS reads a port's state at each poll, about five minutes apart, so a shorter bounce may not be logged | `scope` (not for the authlog), `window`; `filter` `log`, `by`, `min_severity` (`debug`, `info`, `notice`, `warning`, `error`, `critical`: that or worse, eventlog and syslog on one scale; a port change is `notice`), `type` (eventlog), `program` (syslog), `port` (eventlog: a name, long or short, or a port_id; a number is both, as HP and Aruba switches name their ports `5`, but with one device in scope it is that device's port of that name), `text`; `sort` `newest`, `oldest`, `most`, `name` |
+| `events` | What LibreNMS logged over `window` (`1h`, `24h` by default, `7d`, `30d`, any duration up to a year, or `today` with `librenms_timezone`), newest first: its eventlog (`filter.log` `eventlog`, the default: a device or port changing, a reboot, an edit through the API, with `type`, `severity` `unknown` to `error`, `message`, the port it is about, named, and `username`, who made a change), the syslog the devices send it (`syslog`: `severity` `emerg` to `debug`, from the name or number the collector wrote, `facility`, `program`, `tag`, `message`), or the logins to LibreNMS itself (`authlog`: `user`, `address`, `result`; no scope). Each entry (`filter.by` `event`, with its time and age), counted per `device` (entries, by severity, the type or program logged most, the latest), or per `port` from the eventlog's port changes (`ifOperStatus: up -> down`): `status_changes`, `went_down`, `flaps` (back up after going down within the window), `last_status` and `last_change`. `summary` gives the window and the bound sent (`exact` false without `librenms_timezone`), what LibreNMS logged there, counts per severity and device, the types, programs or results logged most; for the eventlog the ports that changed, went down and flapped and those that changed most; for the authlog who logged in (logins, addresses, the last). LibreNMS reads a port's state at each poll, about five minutes apart, so a shorter bounce may not be logged | `scope` (not for the authlog), `window`; `filter` `log`, `by`, `min_severity` (`debug`, `info`, `notice`, `warning`, `error`, `critical`: that or worse, eventlog and syslog on one scale; a port change is `notice`), `type` (eventlog), `program` (syslog), `port` (eventlog: a name, long or short, or a port_id; a number is both, as HP and Aruba switches name their ports `5`, but with one device in scope it is that device's port of that name), `port_id` (eventlog: that port alone, as a follow-up gives a row's `port_id`), `text`; `sort` `newest`, `oldest`, `most`, `name` |
 | `bills` | Each bill LibreNMS keeps, in the current billing period (`filter.period` `current`, the default) or the last one that ended (`previous`, within 40 days, against the commit it had then): a CDR bill's 95th percentile (`rate_95th_bps`, inbound, outbound and the `direction` billed) against its commit (`commit_bps`), a quota bill's traffic (`used_bytes`) against its quota (`quota_bytes`), `used_pct`, `over` and `overuse`, the average rate, the bytes `transferred`, the period's dates (`period_from`, `period_to`), when LibreNMS last worked the figures out (`last_calculated` and its age) and the bill's ports and their devices. `summary` counts bills, those over, per type, and names the fullest. The 95th percentile is of the bill's ports together over its billing period: the API keeps no other traffic history | `scope` (a bill with a port on a device in it); `filter` `period`, `over`, `type` (`cdr`, `quota`), `used_above_pct`, `text` (in its name, customer id, reference, notes, ports or their devices); `sort` `used_pct` (fullest first), `name`, `rate_95th` |
 | `help` | What each view answers and takes: without `topic` the views and what they share (scope, filter, sort, paging, window, units); with `topic` (a view) its scope keys, each filter with what it takes, each sort, the keys of its rows and summary, and examples. Answered by the plugin, without a LibreNMS call | `topic` |
 
@@ -323,6 +382,7 @@ than guess; so does a port name that could be several ports.
 {"view": "port", "scope": {"device": "core-sw1", "port": "Gi1/0/48"}}
 {"view": "capacity", "scope": {"group": "access-switches"}, "sort": "free"}
 {"view": "neighbours", "scope": {"device": "core-sw1"}}
+{"view": "neighbours", "scope": {"device": "edge-rtr1"}, "filter": {"port_id": 5}}
 {"view": "neighbours", "filter": {"mismatch": ["speed", "duplex", "mtu"]}}
 {"view": "neighbours", "filter": {"remote_unmonitored": true}}
 {"view": "locate", "term": "00:11:22:33:44:55"}
@@ -338,6 +398,7 @@ than guess; so does a port name that could be several ports.
 {"view": "routing", "filter": {"protocol": "bgp", "not_established": true}}
 {"view": "routing", "filter": {"remote_as": "AS64500"}}
 {"view": "events", "scope": {"device": "core-sw1"}, "window": "1h"}
+{"view": "events", "scope": {"device": "core-sw1"}, "window": "48h", "filter": {"port_id": 2, "by": "event"}}
 {"view": "events", "window": "today", "filter": {"type": "interface", "by": "port"}, "sort": "most"}
 {"view": "events", "scope": {"device": "edge-rtr1"}, "window": "today", "filter": {"log": "syslog", "min_severity": "error"}}
 {"view": "events", "window": "today", "filter": {"log": "authlog"}}
@@ -550,7 +611,7 @@ Much of what LibreNMS stores was written by the network, not by its users: syslo
 can reach the collector, SNMP strings (sysDescr, sysLocation, sysContact, ifAlias), LLDP/CDP
 neighbour names, eventlog and alert notes, and hostnames found by autodiscovery. The plugin cannot
 stop the model from being influenced by that text; it limits what a misled model can do (plans,
-review, gates, write modes, approval) and makes every attempt visible (audit). The skill tells the
+review, gates, write modes, approval) and makes every attempt visible (audit). Both skills tell the
 model to treat fetched content as data and to report instructions found in it.
 
 The results say so too. Hermes puts its own untrusted-data boundary only around its web, browser
@@ -568,7 +629,7 @@ peer's `description`, `as_name` and `last_error`, a log entry's `message`, `type
 Refusals and errors are the plugin's own text and carry no marker of their own, but they may quote
 LibreNMS: an `error` holds LibreNMS's error message, the refusal of an unknown hostname names the
 devices LibreNMS holds whose names come close (autodiscovered ones among them), and a plan's
-`errors` may quote LibreNMS's answer. The skill tells the model that this text is data too.
+`errors` may quote LibreNMS's answer. Both skills tell the model that this text is data too.
 
 Every string in every result, and everything printed to a terminal or put in the approval prompt,
 has its bidirectional controls, invisible characters (zero-width spaces and joiners, the soft
@@ -666,7 +727,9 @@ audit.py      actor capture and the audit.jsonl event stream
 sinks.py      optional syslog / HTTP forwarding of audit events
 timefmt.py    UTC-to-local rendering for plan diffs and journals (Hermes' timezone setting)
 settings.py   operator settings, fail-closed
-SKILL.md      bundled skill: the workflow the model follows
+SKILL.md      bundled skill librenms:workflow: the change workflow the model follows
+skills/ask/   bundled skill librenms:ask: answering questions, the question-to-call table, follow-ups
+examples/     plan payloads, and conversations the tests run
 ```
 
 ## License

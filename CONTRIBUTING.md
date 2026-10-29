@@ -106,8 +106,9 @@ from LibreNMS. Add its name, filters and sorts to the schema (within the budget)
 `tests/test_reports.py` or a module of their own (`tests/test_report_ports.py`,
 `tests/test_report_neighbours.py`): the happy path, units and edge cases, filters, sorts and
 paging, the call budget, the output budget, and the GET-only, allow-list and no-credential
-assertions. Then the README's Reports table, the skill, and the routes it reads in
-`docs/api-coverage.md`.
+assertions. Then the README's Reports table, the question skill (`skills/ask/SKILL.md`: the questions
+the view answers in its table, each call one `tests/test_conversation.py` runs, and what to watch for),
+and the routes it reads in `docs/api-coverage.md`.
 
 ## Workflow
 

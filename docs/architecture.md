@@ -606,15 +606,31 @@ for the re-read to settle, not a second request.
   what the tool answers or does, and ends saying to invoke the tools through `tool_call` when they
   are deferred. Hermes unwraps `tool_call` before `pre_tool_call`, so the approval hook sees
   `librenms_apply` either way.
-- The `librenms:workflow` skill is registered without `requires_toolsets` or `requires_tools`: Hermes
+- Two skills are registered: `librenms:workflow` (`SKILL.md`: changes, plan to rollback) and
+  `librenms:ask` (`skills/ask/SKILL.md`: questions). A question needs none of the change workflow
+  and a change none of the question table, so each is loaded on its own: Hermes lists both in the
+  system prompt's `<available_skills>` with the description `register_skill` gives (when to load
+  it), `skill_view` serves each by its qualified name with a banner naming its sibling, and each
+  text says when to load the other. `librenms:ask` is also the slash command `/librenms:ask`. Its
+  question table gives the `librenms_report` call for each of the 57 questions of the
+  conversational audit, written with the demo network's names; `tests/test_conversation.py` runs
+  every call in it, and the conversations in `examples/conversations/`, against the fake LibreNMS.
+  A follow-up puts the ids of an earlier answer where an argument takes them exactly (`device_id`
+  as `scope.device`, `port_id` as view `port`'s `scope.port` or as `filter.port_id` of `neighbours`
+  and `events`, `rule_id` as `filter.rule`) rather than a name that needs resolving again:
+  `filter.port` takes a port's name and reads a number as one first, as HP and Aruba switches name
+  their ports `5`.
+- Both skills are registered without `requires_toolsets` or `requires_tools`: Hermes
   checks those against the tools the model sees directly, so under tool search such a gate left the
-  skill out of the system prompt. It is offered whenever the plugin is enabled, so also in a session
-  where the `librenms` toolset is turned off for the platform (`hermes tools`) or the task, and says
+  skill out of the system prompt. They are offered whenever the plugin is enabled, so also in a session
+  where the `librenms` toolset is turned off for the platform (`hermes tools`) or the task, and say
   what to do when the tools are deferred or missing. A catalog listing in groups, or no listing at
-  all, does not name each tool, so the skill counts the tools missing only when `tool_describe` and
-  `tool_search` do not find them (or there is no `tool_search`). It then names both causes for the
-  user, `LIBRENMS_URL` / `LIBRENMS_TOKEN` unset for the profile or the toolset turned off, and tells
-  the model not to reach LibreNMS another way.
+  all, does not name each tool, so the skills count the tools missing only when `tool_describe` and
+  `tool_search` do not find them (or there is no `tool_search`). They then name both causes for the
+  user, `LIBRENMS_URL` / `LIBRENMS_TOKEN` unset for the profile or the toolset turned off, and tell
+  the model not to reach LibreNMS another way. Neither holds text Hermes' `skill_view` flags as
+  possible prompt injection, nor an inline shell snippet or template token its preprocessing would
+  run or fill in.
 - Handlers follow the contract `handler(args, **kwargs) -> str` and never raise; an unexpected
   exception becomes an error id, with the detail in the log.
 - Hermes wraps the results of its web, browser and MCP tools in an `<untrusted_tool_result>` block
@@ -627,7 +643,7 @@ for the re-read to settle, not a second request.
   `report`, `auto_rollback_error` and `steps` of the plan tools, and an error's `librenms`
   (LibreNMS's answer). Refusals and the plan listing carry none, and the `error` of a refusal or an
   error, like a plan's `errors`, may quote LibreNMS (its message, candidate hostnames) unmarked: the
-  skill tells the model that this is data too. The serialiser escapes every string of every result
+  skills tell the model that this is data too. The serialiser escapes every string of every result
   with `redact.visible` (a CR LF read as a newline, then `printable()`), so no bidirectional
   control, invisible character or C0/C1 control reaches the model raw whatever key it is under.
   `redact.clip` and `redact.cut` count a character as long as its escape, so every limit on text

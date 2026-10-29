@@ -6,9 +6,9 @@ Reads: the log ``filter.log`` names (``eventlog`` by default) from the window's 
 :meth:`.context.ReportContext.read_log` (:data:`.context.LOG_PAGE` entries a request and at most :data:`MAX_ENTRIES`
 a report; each device's path for a scope of at most :data:`.ports.DEVICE_READS` devices, else every device's, kept
 to the scope here). For the ports the page and the summary name, the port names of their devices
-(:meth:`.context.ReportContext.ports_by_device`), and for ``filter.port`` those of the devices whose ports logged a
-change. ``filter.by`` shapes the rows: ``event`` (each entry), ``device`` (counts per device) or ``port`` (the
-eventlog's changes per port).
+(:meth:`.context.ReportContext.ports_by_device`), and for ``filter.port`` (a port's name) those of the devices whose
+ports logged a change; ``filter.port_id`` needs none. ``filter.by`` shapes the rows: ``event`` (each entry),
+``device`` (counts per device) or ``port`` (the eventlog's changes per port).
 
 Severity: an eventlog entry's is LibreNMS's (``unknown``, ``ok``, ``info``, ``notice``, ``warning``, ``error``), a
 syslog message's the syslog severity (``emerg`` ... ``debug``), from ``level`` or else ``priority``, which a collector
@@ -94,6 +94,7 @@ _FOR_LOGS = {
     "type": ("eventlog",),
     "program": ("syslog",),
     "port": ("eventlog",),
+    "port_id": ("eventlog",),
 }
 _GROUP_KEY = {"eventlog": "type", "syslog": "program", "authlog": "result"}  # what a summary counts entries by
 LOGGED_IN = "Logged In"  # the authlog's result for a login (AuthLoginListener)
@@ -299,7 +300,7 @@ def _entry(log: Log, devices: Dict[int, Dict[str, Any]], row: Dict[str, Any]) ->
 
 
 def _passes(entry: _Entry, filters: Dict[str, Any]) -> bool:
-    """Whether an entry passes the filters on the entries themselves (filter.port is applied after)."""
+    """Whether an entry passes the filters on the entries themselves (filter.port, a name, is applied after)."""
     for key, wanted in filters.items():
         if key == "min_severity" and (entry.rank is None or entry.rank < SEVERITIES.index(next(iter(wanted)))):
             return False
@@ -309,6 +310,8 @@ def _passes(entry: _Entry, filters: Dict[str, Any]) -> bool:
             return False
         if key == "text" and wanted.casefold() not in entry.text:
             return False
+        if key == "port_id" and entry.port_id != wanted:
+            return False
     return True
 
 
@@ -316,7 +319,8 @@ def _on_port(ctx: ReportContext, entries: List[_Entry], wanted: str, scope: Scop
     """filter.port: the entries about the ports with that name (long or short: ``Gi1/0/5``, ``GigabitEthernet1/0/5``;
     a number too, as HP and Aruba switches name their ports ``5``) on the devices whose ports logged a change (their
     port names, at most 10 devices), and for a number also those about the port with that port_id. With one device
-    in scope its port of that name comes first, as in view port: the port_id counts only when it has none."""
+    in scope its port of that name comes first, as in view port: the port_id counts only when it has none, and a
+    note points to filter.port_id when that port_id logged changes too."""
     devices = list(dict.fromkeys(entry.device_id for entry in entries if entry.port_id is not None))
     maps = ctx.ports_by_device(
         devices,
@@ -341,8 +345,15 @@ def _on_port(ctx: ReportContext, entries: List[_Entry], wanted: str, scope: Scop
         )
     elif number in logged and logged - {number}:
         ctx.notes.append(
-            f"filter.port {shown} kept the entries of port_id {number} and of the ports named {shown}: name the "
-            f"device with scope.device for its port {shown} alone"
+            f"filter.port {shown} kept the entries of port_id {number} and of the ports named {shown}: give "
+            f"filter.port_id {number} for the port with that id alone, or name the device with scope.device for its "
+            f"port {shown} alone"
+        )
+    passed_over = int(wanted) if is_digits(wanted) and number is None and int(wanted) not in ids else None
+    if passed_over is not None and any(entry.port_id == passed_over for entry in entries):
+        ctx.notes.append(
+            f"filter.port {shown} kept the entries of the port named {shown} on the device in scope, not those of "
+            f"port_id {passed_over}, which logged changes too: give filter.port_id {passed_over} for that port"
         )
     return kept
 
@@ -534,7 +545,14 @@ def _notes(ctx: ReportContext, log: Log, by: str, req: Request, entries: List[_E
             "LibreNMS logs a port's changes (ifOperStatus: up -> down) at severity notice: filter.min_severity "
             f"{next(iter(wanted))} leaves them out"
         )
-    if by == "port" or "port" in req.filters or str(req.filters.get("type")).casefold() == "interface":
+    port_id = req.filters.get("port_id")
+    if port_id is not None and not entries:
+        ctx.notes.append(
+            f"no entry about port_id {port_id} passed the filter in the window on the devices in scope: the port's "
+            "device must be in scope"
+        )
+    on_port = by == "port" or "port" in req.filters or port_id is not None
+    if on_port or str(req.filters.get("type")).casefold() == "interface":
         ctx.notes.append(
             "LibreNMS reads a port's state at each poll, about five minutes apart: a shorter bounce may not be in the "
             "eventlog; views ports and port give its state now"
@@ -557,6 +575,7 @@ VIEW = View(
         "type": "text",
         "program": "text",
         "port": "text",
+        "port_id": "id",
         "text": "text",
     },
     sorts=("newest", "oldest", "most", "name"),

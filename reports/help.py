@@ -156,13 +156,16 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "filters": {
             "mismatch": "Links with any of these mismatches.",
             "remote_unmonitored": "Neighbours LibreNMS does not monitor (true), or those it does.",
-            "port": "The local port: its name, long or short, or port_id.",
+            "port": "The local port: its name, long or short (a number too: HP and Aruba name ports 5), or its "
+            "port_id. A number is both: give a port_id as port_id.",
+            "port_id": "The local port with this port_id, exactly.",
             "remote": "Part of the neighbour's name.",
             "protocol": "lldp, cdp, ...",
         },
         "sorts": {"name": "By device, then local port.", "remote": "By the neighbour's name."},
         "examples": [
             {"view": "neighbours", "scope": {"device": "core-sw1"}},
+            {"view": "neighbours", "scope": {"device": "edge-rtr1"}, "filter": {"port_id": 5}},
             {"view": "neighbours", "filter": {"mismatch": ["speed", "duplex", "mtu"]}},
         ],
     },
@@ -367,7 +370,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
             "program": "Syslog messages whose program or tag holds this (LINK-3-UPDOWN, BGP).",
             "port": "Eventlog entries about one port: its name, long or short (a number too: HP and Aruba name ports "
             "5), on the devices in scope, or its port_id. A number is both, but with one device in scope its port of "
-            "that name.",
+            "that name: give a port_id as port_id.",
+            "port_id": "Eventlog entries about the port with this port_id, exactly (put its device in scope).",
             "text": "In the message, type, program, user name or address.",
         },
         "sorts": {
@@ -380,6 +384,7 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "window": "1h, 24h (default), 7d, 30d, another duration up to a year, or today (needs librenms_timezone).",
         "examples": [
             {"view": "events", "scope": {"device": "core-sw1"}, "window": "1h"},
+            {"view": "events", "scope": {"device": "core-sw1"}, "window": "48h", "filter": {"port_id": 2}},
             {"view": "events", "window": "24h", "filter": {"type": "interface", "by": "port"}, "sort": "most"},
             {"view": "events", "scope": {"device": "edge-rtr1"}, "filter": {"log": "syslog", "min_severity": "error"}},
             {"view": "events", "window": "today", "filter": {"log": "authlog"}},
@@ -432,6 +437,8 @@ def takes(kind: Any) -> str:
         return "a duration such as 30m, 24h or 7d"
     if kind == "number":
         return "a number, 0 or more"
+    if kind == "id":
+        return "an id"
     if kind == "text":
         return "a text"
     if isinstance(kind, One):

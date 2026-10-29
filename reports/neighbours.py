@@ -250,8 +250,9 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
 
 
 def _notes(ctx: ReportContext, every: List[Neighbour], kept: List[Neighbour], filters: Dict[str, Any]) -> None:
-    """What the model should know about the links kept: MTUs that may differ only by a header, and, when it asked for
-    mismatches, how many links of all those read could not be compared."""
+    """What the model should know about the links kept: MTUs that may differ only by a header, a number in
+    filter.port that kept both the port with that id and ports of that name, and, when it asked for mismatches, how
+    many links of all those read could not be compared."""
     rows = [item.row for item in kept]
     headers = [row for row in rows if row["mtu_mismatch"] and abs(row["mtu"] - row["remote_mtu"]) in HEADER_BYTES]
     if headers:
@@ -259,6 +260,13 @@ def _notes(ctx: ReportContext, every: List[Neighbour], kept: List[Neighbour], fi
             f"{len(headers)} MTU mismatch(es) differ by an ethernet header (14 bytes, 18 or 22 with VLAN tags): each "
             "end reports its own figure and some systems count the header (Junos: 1514 for 1500), so check both "
             "configurations before calling it a mismatch"
+        )
+    wanted = filters.get("port")
+    ports = {_id(row["port_id"]) for row in rows}
+    if is_digits(wanted) and int(wanted) in ports and len(ports) > 1:
+        ctx.notes.append(
+            f"filter.port {wanted!r} kept the links of port_id {wanted} and of the ports named {wanted!r}: give "
+            f"filter.port_id {wanted} for the port with that id alone"
         )
     unknown = sum(not item.remote_known for item in every)
     if unknown and filters.get("mismatch", frozenset()) & {"speed", "duplex", "mtu"}:
@@ -287,6 +295,8 @@ def _passes(item: Neighbour, filters: Dict[str, Any]) -> bool:
             return False
         if key == "port" and (item.port is None or not names_port(wanted, item.port)):
             return False
+        if key == "port_id" and _id(row["port_id"]) != wanted:
+            return False
         if key == "remote" and wanted.casefold() not in item.remote_names:
             return False
         if key == "protocol" and str(row["protocol"] or "").casefold() != wanted.casefold():
@@ -313,6 +323,7 @@ VIEW = View(
         "mismatch": MISMATCHES,
         "remote_unmonitored": "bool",
         "port": "text",
+        "port_id": "id",
         "remote": "text",
         "protocol": "text",
     },

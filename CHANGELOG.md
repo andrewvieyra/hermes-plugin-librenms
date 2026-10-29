@@ -6,6 +6,75 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-29
+
+### Added
+- A second bundled skill, `librenms:ask` (`skills/ask/SKILL.md`), for answering questions about the network over a
+  conversation (findings hi-query-skill and conv-skill-no-read-guidance). It is registered beside `librenms:workflow`
+  and, as the verifier corrected the finding, without `requires_toolsets`, which under Hermes' default tool search
+  would hide it. Hermes lists it in `<available_skills>` with the description `register_skill` gives it, `skill_view`
+  serves it as `librenms:ask` with a banner naming its sibling, and `/librenms:ask <question>` loads it before the
+  question. It holds: how to answer (a device named by role, site or description goes to view `find` first;
+  `ambiguous` gets a question back, never a pick; the summary first; how current and complete the answer is; the
+  readable values); a question-to-call table of the 57 questions of the conversational audit, by topic (ports,
+  utilisation, speeds and mismatches, naming, alerts, device health, topology, VLANs, routing, capacity and bills,
+  events), each with the `librenms_report` arguments that answer it (`librenms_query` for a device's availability)
+  and where in the result the answer is, the two the API cannot answer marked with what to say instead (a port's
+  traffic history or 95th percentile outside bills; which ports could run faster than they do), and those it answers
+  only in part said so (err-disabled ports, only from syslog; discards, one port at a time); follow-up questions: the
+  ids of earlier answers rather than names ("that device", "that port", "it"), each where an argument takes it
+  exactly (`device_id` as `scope.device`, `port_id` as view `port`'s `scope.port` or as `filter.port_id`, `rule_id`
+  as `filter.rule`, `alert_id` in an `ack` plan; never a `port_id` in `filter.port`, which reads a number as a port's
+  name first), "the other end" through the link's `remote_port_id` (and what to say when LibreNMS does not monitor
+  it), "what about yesterday" as the same question over a window reaching past yesterday's midnight, "the same for
+  edge-rtr1" (a new name resolved like any other), "only the critical ones", "the rest" (`next_offset`), "is it still
+  down?" (call again), "why?" (what LibreNMS shows, never an invented cause), and a change handed to
+  `librenms:workflow`; the envelope, units and states (ports, devices, alerts, the alert log, sensors, BGP, OSPF,
+  severities); honesty about `data_as_of`, `stale`, `truncated`, `partial`, an unknown `timezone`, `exact: false` (up
+  to 26h more than the window) and an empty answer; what to watch for in each view; what the API cannot answer
+  (traffic, sensor and session history, which ports could run faster, which are err-disabled, which hosts talk most,
+  what a state sensor's number means, IPv6 neighbours, a calendar month's availability); `librenms_query` for the
+  rest, with the units of its port columns and the raw fault states; and the untrusted-content rule.
+- `examples/conversations/`: four conversations about the demo network (a WAN port down, the busiest port of "the
+  switch", what is alerting, where an IP address is), each turn the user's question, the read-only calls the model
+  makes and its answer; the examples README lists them.
+- README "Asking questions": what the question skill does, two dialogues with follow-ups, how follow-ups build on
+  earlier answers, and what the API cannot answer.
+- `filter.port_id` of views `neighbours` and `events`: the port with that `port_id` exactly, where a follow-up puts a
+  row's `port_id` ("the other end", "did that port flap"). `filter.port` takes a port's name, long or short, and
+  reads a number as one first, as HP and Aruba switches name their ports `5`: in `events` with one device in scope
+  its port of that name wins, and in `neighbours` the port of that name and the port with that id both pass. Each now
+  says so in a note that names `filter.port_id`: when a number kept both, or when the port of that name was kept and
+  the port with that id logged changes too. An `events` answer with `filter.port_id` and no entry notes that the
+  port's device must be in scope. View `help` lists the filter with an example for each view.
+  tests/test_report_events.py and tests/test_report_neighbours.py check both filters on a switch that names a port by
+  a number.
+- tests/test_conversation.py: the skill's table holds questions 1 to 57 once each, every call in it runs as written
+  against the fake LibreNMS (no refusal, no ambiguity) and every view answers one; every example conversation runs
+  turn by turn, each id a follow-up passes given by an earlier answer of that conversation and each offset by its
+  `next_offset`, a question back after an ambiguous answer, every value an answer quotes in backticks a value the
+  tools returned (a number equal to a returned number, a text a returned text or part of one, never a key), and each
+  number and bare word it gives (counts, percentages, states) in the order given and the one under the key the test
+  pins it to, so a wrong count or state fails; and a conversation driven as the skill says (find, then ids; the far
+  end of a link LibreNMS does not monitor; "is it still down?" after the port came back; a question back on an
+  ambiguous name; reading on with `next_offset`; yesterday's flaps) gets its answers, every read a GET on the
+  allow-list.
+- tests/test_plugin_load.py: through Hermes' real loader both skills are in the skills index, `skill_view` serves
+  each with the banner naming the other and without Hermes' prompt-injection warning, and `/librenms:ask` is a slash
+  command; a skill Hermes refuses leaves the other registered.
+
+### Changed
+- `librenms:workflow` (`SKILL.md`) is about changes: its description says to load it for a change and
+  `librenms:ask` for a question that changes nothing, and its "Answering questions" section, units table and
+  per-view notes moved to `librenms:ask`, rewritten around the question table. Step 1 of its procedure names the
+  views a change looks things up with (`find`, `alerts` for an `alert_id`, `port`).
+- `register()` registers both skills from one table, each on its own, so a skill Hermes refuses does not keep the
+  other out. README, SECURITY.md, docs/architecture.md, CONTRIBUTING.md and plugin.yaml's description name both.
+- tests/test_version.py checks both skills: the version, the frontmatter, the deferred-tools and missing-tools
+  paragraphs, the untrusted sources, that each says when to load the other, and that neither holds what Hermes'
+  `skill_view` logs as possible prompt injection, an inline shell snippet or template token its preprocessing would
+  run or fill in, or a character that would not show.
+
 ## [0.9.0] - 2026-10-29
 
 ### Added

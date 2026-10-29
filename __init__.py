@@ -2,8 +2,9 @@
 
 Registers six tools (query / report / plan / apply / rollback / plans), three hooks (the approval prompt for apply and
 rollback, the user's request for the audit trail, the approval decision), a ``/librenms`` slash command, a
-``hermes librenms`` CLI subcommand, and the bundled ``librenms:workflow`` skill. Registration performs no network
-I/O; the LibreNMS client is created lazily inside each tool call.
+``hermes librenms`` CLI subcommand, and two bundled skills: ``librenms:workflow`` (changes: plan, review, apply, roll
+back) and ``librenms:ask`` (questions, over several turns). Registration performs no network I/O; the LibreNMS client
+is created lazily inside each tool call.
 """
 
 from __future__ import annotations
@@ -29,6 +30,22 @@ _EMOJI = {
     "librenms_plans": "🗂️",
 }
 _REQUIRES_ENV = ["LIBRENMS_URL", "LIBRENMS_TOKEN"]
+# The bundled skills: (name, its SKILL.md under the plugin directory, the description Hermes lists in the system
+# prompt's <available_skills>).
+_SKILLS = (
+    (
+        "workflow",
+        "SKILL.md",
+        "Plan, review, apply and roll back LibreNMS changes safely: devices, locations, groups, services, alert "
+        "rules, port descriptions, acknowledgements, maintenance",
+    ),
+    (
+        "ask",
+        "skills/ask/SKILL.md",
+        "Answer questions about the network from LibreNMS: what is down, ports, utilisation, link speeds, naming, "
+        "neighbours, where a MAC or IP is, VLANs, alerts, sensors, BGP/OSPF, logs and bills, with follow-ups",
+    ),
+)
 
 
 def register(ctx) -> None:
@@ -81,16 +98,13 @@ def register(ctx) -> None:
 
     # No requires_toolsets / requires_tools: Hermes checks them against the tools the model sees directly, and under
     # its tool search (on by default) every plugin tool is deferred behind tool_search / tool_call, so a gate kept
-    # the skill out of the system prompt exactly where the model needs it to find the tools. The skill says what to
-    # do when they are deferred, and when they are missing.
-    skill = _PLUGIN_DIR / "SKILL.md"
-    if skill.exists():
-        try:
-            ctx.register_skill(
-                "workflow",
-                skill,
-                description="Look up LibreNMS devices, ports, alerts and logs, and plan, review, apply and roll back "
-                "changes safely",
-            )
-        except Exception as exc:
-            logger.debug("librenms plugin: skill not registered: %s", exc)
+    # the skill out of the system prompt exactly where the model needs it to find the tools. Each skill says what to
+    # do when they are deferred, and when they are missing. Hermes lists both as <plugin>:<name>; each one's
+    # description says when to load it, and its text names the other.
+    for name, relative, description in _SKILLS:
+        path = _PLUGIN_DIR / relative
+        if path.exists():
+            try:
+                ctx.register_skill(name, path, description=description)
+            except Exception as exc:
+                logger.debug("librenms plugin: skill %s not registered: %s", name, exc)

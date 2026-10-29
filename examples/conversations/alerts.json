@@ -1,0 +1,43 @@
+{
+  "title": "What is alerting, since when, how high the CPU is, what alerted yesterday and this week, and who acknowledged what",
+  "turns": [
+    {
+      "user": "What is alerting right now?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "alerts"}}
+      ],
+      "answer": "`4` open alerts, `3` of them not acknowledged. The critical one is `High CPU` on `core-sw1.example.net`. The other three are `Port down`: `Gi0/0/0` on edge-rtr1, `Gi1/0/48 (to core-sw1)` on access-sw2, and `Gi0/0/1 (WAN: transit-b)` on edge-rtr1, which someone acknowledged."
+    },
+    {
+      "user": "Since when is the CPU one?",
+      "calls": [],
+      "answer": "Since `2026-10-28T11:40:00Z`, `20m 0s` ago."
+    },
+    {
+      "user": "How high is it?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "health", "scope": {"device": 1}, "filter": {"class": "processor"}}}
+      ],
+      "answer": "`CPU 0` on core-sw1 reads `97 %`, past its warning limit of `75.0`: status `warning`."
+    },
+    {
+      "user": "What about yesterday? Did anything alert then?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "alert_history", "window": "48h", "filter": {"by": "event"}}}
+      ],
+      "answer": "The same rule on the same switch: `High CPU` alerted at `2026-10-27T21:00:00Z` and `recovered` at `2026-10-27T22:00:00Z`. Everything else in the alert log is from today."
+    },
+    {
+      "user": "Which device has alerted most this week?",
+      "calls": [
+        {"tool": "librenms_report", "arguments": {"view": "alert_history", "window": "7d", "filter": {"by": "device"}, "sort": "fired"}}
+      ],
+      "answer": "`edge-rtr1.example.net`: `Port down` was raised there twice, last at `2026-10-28T10:02:00Z`, and has not cleared. core-sw1 comes next with the one `High CPU` alert of yesterday evening. Nothing flapped."
+    },
+    {
+      "user": "Who acknowledged the transit-b alert, and why?",
+      "calls": [],
+      "answer": "`alice`, at 09:15 today, with the note `carrier ticket 4411`."
+    }
+  ]
+}
