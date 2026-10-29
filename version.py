@@ -1,3 +1,3 @@
 """Single source of the plugin version (also declared in plugin.yaml; keep both in step)."""
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"

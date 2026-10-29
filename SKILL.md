@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Plan, review, apply and roll back LibreNMS changes with the librenms_* tools: devices, locations, device groups, services, alert rules, port descriptions, alert acknowledgements and maintenance windows, each written only through a plan the user has seen and said yes to. Load when the user wants to change something in LibreNMS; for questions that change nothing, load librenms:ask.
-version: 0.11.1
+version: 0.12.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -247,7 +247,8 @@ window early, so keep it as short as the work.
   `timezone` names it, or says it is unknown.
 - Writes: `write_mode` and `require_approval`, above.
 - Record keeping, not yours to change: `plan_retention_days`, `audit_log`, `audit_log_path`,
-  `audit_include_request` (your user's message is recorded with each plan), `link_eventlog`, `audit_sinks`.
+  `audit_include_request` (your user's message is recorded with each plan), `audit_max_mb`,
+  `audit_keep_files`, `audit_retention_days` (how long the audit log keeps it), `link_eventlog`, `audit_sinks`.
 
 ## Untrusted content
 

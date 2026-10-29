@@ -5,6 +5,7 @@ invariants that the token and existing service parameters never reach a tool res
 import json
 import os
 import unittest
+import unittest.mock
 
 from .base import PluginTestCase
 from .fake_librenms import TOKEN
@@ -62,6 +63,22 @@ class Query(HandlerCase):
         (warning,) = out["warnings"]
         self.assertTrue(warning.startswith("audit_sinks[0] header Authorization holds a credential written into "))
         self.assertNotIn("3f2a9c1e", json.dumps(out))
+
+    def test_status_warns_when_the_count_of_rotated_audit_files_cuts_retention_short(self):
+        # the log is rotated daily while audit_retention_days is on: 10 files keep about 10 days, not 90
+        Settings = self.settings_mod.Settings
+        self.settings_mod.set_settings(Settings(audit_keep_files=10, audit_retention_days=90))
+        (warning,) = self.call("librenms_query", action="status")["warnings"]
+        self.assertTrue(warning.startswith("audit_keep_files (10) is below audit_retention_days (90): "), warning)
+        self.assertIn("only its newest 10 rotated files (about as many days) are kept", warning)
+        for quiet in (Settings(), Settings(audit_keep_files=0), Settings(audit_keep_files=5, audit_retention_days=0)):
+            self.settings_mod.set_settings(quiet)
+            self.assertEqual(self.call("librenms_query", action="status")["warnings"], [])
+        self.settings_mod.set_settings(Settings(audit_max_mb=0, audit_keep_files=0, audit_retention_days=0))
+        settings = self.call("librenms_query", action="status")["settings"]
+        self.assertEqual(
+            (settings["audit_max_mb"], settings["audit_keep_files"], settings["audit_retention_days"]), (0, 0, 0)
+        )
 
     def test_status_says_only_whether_a_custom_audit_log_path_is_set(self):
         self.settings_mod.set_settings(self.settings_mod.Settings(audit_log_path="/home/alice/logs/audit.jsonl"))
@@ -489,6 +506,38 @@ class Prune(HandlerCase):
         self.handlers.reset_state()
         self.call("librenms_plan", description="z", operations=[self.update_purpose("edge", 4)])
         self.assertIsNone(self.store.load(again))
+
+    def rotated_audit(self, days_ago):
+        """A rotated audit log file whose newest event is *days_ago* days old."""
+        from datetime import datetime, timedelta, timezone
+
+        stamp = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y%m%dT%H%M%SZ")
+        path = self.audit_path.with_name(f"{self.audit_path.name}.{stamp}")
+        path.write_text('{"event":"plan_created"}\n', encoding="utf-8")
+        return path
+
+    def test_the_hourly_sweep_applies_the_audit_logs_retention_even_with_plans_kept_forever(self):
+        self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=0, audit_retention_days=30))
+        old, recent = self.rotated_audit(100), self.rotated_audit(10)
+        self.call("librenms_plans", {"task_id": "t1"})
+        self.assertEqual((old.exists(), recent.exists()), (False, True))
+        pruned = self.events("audit_pruned")[-1]
+        self.assertEqual((pruned["files"], pruned["actor"]["kind"], pruned["max_age_days"]), ([old.name], "model", 30))
+        again = self.rotated_audit(200)
+        self.call("librenms_plans")
+        self.assertTrue(again.exists())  # within the hour: no second sweep
+        self.handlers.reset_state()
+        self.call("librenms_plans")
+        self.assertFalse(again.exists())
+        result = self.handlers.prune_audit(dry_run=True)
+        self.assertEqual(result, {"keep_files": 100, "max_age_days": 30, "dry_run": True, "removed": []})
+
+    def test_a_failing_plan_sweep_still_lets_the_audit_logs_retention_run(self):
+        self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=1))
+        old = self.rotated_audit(100)
+        with unittest.mock.patch.object(self.handlers, "prune_plans", side_effect=TimeoutError("store locked")):
+            self.call("librenms_plans")
+        self.assertFalse(old.exists())
 
     def test_retention_zero_never_prunes(self):
         self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=0))

@@ -344,7 +344,11 @@ class ExitStatus(CommandCase):
         self.assertIn("No plan matches 'nothing-like-it'", self.cli("show", "nothing-like-it", status=1))
         older = self.plan([NOTES], plan_id=f"lnp-20261028T190100Z-{pid[-4:]}")["id"]
         self.assertIn(f"is ambiguous; matches:\n  {older}\n  {pid}", self.cli("show", pid[-4:], status=1))
-        self.assertEqual(self.cli("prune", "--dry-run").strip(), "Nothing older than 90 days.")
+        self.assertEqual(
+            self.cli("prune", "--dry-run").strip(),
+            "Nothing older than 90 days.\n"
+            "Audit log: no rotated file to remove (keeping the newest 100, none older than 90 days).",
+        )
         self.assertIn("Retention is disabled", self.cli("prune", "--days", "0"))
 
     def test_check_fails_when_a_precondition_no_longer_holds(self):
@@ -504,7 +508,11 @@ class Prune(CommandCase):
         path.write_text(json.dumps(doc), encoding="utf-8")
 
     def test_prune_command_and_audit(self):
-        self.assertEqual(self.commands.slash_handler("prune"), "Nothing older than 90 days.")
+        self.assertEqual(
+            self.commands.slash_handler("prune"),
+            "Nothing older than 90 days.\n"
+            "Audit log: no rotated file to remove (keeping the newest 100, none older than 90 days).",
+        )
         self.assertIn("Usage", self.commands.slash_handler("prune --days x"))
         self.assertIn("Usage", self.commands.slash_handler("prune --days -1"))
         self.assertIn("Usage", self.commands.slash_handler("prune --days ²"))
@@ -521,6 +529,53 @@ class Prune(CommandCase):
         pruned = self.events("plans_pruned")
         self.assertEqual(pruned[-1]["plan_ids"], [pid])
         self.assertEqual(pruned[-1]["actor"]["via"], "cli")
+
+    def rotated_audit(self, days_ago: int):
+        """A rotated audit log file whose newest event is *days_ago* days old."""
+        stamp = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y%m%dT%H%M%SZ")
+        path = self.audit_path.with_name(f"{self.audit_path.name}.{stamp}")
+        path.write_text('{"event":"plan_created"}\n', encoding="utf-8")
+        return path
+
+    def test_prune_applies_the_audit_logs_retention_too(self):
+        # `hermes librenms prune` from cron is the strict policy for the users' messages in the audit log as well
+        old, recent = self.rotated_audit(100), self.rotated_audit(10)
+        policy = "(keeping the newest 100, none older than 90 days)"
+        self.assertEqual(
+            self.commands.slash_handler("prune --dry-run"),
+            f"Nothing older than 90 days.\nAudit log: would remove 1 rotated file(s) {policy}:\n  {old.name}",
+        )
+        self.assertTrue(old.exists())
+        self.assertEqual(self.events("audit_pruned"), [])
+        text = self.commands.run(["prune", "--days", "0"], via=self.audit.VIA_CLI)  # --days is the plans' alone
+        self.assertTrue(text.startswith("Retention is disabled (plan_retention_days is 0)"), text)
+        self.assertIn(f"\nAudit log: removed 1 rotated file(s) {policy}:\n  {old.name}", text)
+        self.assertEqual((old.exists(), recent.exists()), (False, True))
+        pruned = self.events("audit_pruned")[-1]
+        self.assertEqual((pruned["files"], pruned["count"], pruned["actor"]["via"]), ([old.name], 1, "cli"))
+        self.configure(audit_keep_files=1, audit_retention_days=0)
+        text = self.commands.slash_handler("prune")
+        self.assertTrue(text.endswith("\nAudit log: no rotated file to remove (keeping the newest 1)."), text)
+        self.configure(audit_keep_files=0, audit_retention_days=5)
+        text = self.commands.slash_handler("prune")
+        self.assertIn(f"Audit log: removed 1 rotated file(s) (keeping none older than 5 days):\n  {recent.name}", text)
+        self.configure(audit_keep_files=0, audit_retention_days=0)
+        self.assertTrue(
+            self.commands.slash_handler("prune").endswith(
+                "\nAudit log: retention is off (audit_keep_files and audit_retention_days are 0)."
+            )
+        )
+
+    def test_every_other_command_sweeps_the_audit_log_too(self):
+        for argv in (["status"], ["plans"], ["show", "nothing-like-it"]):
+            self.handlers.reset_state()
+            old = self.rotated_audit(100)
+            self.commands.run(argv, via=self.audit.VIA_CLI)
+            self.assertFalse(old.exists(), argv)
+            self.assertEqual(self.events("audit_pruned")[-1]["actor"]["via"], "cli")
+
+    def test_the_cli_help_names_the_audit_logs_retention(self):
+        self.assertIn("rotated audit logs past audit_keep_files or audit_retention_days", self.commands.run(["help"]))
 
     def test_retention_setting_is_the_default(self):
         pid = self.planned()

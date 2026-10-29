@@ -32,8 +32,13 @@ COUNTS = {
     "max_plan_age_hours": (24, 720),
     "max_maintenance_hours": (72, 8760),
     "plan_retention_days": (90, 3650),
+    "audit_max_mb": (10, 10240),
+    "audit_keep_files": (100, 10000),
+    "audit_retention_days": (90, 3650),
 }
-LEAST = {"plan_retention_days": 0, "max_result_chars": 8000}
+# 0 is "no limit" for the retention counts only
+NO_LIMIT = ("plan_retention_days", "audit_max_mb", "audit_keep_files", "audit_retention_days")
+LEAST = {**dict.fromkeys(NO_LIMIT, 0), "max_result_chars": 8000}
 TEXTS = ("write_mode", "audit_log_path", "librenms_timezone")
 LISTS = ("audit_sinks",)
 
@@ -173,16 +178,22 @@ class Counts(unittest.TestCase):
             built("plan_retention_days", 0.5),
             (90, ["plan_retention_days: expected a whole number of 0 or more, got 0.5; using 90"]),
         )
+        # an audit log that holds users' messages is never kept forever by mistake: only 0 means that
+        for raw in (False, -1, "never", "30d", 0.0):
+            self.assertEqual(built("audit_retention_days", raw)[0], 90, raw)
+            self.assertEqual(built("audit_keep_files", raw)[0], 100, raw)
+            self.assertEqual(built("audit_max_mb", raw)[0], 10, raw)
         self.assertEqual(
             built("max_operations", "9" * 5000),  # more digits than int() converts
             (100, ["max_operations: expected a whole number of 1 or more, got str; using 100"]),
         )
 
     def test_zero_is_no_cap_so_only_retention_takes_it(self):
-        self.assertEqual(built("plan_retention_days", 0), (0, []))
-        self.assertEqual(built("plan_retention_days", "0"), (0, []))
+        for name in NO_LIMIT:
+            self.assertEqual(built(name, 0), (0, []), name)
+            self.assertEqual(built(name, "0"), (0, []), name)
         for name, (default, _limit) in COUNTS.items():
-            if name == "plan_retention_days":
+            if name in NO_LIMIT:
                 continue
             least = LEAST.get(name, 1)
             for raw in (0, "0"):
@@ -360,12 +371,16 @@ class PublicAndDigest(unittest.TestCase):
         summary = dict(settings.to_dict(), audit_sinks={"count": 4, "types": ["http", "syslog", "unknown"]})
         del summary["max_result_chars"]  # added in 0.1.3: counted only once it differs from its default
         del summary["librenms_timezone"]  # added in 0.4.0, likewise
+        for name in ("audit_max_mb", "audit_keep_files", "audit_retention_days"):  # added in 0.12.0, likewise
+            del summary[name]
         canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         self.assertEqual(digest, hashlib.sha256(canonical.encode("ascii")).hexdigest()[:12])
         # what 0.1.0 gave, so an upgrade raises no alert on an unapproved configuration
         self.assertEqual(Settings().digest(), "82752853a9ac")
         self.assertNotEqual(Settings(max_result_chars=30000).digest(), "82752853a9ac")
         self.assertNotEqual(Settings(librenms_timezone="Europe/Amsterdam").digest(), "82752853a9ac")
+        for name in ("audit_max_mb", "audit_keep_files", "audit_retention_days"):
+            self.assertNotEqual(Settings(**{name: 0}).digest(), "82752853a9ac", name)
         self.assertEqual(Settings(audit_log_path="/var/log/hermes/librenms-audit.jsonl").digest(), "0a6839d34d47")
         self.assertEqual(Settings(audit_sinks=list(reversed(self.SINKS))).digest(), digest)  # types are a set
         self.assertEqual(Settings(audit_sinks=self.SINKS, errors=["x"]).digest(), digest)

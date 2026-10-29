@@ -1,5 +1,5 @@
 name: librenms
-version: 0.11.1
+version: 0.12.0
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"
@@ -100,6 +100,18 @@ config_schema:
     type: bool
     default: true
     description: "Record the user's triggering message (secrets masked, truncated to 500 characters) in the actor record."
+  audit_max_mb:
+    type: int
+    default: 10
+    description: "Rotate the audit log before an event would take it past this many MiB (at most 10240): it is renamed to <name>.<UTC time of its newest event> and a new file is started with the same mode. 0 never rotates it by size."
+  audit_keep_files:
+    type: int
+    default: 100
+    description: "Rotated audit log files to keep, newest first; older ones are deleted (at most 10000). 0 keeps any number. While audit_retention_days is on the log is rotated daily, so keep this above it."
+  audit_retention_days:
+    type: int
+    default: 90
+    description: "Delete rotated audit log files once their newest event is this many days old, and rotate the log daily so a day's events (each with the user's message) go together (at most 3650). 0 keeps them forever. Applied after each rotation, at most hourly per profile when the plugin is used, and by `hermes librenms prune`; whether or not audit_log is on."
   link_eventlog:
     type: bool
     default: true

@@ -16,16 +16,16 @@ results before it is written or forwarded.
 | Output | Location | Setting |
 |---|---|---|
 | Plan files | `<HERMES_HOME>/plugin-data/librenms/plans/<plan_id>.json` | `plan_retention_days` (default 90; `0` keeps them forever), applied at most hourly per profile when the plugin is used; `hermes librenms prune` from cron for a strict policy |
-| Event stream | `<HERMES_HOME>/plugin-data/librenms/audit.jsonl` | `audit_log` (on/off), `audit_log_path` (absolute path override; a relative one is a settings error and the default is used), `audit_include_request` |
+| Event stream | `<HERMES_HOME>/plugin-data/librenms/audit.jsonl` | `audit_log` (on/off), `audit_log_path` (absolute path override; a relative one is a settings error and the default is used), `audit_include_request`; rotation and retention: `audit_max_mb` (default 10), `audit_keep_files` (default 100), `audit_retention_days` (default 90), [below](#rotation-and-retention) |
 
 `<HERMES_HOME>` is the active Hermes profile's home, resolved for every event, so a gateway that
 serves several profiles writes each profile's events to its own file.
 
 Set `audit_log_path` to a location your collector already watches, for example
 `/var/log/hermes/librenms-audit.jsonl` (`~` is expanded). The writer opens the file with `O_APPEND`
-for every event and writes each line with a single `write`, so `logrotate` with `copytruncate` is
-safe, and several Hermes processes (the gateway and `hermes librenms`) can append to the same file
-without coordination. A file the plugin creates is `0600`, and directories it creates are `0700`;
+for every event and writes each line with a single `write`, so several Hermes processes (the
+gateway and `hermes librenms`) can append to the same file; they rotate it under a shared lock
+([below](#rotation-and-retention)). A file the plugin creates is `0600`, and directories it creates are `0700`;
 an existing directory keeps its mode, except `plugin-data/librenms` itself, which Hermes creates
 under the process umask and the plugin narrows to `0700` (a log shipper should read a file at
 `audit_log_path` instead). The file is never opened through a symlink, and an event is written to
@@ -42,6 +42,87 @@ describes.
 
 `audit_log: false` stops the file and the [sinks](sinks.md) alike: events are forwarded from the
 same call that writes them. Plan files are always written; they are how apply and rollback work.
+
+## Rotation and retention
+
+Each event can carry the user's message (`request`), so the stream is kept no longer than you say,
+like the plan files:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `audit_max_mb` | `10` | Before an event would take the file past this many MiB (1,048,576 bytes each), the file is rotated (at most 10240). `0`: never by size |
+| `audit_keep_files` | `100` | Rotated files kept, newest first; older ones are deleted (at most 10000). `0`: any number |
+| `audit_retention_days` | `90` | Rotated files whose newest event is older than this are deleted (at most 3650). While it is on, the file is also rotated at the first event or sweep of each new UTC day, so each file holds one day's events, and they are deleted together, 90 to 91 days after they were written (at the first rotation or sweep past that). `0`: kept forever |
+
+A value that cannot be read (`30d`, `-1`, `false`, `0.5`) is the default and a settings error in
+`/librenms status`, never "keep forever"; only `0` turns a limit off, and a value above the limit is
+lowered to it. The settings are read for every event, like the others.
+
+**Rotating** renames the file to `<name>.<UTC time of its newest event>` in the same directory
+(`audit.jsonl.20261029T235959Z`; `-2`, `-3` and so on for more rotations within that second, so
+the names sort in the order the files were rotated) and starts a new file at the log's name with
+the old file's mode and group, as logrotate's `create` does: `0600` for a file the plugin made, and
+a shipper that reads a file you made `0640` for its group keeps reading. The new file is created
+with `O_EXCL` and never through a symlink. Only a log that passes the writer's own checks (a
+regular file this account owns, with no other hard link) is rotated. Log shippers that follow a
+file across a rename (Filebeat, Fluent Bit, Vector, the Splunk forwarder) read every line once.
+
+**Retention** deletes the rotated files past the newest `audit_keep_files` and those whose newest
+event is older than `audit_retention_days`. It counts and deletes only names of the form above
+that are regular files this account owns with no other hard link; anything else in the directory
+(logrotate's `audit.jsonl.1`, a compressed copy, a symbolic or hard link or another account's file
+planted at such a name) is neither counted nor touched. It runs after each rotation, at most hourly
+per profile when the plugin is used (with the plans' retention: a plan made or listed, status, any
+`/librenms` or `hermes librenms` command), and on `hermes librenms prune` (`--dry-run` lists the
+rotated files it would delete; `--days` concerns plans only). The hourly sweep also rotates a file
+whose events are of an earlier day, so a log nobody writes to ages out too; a profile nobody uses at
+all is swept when someone next does, so for a strict policy run `hermes librenms prune` from cron.
+Each deletion is recorded as an `audit_pruned` event naming the files, in the new file and at the
+sinks. Retention applies whether or not `audit_log` is on: turning the log off writes no new event,
+and what was written still ages out (with no `audit_pruned` record, since the log is off).
+
+**Several processes** write the same file. Each writer of the plugin, in every process, takes an
+exclusive `flock` on `<name>.lock` (next to the log; it stays empty) before it opens the log, and
+keeps it until its line is written; rotation and retention happen only under it. So no rotation
+falls between a writer's open and its write, no event is written to a file after it was rotated
+(where retention could delete it), and no two processes rotate at once (two renames to the same
+name would replace the first rotated file): every event is written whole, once, to the file that
+was the log when it was written. A writer waits up to two seconds for the lock; past that the event
+is written without it and the file is not rotated until a later event takes the lock (Hermes' log
+says so). Where the lock cannot be used, because the platform has no `flock` (Windows), the lock
+file cannot be created (a directory this account cannot write to) or is not a regular file this
+account owns, events are written as before and nothing is rotated or deleted; Hermes' log says
+why, once per process. With every limit at `0` no lock is taken.
+
+On disk the log takes at most about (`audit_keep_files` + 1) × `audit_max_mb`, 1,010 MiB at the
+defaults; a day of ordinary use writes far less than 10 MiB, so it is usually one small file per day
+for 90 days. While `audit_retention_days` is on, each active day starts a file, so an
+`audit_keep_files` below `audit_retention_days` keeps only about as many days; `/librenms status`
+warns about it.
+
+### Rotating with logrotate instead
+
+To let the system's logrotate manage a file at `audit_log_path`, turn the plugin's rotation off
+(`audit_max_mb: 0`, `audit_keep_files: 0`, `audit_retention_days: 0`) and rotate by renaming, which
+loses no line because the plugin opens the file by name for every event:
+
+```
+/var/log/hermes/librenms-audit.jsonl {
+    su hermes hermes
+    daily
+    rotate 90
+    maxage 90
+    dateext
+    missingok
+    notifempty
+    create 0600 hermes hermes
+}
+```
+
+With `compress`, add `delaycompress`, so the file just renamed is not compressed while a line may
+still be on its way to it. `copytruncate` works too (each line is a single `write` at the end of the
+file) but loses the lines written between its copy and its truncate. Do not combine logrotate and the
+plugin's own rotation on one file: they do not share a lock.
 
 ## The actor record
 
@@ -109,8 +190,9 @@ Every event carries `config_digest`: the first 12 hex digits of the SHA-256 of t
 force, as canonical JSON, with `audit_sinks` reduced to their count and types (a sink's URL and
 headers can hold a credential). The same settings give the same digest in every process, so a
 collector can alert on any digest you have not approved, and two events with different digests ran
-under different configurations. A setting added in a later release (`max_result_chars`, 0.1.3)
-counts only once it differs from its default, so upgrading does not change the digest of a
+under different configurations. A setting added in a later release (`max_result_chars` in 0.1.3,
+`librenms_timezone` in 0.4.0, `audit_max_mb`, `audit_keep_files` and `audit_retention_days` in
+0.12.0) counts only once it differs from its default, so upgrading does not change the digest of a
 configuration. `/librenms status` shows the settings behind the digest.
 
 ## The plan file
@@ -228,6 +310,7 @@ Step and revert events identify their object with `index`, `action`, `resource`,
 | `revert_reverted`, `revert_conflict`, `revert_failed`, `revert_irreversible`, `revert_skipped` | Outcome of one inverse. A write whose answer was lost and that LibreNMS shows no trace of yet is `revert_failed` until ten minutes have passed (it may still land), with an `error` that says when to roll back again | object fields, `status`, `error`, `new_object_id` (a re-created object), `http_status`, `request` |
 | `rollback_finished` | Outcome of the rollback | `status` (`rolled_back` or `partially_rolled_back`), `reverted`, `conflict`, `failed`, `irreversible`, `skipped`, `force`, `reason` |
 | `plans_pruned` | Retention removed plan files (`plan_id` is null) | `max_age_days`, `count`, `plan_ids` |
+| `audit_pruned` | Retention removed rotated audit log files (`plan_id` is null); `actor` is whoever's call set it off | `max_age_days`, `keep_files`, `count`, `files` (names in the log's directory) |
 
 `summary` counts `create`, `update`, `delete`, `action` (maintenance, discover, ack, unmute) and
 `noop`. `request` is `{"method", "path", "status", "duration_ms"}`.
@@ -271,6 +354,9 @@ A revert that could not be undone:
 - The stream is newline-delimited JSON. Point Filebeat, Fluent Bit, Vector or the Splunk forwarder
   at the file with a JSON codec; every line is a self-contained record.
 - Map `ts` to your timestamp field (`@timestamp` in Elastic).
+- The file is rotated by renaming it ([above](#rotation-and-retention)): watch the log's own name,
+  not a pattern that also matches the rotated files (`audit.jsonl.*`), or a shipper that does not
+  follow renames reads them twice.
 - Useful searches:
   - `event:apply_started AND actor.kind:model AND actor.chat_type:group`: a model wrote to
     LibreNMS from a group chat;
@@ -288,6 +374,7 @@ A revert that could not be undone:
     asked again for that plan while its content stays as it was (`digest`);
   - `event:apply_refused AND approved_digest:*` (or `rollback_refused`): a plan file that changed
     between the approval prompt and the run; find who wrote to `plugin-data`;
-  - `config_digest` not in the set you approved: the configuration changed.
+  - `config_digest` not in the set you approved: the configuration changed;
+  - `event:audit_pruned`: local audit files deleted by retention; the collector's copy is the record.
 - Join with LibreNMS's eventlog on `eventlog_ids`, and with its web server's access log on
   `request.path`, the time and the plugin's User-Agent.

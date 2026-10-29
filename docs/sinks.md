@@ -179,7 +179,7 @@ Severity mapping:
 | Severity | Events |
 |---|---|
 | warning (4) | `plan_rejected`, `apply_refused`, `rollback_refused`, `query_refused`, `step_failed`, `step_conflict`, `revert_failed`, `revert_conflict`, `revert_irreversible`, `run_recovered`, `apply_finished` with a failed outcome, `rollback_finished` that is not fully rolled back, `eventlog_linked` that could not link |
-| notice (5) | `apply_started`, `rollback_started`, `plans_pruned`, `approval_requested`, `approval_decided` |
+| notice (5) | `apply_started`, `rollback_started`, `plans_pruned`, `audit_pruned`, `approval_requested`, `approval_decided` |
 | informational (6) | everything else |
 
 ## CEF

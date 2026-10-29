@@ -119,7 +119,14 @@ _WARNING_EVENTS = {
     "revert_irreversible",
     "run_recovered",
 }
-_NOTICE_EVENTS = {"apply_started", "rollback_started", "plans_pruned", "approval_requested", "approval_decided"}
+_NOTICE_EVENTS = {
+    "apply_started",
+    "rollback_started",
+    "plans_pruned",
+    "audit_pruned",
+    "approval_requested",
+    "approval_decided",
+}
 
 
 def severity_of(record: Dict[str, Any]) -> int:

@@ -35,7 +35,7 @@ v0 route to what the plugin does with it.
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
 | `executor` | Preflight, claims and run locks, per-step precondition, execute, journal, automatic and manual rollback, crash recovery, eventlog linking | `resources`, `store`, `audit` |
 | `store` | Atomic `0600` JSON persistence of plans in `0700` directories, the cross-process claim lock, per-plan run locks, retention, the active profile's key | Hermes `plugin_storage`, `hermes_constants` (optional) |
-| `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl` | Hermes `gateway.session_context` (optional) |
+| `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl`, its rotation (under a `flock` every writer holds from its open to its write) and retention | Hermes `gateway.session_context` (optional) |
 | `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread per Hermes profile; the warning about a credential written into `config.yaml` | `settings`, `store`, Hermes `hermes_cli.config` (optional) |
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
 | `settings` | Operator settings with fail-closed coercion (a time zone the host's zone database does not hold is refused) | Hermes `ctx.get_config` (optional) |

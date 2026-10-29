@@ -406,21 +406,38 @@ def prune_plans(
     return {"max_age_days": max_age, "dry_run": dry_run, "removed": removed}
 
 
+def prune_audit(*, dry_run: bool = False, actor: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Apply the audit log's retention (``audit_keep_files``, ``audit_retention_days``): rotate the live file when
+    it is due and remove the rotated files past it; audited as ``audit_pruned``. *dry_run* lists the rotated files
+    that would go now."""
+    log = audit.get_audit_log()
+    retention = log.retention
+    return {
+        "keep_files": retention.keep_files,
+        "max_age_days": retention.max_age_days,
+        "dry_run": dry_run,
+        "removed": log.prune(actor=actor, dry_run=dry_run),
+    }
+
+
 def maybe_prune(actor: Dict[str, Any] | Callable[[], Dict[str, Any]]) -> None:
-    """Opportunistic retention sweep of the active profile's plans, at most once an hour per profile in this
-    process: planning, listing plans, status and every ``/librenms`` or ``hermes librenms`` command call it, so a
-    profile that stops planning is still swept. *actor* (or a function making it, called only when a sweep runs)
-    is recorded on ``plans_pruned``. Never raises: retention is housekeeping and must not affect the call."""
+    """Opportunistic retention sweep of the active profile's plans and audit log, at most once an hour per profile
+    in this process: planning, listing plans, status and every ``/librenms`` or ``hermes librenms`` command call
+    it, so a profile that stops planning is still swept, and a log nobody writes to still ages out. *actor* (or a
+    function making it, called only when a sweep runs) is recorded on ``plans_pruned`` and ``audit_pruned``. Never
+    raises: retention is housekeeping and must not affect the call."""
     with contextlib.suppress(Exception):
-        if get_settings().plan_retention_days <= 0:
-            return
         key, now = profile_key(), time.monotonic()
         with _prune_lock:
             last = _last_prune_at.get(key)
             if last is not None and now - last < _PRUNE_INTERVAL:
                 return
             _last_prune_at[key] = now
-        prune_plans(actor=actor() if callable(actor) else actor)
+        who = actor() if callable(actor) else actor
+        if get_settings().plan_retention_days > 0:
+            with contextlib.suppress(Exception):  # the audit log's retention runs all the same
+                prune_plans(actor=who)
+        prune_audit(actor=who)
 
 
 def status_report(settings: Settings | None = None) -> Dict[str, Any]:
@@ -451,6 +468,13 @@ def status_report(settings: Settings | None = None) -> Dict[str, Any]:
         warnings.append(
             "write_mode is full and require_approval is false: the model can apply and roll back plans without "
             "anyone approving them"
+        )
+    if 0 < settings.audit_keep_files < settings.audit_retention_days:
+        warnings.append(
+            f"audit_keep_files ({settings.audit_keep_files}) is below audit_retention_days "
+            f"({settings.audit_retention_days}): the audit log is rotated daily while retention is on, so only its "
+            f"newest {settings.audit_keep_files} rotated files (about as many days) are kept; raise audit_keep_files "
+            "or set it to 0"
         )
     warnings += sinks.literal_credential_warnings()
     return {

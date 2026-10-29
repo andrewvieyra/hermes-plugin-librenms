@@ -141,6 +141,9 @@ plugins:
         audit_log: true              # append events to audit.jsonl
         audit_log_path: ""           # absolute; empty = <HERMES_HOME>/plugin-data/librenms/audit.jsonl
         audit_include_request: true  # record the triggering message (masked, truncated) in the actor
+        audit_max_mb: 10             # rotate audit.jsonl before it passes this many MiB; 0: never by size
+        audit_keep_files: 100        # rotated audit files kept, newest first; 0: any number
+        audit_retention_days: 90     # delete rotated audit files this old (rotated daily); 0: keep forever
         link_eventlog: true          # attach LibreNMS eventlog ids to the journal after apply/rollback
         audit_sinks: []              # optional syslog / HTTP forwarding, see docs/sinks.md
 ```
@@ -172,6 +175,15 @@ re-read on each call, so a change in `config.yaml` or the Desktop settings form 
 restart. Retention is applied at most hourly per profile, when a plan is made or listed, on status
 and on every `/librenms` or `hermes librenms` command; for a strict policy, run `hermes librenms
 prune` from cron.
+
+The audit log holds every triggering message, so it has a retention of its own. It is rotated before
+an event would take it past `audit_max_mb`, and daily while `audit_retention_days` is on, by renaming
+it to `audit.jsonl.<UTC time of its newest event>`; rotated files past the newest `audit_keep_files`,
+or whose newest event is older than `audit_retention_days`, are deleted after each rotation, by the
+same hourly sweep and by `hermes librenms prune`. Every writer, in every process, holds a lock on
+`audit.jsonl.lock` from its open to its write, so no event is lost to a rotation. Keep
+`audit_keep_files` above `audit_retention_days` (status warns otherwise), and set all three to `0`
+when logrotate manages the file. See [docs/audit.md](docs/audit.md#rotation-and-retention).
 
 Environment variables (connection only; nothing that relaxes a safeguard is read from the
 environment):
@@ -687,7 +699,9 @@ Every plan, apply and rollback is recorded for review and for SIEM ingestion:
 - **In an append-only event stream**, `<HERMES_HOME>/plugin-data/librenms/audit.jsonl`, one JSON
   object per line: `plan_created`, `apply_started`, `step_done`, `apply_finished`, `rollback_*`,
   `approval_requested`, `approval_decided`, and the refusals and rejections that never reached
-  LibreNMS.
+  LibreNMS. It is rotated at 10 MiB and daily, and rotated files are deleted after 90 days or past
+  the newest 100 (`audit_max_mb`, `audit_retention_days`, `audit_keep_files`), each deletion recorded
+  as `audit_pruned`.
 
 The actor record distinguishes a model tool call from a human using `/librenms` or `hermes
 librenms`, and carries the Hermes surface, profile, gateway platform, chat, user, session, cron job,
@@ -749,7 +763,7 @@ resources/    one module per resource: validate, resolve, diff, execute, verify,
 planner.py    operations -> plan
 executor.py   apply with journal and verification, rollback, eventlog linking
 store.py      plan persistence and locks under plugin-data
-audit.py      actor capture and the audit.jsonl event stream
+audit.py      actor capture and the audit.jsonl event stream, its rotation and retention
 sinks.py      optional syslog / HTTP forwarding of audit events
 timefmt.py    UTC-to-local rendering for plan diffs and journals (Hermes' timezone setting)
 settings.py   operator settings, fail-closed

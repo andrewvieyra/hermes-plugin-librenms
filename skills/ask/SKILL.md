@@ -1,7 +1,7 @@
 ---
 name: librenms-ask
 description: Answer questions about the network as LibreNMS sees it, over several turns, with the read-only librenms_report and librenms_query tools. Load when the user asks what is down, alerting or flapping, how busy a port or link is, link speeds and duplex, port descriptions and device names, LLDP/CDP neighbours, where a MAC or IP address is, VLANs, sensors and optics, BGP or OSPF sessions, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.11.1
+version: 0.12.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, network, questions]

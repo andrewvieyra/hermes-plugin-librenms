@@ -6,6 +6,72 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-29
+
+Audit log retention and rotation (finding feat-audit-retention).
+
+### Security
+- The audit log no longer keeps the users' messages forever. `audit.jsonl` was append-only and grew without bound,
+  and every event can carry the message that triggered the call (`actor.request`), so a year of use left a year of
+  chat on the gateway host with no setting to bound it; plans had `plan_retention_days`, the stream nothing. It is
+  now rotated before an event would take it past `audit_max_mb` (default 10 MiB) and, while
+  `audit_retention_days` is on, at the first event of each UTC day, by renaming it to
+  `<name>.<UTC time of its newest event>` (`-2`, `-3` for more within that second, so names sort in rotation order
+  even after one was removed). Rotated files past the newest `audit_keep_files` (default 100), or whose newest event
+  is older than `audit_retention_days` (default 90), are deleted after each rotation, by the hourly retention sweep
+  that already ran for plans (which also rotates a file whose events are of an earlier day, so a log nobody writes
+  to ages out), and by `hermes librenms prune`, whether or not `audit_log` is on. Each deletion is audited as
+  `audit_pruned` (`max_age_days`, `keep_files`, `count`, `files`), a notice at the sinks. A value that cannot be
+  read (`30d`, `-1`, `false`, `0.5`) is the default, never "keep forever"; only `0` turns a limit off, and the limits
+  are 10240 MiB, 10000 files and 3650 days.
+- No event is lost to a rotation, in any process. Every writer takes an exclusive `flock` on `<name>.lock` (next to
+  the log, never written to) before it opens the log and keeps it until its line is written, and rotation and
+  retention run only under it: no rotation falls between a writer's open and its write, so no event lands in a file
+  after it was rotated (where retention could delete it with the event), and no two processes rotate at once (their
+  renames to the same name would replace the first rotated file; four processes writing through rotations every
+  few events lost lines without the lock). A writer kept waiting more than two seconds writes without the lock and
+  does not rotate; where the lock cannot be used (no `flock`, a lock file that cannot be created or is a link or
+  another account's) events are written as before, unrotated, and Hermes' log says why once per process. With every
+  limit `0` no lock is taken.
+- The 0.1.1 checks hold for every file rotation touches. Only a log that is a regular file this account owns with
+  no other hard link is rotated; its successor is created with `O_EXCL` and never through a symlink, with the old
+  file's mode and group (`0600` for one the plugin made; a shipper that reads a `0640` file the operator made keeps
+  reading); retention counts and deletes only rotated names that are regular files this account owns with one name,
+  so a symbolic or hard link or another account's file planted at such a name is neither followed nor deleted, and
+  anything else in the directory (logrotate's `audit.jsonl.1`, a compressed copy) is left alone.
+
+### Added
+- Settings `audit_max_mb`, `audit_keep_files` and `audit_retention_days` (plugin.yaml `config_schema`, README,
+  SKILL.md). Added after 0.1.0, they count in `config_digest` only once they differ from their defaults, so an
+  upgrade does not change the digest of an approved configuration.
+- `hermes librenms prune` and `/librenms prune` apply the audit log's retention too, and say what they removed
+  (`Audit log: removed N rotated file(s) (keeping the newest 100, none older than 90 days):` and the names);
+  `--dry-run` lists the rotated files they would delete, `--days` still concerns plans only.
+- A status warning when `audit_keep_files` is below `audit_retention_days`: the log is rotated daily while
+  retention is on, so the count would keep only about as many days.
+- `audit.Retention`, `AuditLog(retention=)`, `AuditLog.prune()`, `audit.rotated_files()` and
+  `handlers.prune_audit()`.
+
+### Changed
+- On upgrade, an existing `audit.jsonl` is rotated at its first event on a later UTC day than its last one (or
+  sooner past 10 MiB), and deleted, older events in it included, once its newest event is 90 days old. To keep it,
+  copy it away first or set `audit_retention_days: 0` (and `audit_keep_files: 0`). Where logrotate already manages
+  the file, set all three settings to `0`; docs/audit.md has a logrotate stanza that rotates by renaming, which
+  loses no line.
+- `maybe_prune` runs the audit log's retention whatever `plan_retention_days` is, and a failing plan sweep no
+  longer keeps it from running. `prune` output gains an `Audit log:` line.
+- docs/audit.md (a "Rotation and retention" section: settings, naming, the lock, disk use, the logrotate
+  alternative; the `audit_pruned` event; ingestion notes on following renames), SECURITY.md (a threat row for
+  users' messages piling up, the file checks and the lock, what pruning does not do, deployment item 11),
+  README (Configuration, the audit trail, the layout), docs/sinks.md and docs/architecture.md say so.
+- Tests: the settings' coercion, limits and digest; rotation by size and by day, the successor's mode and group,
+  names in rotation order after a removal, retention by count and age with every removal recorded, nothing removed
+  that is not the plugin's own rotated file, a live file that is not this account's never rotated, an unusable
+  lock file, the lock held by a writer from its open to its write against another process, a lock held too long
+  delaying but not dropping an event, four processes writing through dozens of rotations with every event kept once
+  and in order, the sweep of a quiet log, dry runs, no files made without a log, retention with the log off and
+  with every limit 0; the hourly sweep and `prune` applying it, and the status warning.
+
 ## [0.11.1] - 2026-10-29
 
 What the review of 0.11.0 found in its own changes, each confirmed against the 0.11.0 code first.

@@ -1,14 +1,18 @@
 """Audit trail: actor capture (session context, plugin context, slash-command sender), the request cache filled by
-``pre_llm_call`` and its redaction, the environment record, and the event stream's file discipline (0600 file in a
-0700 directory, one append per line, masking, order shared with the sinks)."""
+``pre_llm_call`` and its redaction, the environment record, the event stream's file discipline (0600 file in a
+0700 directory, one append per line, masking, order shared with the sinks), and its rotation and retention (by size
+and day, by count and age, under a lock every writer holds, in every process)."""
 
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +20,7 @@ from unittest import mock
 
 from .base import PluginTestCase
 from .fake_librenms import TOKEN
-from .helpers import submodule
+from .helpers import REPO_ROOT, submodule
 
 audit = submodule("audit")
 sinks = submodule("sinks")
@@ -67,6 +71,34 @@ ACTOR_KEYS = [
     "request",
 ]
 BASE_KEYS = ["ts", "schema", "plugin", "event", "plan_id", "librenms_url", "config_digest", "actor", "host", "pid"]
+# Another process writing to, holding the rotation lock of, or sweeping the same audit log.
+CHILD = """
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from tests.helpers import submodule
+
+audit = submodule("audit")
+submodule("sinks").set_worker(submodule("sinks").SinkWorker([]))
+path, mode = Path(sys.argv[2]), sys.argv[3]
+log = audit.AuditLog(path, retention=audit.Retention(*json.loads(sys.argv[4])))
+if mode == "write":
+    name, count = sys.argv[5], int(sys.argv[6])
+    print("ready", flush=True)
+    sys.stdin.readline()  # every writer starts at once
+    for index in range(count):
+        log.emit("step_done", plan_id=name, index=index, label="x" * 200)
+elif mode == "hold":
+    with audit._rotation_lock(path) as locked:
+        print("locked" if locked else "not locked", flush=True)
+        sys.stdin.read()
+elif mode == "try":
+    audit.LOCK_WAIT = 0.2
+    with audit._rotation_lock(path) as locked:
+        print("locked" if locked else "busy", flush=True)
+"""
 
 
 def _restore_env(saved):
@@ -155,6 +187,20 @@ class AuditCase(unittest.TestCase):
         if not self.audit_path.exists():
             return []
         return [json.loads(line) for line in self.audit_path.read_text(encoding="utf-8").splitlines() if line]
+
+    def open_then(self, after_open):
+        """``os.open`` that runs *after_open(attempt)* once the log itself is opened: what another process does to
+        the name between the open and the check."""
+        real_open, attempts = os.open, []
+
+        def opener(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if Path(path) == self.audit_path:
+                attempts.append(path)
+                after_open(len(attempts))
+            return fd
+
+        return mock.patch.object(audit.os, "open", opener), attempts
 
 
 class ActorCapture(AuditCase):
@@ -600,20 +646,6 @@ class EventStream(AuditCase):
         self.assertTrue(sinks.get_worker().flush(2))
         self.assertEqual([r["event"] for r in recorder.records], ["plan_created"])
 
-    def open_then(self, after_open):
-        """``os.open`` that runs *after_open(attempt)* once the log itself is opened: what another process does to
-        the name between the open and the check."""
-        real_open, attempts = os.open, []
-
-        def opener(path, *args, **kwargs):
-            fd = real_open(path, *args, **kwargs)
-            if Path(path) == self.audit_path:
-                attempts.append(path)
-                after_open(len(attempts))
-            return fd
-
-        return mock.patch.object(audit.os, "open", opener), attempts
-
     def test_a_hard_link_removed_between_the_open_and_the_check_is_caught(self):
         victim = self.tmp / "victim.txt"
         victim.write_text("untouched\n")
@@ -711,6 +743,337 @@ class EventStream(AuditCase):
         self.assertEqual([r["event"] for r in recorder.records], names)
         self.assertEqual([e["event"] for e in self.events()], names)
         self.assertEqual(recorder.records[0]["snapshot"]["community"], "<redacted>")
+
+
+def _stamp(when):
+    return when.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+class Child:
+    """A second Python process running :data:`CHILD` on the same audit log."""
+
+    def __init__(self, path, mode, retention, *args):
+        limits = json.dumps([retention.max_bytes, retention.keep_files, retention.max_age_days])
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", CHILD, str(REPO_ROOT), str(path), mode, limits, *args],
+            cwd=REPO_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def line(self):
+        line = self.proc.stdout.readline().strip()
+        if not line:
+            self.proc.kill()
+            raise AssertionError(f"child said nothing: {self.proc.communicate(timeout=10)[1]}")
+        return line
+
+    def go(self):
+        self.proc.stdin.write("\n")
+        self.proc.stdin.flush()
+
+    def finish(self):
+        out, err = self.proc.communicate(timeout=120)
+        if self.proc.returncode:
+            raise AssertionError(f"child failed: {err}")
+        return out
+
+    def kill(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.communicate(timeout=10)
+
+
+class Rotation(AuditCase):
+    """``audit_max_mb``, ``audit_keep_files`` and ``audit_retention_days``: the log is rotated by renaming it, under
+    a lock every writer holds from its open to its write, and rotated files are removed by count and age."""
+
+    def setUp(self):
+        super().setUp()
+        sinks.set_worker(sinks.SinkWorker([]))
+
+    def use(self, max_bytes=0, keep_files=0, max_age_days=0):
+        retention = audit.Retention(max_bytes, keep_files, max_age_days)
+        audit.set_audit_log(audit.AuditLog(self.audit_path, retention=retention))
+        return retention
+
+    def rotated(self):
+        """The rotated files' names, oldest first."""
+        return [name for _newest, name in reversed(audit.rotated_files(self.audit_path))]
+
+    def lines(self, name):
+        return [json.loads(line) for line in (self.tmp / name).read_text(encoding="utf-8").splitlines()]
+
+    def plant(self, days_ago, suffix="", content='{"event":"old"}\n'):
+        """A rotated file whose newest event is *days_ago* days old."""
+        moment = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        path = self.tmp / f"audit.jsonl.{_stamp(moment)}{suffix}"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_retention_follows_the_settings(self):
+        self.set_settings(audit_max_mb=3, audit_keep_files=7, audit_retention_days=30)
+        self.assertEqual(audit.Retention.from_settings(), audit.Retention(3 * 1024 * 1024, 7, 30))
+        self.assertEqual(audit.AuditLog(self.audit_path).retention, audit.Retention(3 * 1024 * 1024, 7, 30))
+        audit.set_audit_log(None)
+        self.assertEqual(audit.get_audit_log().retention, audit.Retention(3 * 1024 * 1024, 7, 30))
+        self.assertEqual(audit.Retention.from_settings(Settings()), audit.Retention(10 * 1024 * 1024, 100, 90))
+        self.assertFalse(audit.Retention(0, 5, 0).rotates)
+
+    def test_the_log_is_rotated_before_a_write_would_take_it_past_its_size(self):
+        old = os.umask(0o022)
+        try:
+            self.use(max_bytes=1500)
+            for index in range(12):
+                audit.emit("step_done", plan_id="lnp-1", index=index, label="x" * 300)
+        finally:
+            os.umask(old)
+        rotated = self.rotated()
+        self.assertGreater(len(rotated), 3)
+        written = [event["index"] for name in [*rotated, "audit.jsonl"] for event in self.lines(name)]
+        self.assertEqual(written, list(range(12)))  # every event once, in order across the files
+        for name in [*rotated, "audit.jsonl"]:
+            self.assertLessEqual((self.tmp / name).stat().st_size, 1500, name)
+            self.assertEqual(stat.S_IMODE((self.tmp / name).stat().st_mode), 0o600, name)
+        for name in rotated:
+            self.assertRegex(name, r"^audit\.jsonl\.\d{8}T\d{6}Z(-\d+)?$")
+        self.assertEqual(stat.S_IMODE((self.tmp / "audit.jsonl.lock").stat().st_mode), 0o600)
+        self.assertEqual((self.tmp / "audit.jsonl.lock").read_bytes(), b"")  # a lock, never written
+
+    def test_rotations_within_a_second_keep_their_order_after_retention_removed_one(self):
+        self.use(max_bytes=10, keep_files=1)  # every event over the size: each write rotates the one before
+        for index in range(6):
+            audit.emit("step_done", plan_id="lnp-1", index=index)
+        (rotated,) = self.rotated()
+        steps = [e["index"] for e in self.lines(rotated) if e["event"] == "step_done"]
+        self.assertEqual(steps, [4])  # the newest rotated file is the one kept
+        self.assertEqual([e["index"] for e in self.events() if e["event"] == "step_done"], [5])
+
+    def test_the_successor_keeps_the_mode_and_group_of_the_file_it_replaces(self):
+        # a log shipper that reads a file the operator made 0640 for its group keeps reading after a rotation
+        self.use(max_bytes=10)
+        audit.emit("plan_created", plan_id="lnp-1")
+        os.chmod(self.audit_path, 0o640)
+        groups = [gid for gid in os.getgroups() if gid != self.audit_path.stat().st_gid]
+        if groups:
+            os.chown(self.audit_path, -1, groups[0])
+        audit.emit("plan_created", plan_id="lnp-2")
+        (rotated,) = self.rotated()
+        self.assertEqual(stat.S_IMODE(self.audit_path.stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE((self.tmp / rotated).stat().st_mode), 0o640)
+        if groups:
+            self.assertEqual(self.audit_path.stat().st_gid, groups[0])
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-2"])
+
+    def test_with_retention_by_age_the_log_is_rotated_daily(self):
+        self.use(max_age_days=30)
+        audit.emit("plan_created", plan_id="lnp-1")
+        audit.emit("plan_created", plan_id="lnp-2")
+        self.assertEqual(self.rotated(), [])  # the same day: one file
+        yesterday = time.time() - 86400
+        os.utime(self.audit_path, (yesterday, yesterday))
+        audit.emit("plan_created", plan_id="lnp-3")
+        (rotated,) = self.rotated()
+        self.assertEqual(rotated, f"audit.jsonl.{_stamp(datetime.fromtimestamp(yesterday, timezone.utc))}")
+        self.assertEqual([e["plan_id"] for e in self.lines(rotated)], ["lnp-1", "lnp-2"])
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-3"])
+        self.use(max_bytes=10 * 1024 * 1024)  # without retention by age: only by size
+        os.utime(self.audit_path, (yesterday, yesterday))
+        audit.emit("plan_created", plan_id="lnp-4")
+        self.assertEqual(len(self.rotated()), 1)
+
+    def test_rotated_files_past_the_count_or_the_age_are_removed_and_audited(self):
+        recorder = Recorder()
+        sinks.set_worker(sinks.SinkWorker([recorder]))
+        old, recent = self.plant(100), self.plant(10)
+        older = self.plant(200, suffix="-2")
+        self.use(max_bytes=10, keep_files=3, max_age_days=30)
+        actor = {"kind": "operator", "via": "cli"}
+        audit.emit("plan_created", plan_id="lnp-1", actor=actor)
+        self.assertEqual(self.rotated(), [older.name, old.name, recent.name])  # an empty file is not rotated
+        self.assertEqual([e["event"] for e in self.events()], ["plan_created"])  # so retention has not run
+        audit.emit("plan_created", plan_id="lnp-2", actor=actor)  # rotates lnp-1's file, then retention runs
+        self.assertFalse(old.exists() or older.exists())
+        self.assertEqual(len(self.rotated()), 2)
+        pruned = [e for e in self.events() if e["event"] == "audit_pruned"]
+        self.assertEqual(len(pruned), 1)
+        self.assertEqual(sorted(pruned[0]["files"]), sorted([old.name, older.name]))
+        self.assertEqual(
+            (pruned[0]["count"], pruned[0]["keep_files"], pruned[0]["max_age_days"], pruned[0]["plan_id"]),
+            (2, 3, 30, None),
+        )
+        self.assertEqual(pruned[0]["actor"], actor)  # whoever's event set the rotation off
+        for index in range(3, 8):
+            audit.emit("plan_created", plan_id=f"lnp-{index}", actor=actor)
+        self.assertEqual(len(self.rotated()), 3)  # the newest three
+        self.assertFalse(recent.exists())
+        self.assertTrue(sinks.get_worker().flush(5))
+        removed = [name for r in recorder.records if r["event"] == "audit_pruned" for name in r["files"]]
+        self.assertIn(recent.name, removed)  # every removal is on record (the collector's copy outlives the file)
+        self.assertEqual(len(removed), len(set(removed)))
+        for name in removed:
+            self.assertFalse((self.tmp / name).exists())
+        self.assertEqual(len(removed), 6)  # the three planted files and the three oldest rotations
+
+    def test_retention_leaves_alone_what_is_not_its_own_rotated_file(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("untouched\n")
+        stamp = _stamp(datetime.now(timezone.utc) - timedelta(days=400))
+        link = self.tmp / f"audit.jsonl.{stamp}"
+        os.symlink(victim, link)
+        hard = self.tmp / f"audit.jsonl.{stamp}-2"
+        os.link(victim, hard)
+        folder = self.tmp / f"audit.jsonl.{stamp}-3"
+        folder.mkdir()
+        others = ["audit.jsonl.1", "audit.jsonl-20200101", f"audit.jsonl.{stamp}.gz", "other.jsonl." + stamp]
+        for name in others:
+            (self.tmp / name).write_text("{}\n")
+        self.assertEqual(audit.rotated_files(self.audit_path), [])
+        self.use(max_bytes=10, keep_files=1, max_age_days=1)
+        for index in range(3):
+            audit.emit("plan_created", plan_id=f"lnp-{index}")
+        self.assertEqual(victim.read_text(), "untouched\n")
+        self.assertTrue(link.is_symlink() and hard.exists() and folder.is_dir())
+        for name in others:
+            self.assertTrue((self.tmp / name).exists(), name)
+        if hasattr(os, "geteuid"):  # another account's file at a rotated name: neither counted nor removed
+            planted = self.plant(500)
+            with mock.patch.object(audit.os, "geteuid", return_value=os.geteuid() + 1):
+                self.assertEqual(audit.rotated_files(self.audit_path), [])
+            self.assertIn(planted.name, [name for _newest, name in audit.rotated_files(self.audit_path)])
+
+    def test_a_live_file_that_is_not_this_accounts_own_is_never_rotated(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("untouched\n")
+        os.link(victim, self.audit_path)
+        self.use(max_bytes=1, keep_files=1, max_age_days=1)
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            audit.emit("plan_created", plan_id="lnp-1")
+        self.assertEqual((victim.read_text(), self.rotated()), ("untouched\n", []))
+        self.assertIn("has other hard links", logs.output[0])
+        self.assertFalse((self.tmp / "audit.jsonl.lock").exists())  # not even a lock taken for it
+
+    def test_a_lock_file_that_cannot_be_used_leaves_the_log_unrotated_but_written(self):
+        self.use(max_bytes=10)
+        os.symlink(self.tmp / "elsewhere", self.tmp / "audit.jsonl.lock")
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            for index in range(3):
+                audit.emit("plan_created", plan_id=f"lnp-{index}")
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-0", "lnp-1", "lnp-2"])
+        self.assertEqual(self.rotated(), [])
+        self.assertFalse((self.tmp / "elsewhere").exists())  # never created through the link
+        self.assertEqual(len([line for line in logs.output if "not rotated" in line]), 1)  # said once
+
+    def test_a_writer_holds_the_lock_from_its_open_to_its_write(self):
+        # so a rotation and removal in another process cannot take the file from under an event about to be written
+        retention = self.use(max_bytes=1024 * 1024, keep_files=1, max_age_days=1)
+        said = []
+
+        def other_process(attempt):
+            child = Child(self.audit_path, "try", retention)
+            said.append(child.line())
+            child.finish()
+
+        patched, attempts = self.open_then(other_process)
+        with patched:
+            audit.emit("plan_created", plan_id="lnp-1")
+        self.assertEqual((said, len(attempts)), (["busy"], 1))
+        child = Child(self.audit_path, "try", retention)
+        self.assertEqual(child.line(), "locked")  # and let go once written
+        child.finish()
+
+    def test_a_lock_held_too_long_delays_an_event_but_never_drops_it(self):
+        retention = self.use(max_bytes=10)
+        audit.emit("plan_created", plan_id="lnp-1")
+        holder = Child(self.audit_path, "hold", retention)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.line(), "locked")
+        started = time.monotonic()
+        with (
+            mock.patch.object(audit, "LOCK_WAIT", 0.3),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            audit.emit("plan_created", plan_id="lnp-2")
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        self.assertIn("held the rotation lock", logs.output[0])
+        self.assertEqual(([e["plan_id"] for e in self.events()], self.rotated()), (["lnp-1", "lnp-2"], []))
+        holder.finish()
+        audit.emit("plan_created", plan_id="lnp-3")  # the lock is free again: the overdue rotation happens
+        (rotated,) = self.rotated()
+        self.assertEqual([e["plan_id"] for e in self.lines(rotated)], ["lnp-1", "lnp-2"])
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-3"])
+
+    def test_concurrent_processes_lose_no_event_across_rotations(self):
+        retention = audit.Retention(4096, 0, 0)  # a rotation every few events; every rotated file kept
+        names, count = [f"lnp-{n}" for n in range(4)], 60
+        children = [Child(self.audit_path, "write", retention, name, str(count)) for name in names]
+        for child in children:
+            self.addCleanup(child.kill)
+            self.assertEqual(child.line(), "ready")
+        for child in children:
+            child.go()
+        for child in children:
+            child.finish()
+        rotated = self.rotated()
+        self.assertGreater(len(rotated), 10)
+        seen = {name: [] for name in names}
+        for name in [*rotated, "audit.jsonl"]:
+            self.assertLessEqual((self.tmp / name).stat().st_size, 4096, name)
+            for event in self.lines(name):
+                seen[event["plan_id"]].append(event["index"])
+        # every event once, and none written to a file after it was rotated: each writer's events stay in order
+        # from the oldest rotated file to the live one
+        self.assertEqual(seen, {name: list(range(count)) for name in names})
+
+    def test_a_sweep_rotates_and_removes_a_quiet_log(self):
+        # a profile nobody uses for months: no event comes to rotate the file, the sweep does
+        self.use(max_age_days=30)
+        audit.emit("plan_created", plan_id="lnp-1")
+        quiet = time.time() - 40 * 86400
+        os.utime(self.audit_path, (quiet, quiet))
+        recent = self.plant(5)
+        self.assertEqual(audit.get_audit_log().prune(dry_run=True), [])  # the live file is not rotated in a dry run
+        actor = {"kind": "operator", "via": "cli"}
+        expected = f"audit.jsonl.{_stamp(datetime.fromtimestamp(quiet, timezone.utc))}"
+        self.assertEqual(audit.get_audit_log().prune(actor=actor), [expected])
+        self.assertEqual(self.rotated(), [recent.name])
+        (pruned,) = self.events()  # the log starts again with the record of what was removed
+        self.assertEqual((pruned["event"], pruned["files"], pruned["actor"]), ("audit_pruned", [expected], actor))
+        self.assertEqual(audit.get_audit_log().prune(), [])
+
+    def test_a_dry_run_lists_what_would_go_and_removes_nothing(self):
+        self.use(keep_files=1, max_age_days=30)
+        old, recent, newest = self.plant(100), self.plant(10), self.plant(1)
+        self.assertEqual(sorted(audit.get_audit_log().prune(dry_run=True)), sorted([old.name, recent.name]))
+        self.assertTrue(old.exists() and recent.exists() and newest.exists())
+        self.assertEqual(self.events(), [])
+
+    def test_a_sweep_without_a_log_creates_nothing(self):
+        nowhere = self.tmp / "none" / "audit.jsonl"
+        log = audit.AuditLog(nowhere, retention=audit.Retention(1, 1, 1))
+        self.assertEqual(log.prune(), [])
+        self.assertFalse(nowhere.parent.exists())
+        audit.AuditLog(self.audit_path, retention=audit.Retention(1, 1, 1)).prune()
+        self.assertEqual(list(self.tmp.iterdir()), [])  # no lock file in an empty directory
+        self.assertEqual(audit.AuditLog(self.audit_path, retention=audit.Retention()).prune(), [])
+
+    def test_retention_still_applies_with_the_log_off(self):
+        # turning the log off keeps no new event; what was written still ages out
+        old = self.plant(100)
+        log = audit.AuditLog(self.audit_path, enabled=False, retention=audit.Retention(0, 0, 30))
+        self.assertEqual(log.prune(), [old.name])
+        self.assertFalse(old.exists())
+        self.assertFalse(self.audit_path.exists())  # and its removal is not recorded in a log that is off
+
+    def test_rotation_off_writes_as_before(self):
+        self.use()  # every limit 0: no lock, no rotation, no removal
+        old = self.plant(4000)
+        audit.emit("plan_created", plan_id="lnp-1")
+        self.assertTrue(old.exists())
+        self.assertFalse((self.tmp / "audit.jsonl.lock").exists())
+        self.assertEqual(audit.get_audit_log().prune(), [])
 
 
 class Lifecycle(PluginTestCase):

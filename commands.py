@@ -43,7 +43,8 @@ _HELP = """\
   check <plan_id>                   Re-verify a plan's preconditions without writing
   apply <plan_id> [--no-rollback]   Apply a reviewed plan
   rollback <plan_id> [--force]      Revert an applied plan from its journal
-  prune [--days N] [--dry-run]      Delete plans older than N days (default: plan_retention_days)
+  prune [--days N] [--dry-run]      Delete plans older than N days (default: plan_retention_days),
+                                    and rotated audit logs past audit_keep_files or audit_retention_days
 """
 
 # Per subcommand: its usage line, how many positional arguments it takes at most, and its options (True for one
@@ -151,15 +152,30 @@ def _prune(options: Dict[str, Any], prog: str, actor: Dict[str, Any]) -> Tuple[s
         return f"Usage: {prog} {_SYNTAX['prune'][0]}", USAGE
     days = int(raw) if raw is not None else None
     dry = bool(options.get("--dry-run"))
+    verb = "Would remove" if dry else "Removed"
     result = handlers.prune_plans(days=days, dry_run=dry, actor=actor)
     if result["max_age_days"] <= 0:
-        return "Retention is disabled (plan_retention_days is 0); pass --days N to prune explicitly.", OK
+        lines = ["Retention is disabled (plan_retention_days is 0); pass --days N to prune explicitly."]
+    elif not result["removed"]:
+        lines = [f"Nothing older than {result['max_age_days']} days."]
+    else:
+        lines = [f"{verb} {len(result['removed'])} plan(s) older than {result['max_age_days']} days:"]
+        lines += [f"  {one_line(r['id'])}  {one_line(r['status']):<21} {r['age_days']}d" for r in result["removed"]]
+    return "\n".join(lines + _audit_retention(handlers.prune_audit(dry_run=dry, actor=actor), verb)), OK
+
+
+def _audit_retention(result: Dict[str, Any], verb: str) -> List[str]:
+    """What ``prune`` says about the audit log: its retention, and the rotated files it removed (by name; the
+    directory is the log's)."""
+    keep, days = result["keep_files"], result["max_age_days"]
+    if not keep and not days:
+        return ["Audit log: retention is off (audit_keep_files and audit_retention_days are 0)."]
+    policy = [f"the newest {keep}"] if keep else []
+    policy += [f"none older than {days} days"] if days else []
     if not result["removed"]:
-        return f"Nothing older than {result['max_age_days']} days.", OK
-    verb = "Would remove" if dry else "Removed"
-    lines = [f"{verb} {len(result['removed'])} plan(s) older than {result['max_age_days']} days:"]
-    lines += [f"  {one_line(r['id'])}  {one_line(r['status']):<21} {r['age_days']}d" for r in result["removed"]]
-    return "\n".join(lines), OK
+        return [f"Audit log: no rotated file to remove (keeping {', '.join(policy)})."]
+    lines = [f"Audit log: {verb.lower()} {len(result['removed'])} rotated file(s) (keeping {', '.join(policy)}):"]
+    return lines + [f"  {one_line(name)}" for name in result["removed"]]
 
 
 def _resolve(fragment: str, prog: str) -> Tuple[str | None, str]:
@@ -321,7 +337,7 @@ def setup_cli(parser: Any) -> None:
     p = sub.add_parser("rollback", help="Revert an applied plan")
     p.add_argument("plan_id")
     p.add_argument("--force", action="store_true", help="Override post-apply modification checks")
-    p = sub.add_parser("prune", help="Delete plans older than the retention period")
+    p = sub.add_parser("prune", help="Delete plans and rotated audit logs past their retention")
     p.add_argument("--days", type=int, default=None, help="Override plan_retention_days")
     p.add_argument("--dry-run", action="store_true", help="List what would be removed")
 

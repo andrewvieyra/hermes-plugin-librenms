@@ -29,11 +29,21 @@ LIMITS = {
     "max_plan_age_hours": 720,
     "max_maintenance_hours": 8760,
     "plan_retention_days": 3650,
+    "audit_max_mb": 10240,
+    "audit_keep_files": 10000,
+    "audit_retention_days": 3650,
 }
-# Lower limits where 1 is not the least: plan_retention_days is the one count where 0 means something (keep plans
-# forever), and a result budget below Hermes' own floor (8,000 characters) leaves no room for a row. A smaller value
-# keeps the default.
-MINIMUMS = {"plan_retention_days": 0, "max_result_chars": 8000}
+# Lower limits where 1 is not the least: the retention counts are the ones where 0 means something (no limit: keep
+# plans forever, never rotate the audit log by size, keep any number of rotated files or keep them forever), and a
+# result budget below Hermes' own floor (8,000 characters) leaves no room for a row. A smaller value keeps the
+# default, so a negative or unreadable retention is the default's bound, never "keep forever".
+MINIMUMS = {
+    "plan_retention_days": 0,
+    "max_result_chars": 8000,
+    "audit_max_mb": 0,
+    "audit_keep_files": 0,
+    "audit_retention_days": 0,
+}
 # What an unreadable value becomes when that is not simply the default: whatever lets the model do least. Every
 # flag listed here equals its default today; the table keeps it so when a default changes.
 _FAIL_CLOSED: Dict[str, Any] = {
@@ -48,7 +58,9 @@ _FAIL_CLOSED: Dict[str, Any] = {
 }
 # Settings added after 0.1.0: the digest counts one only once it differs from its default, so an upgrade does not
 # change the digest of a configuration a collector has approved.
-_LATER_SETTINGS = frozenset({"max_result_chars", "librenms_timezone"})
+_LATER_SETTINGS = frozenset(
+    {"max_result_chars", "librenms_timezone", "audit_max_mb", "audit_keep_files", "audit_retention_days"}
+)
 _TRUE = frozenset({"true", "yes", "on", "1"})
 _FALSE = frozenset({"false", "no", "off", "0"})
 _SHOWN_CHARS = 40
@@ -72,6 +84,9 @@ class Settings:
     audit_log: bool = True
     audit_log_path: str = ""  # absolute; empty = <HERMES_HOME>/plugin-data/librenms/audit.jsonl
     audit_include_request: bool = True
+    audit_max_mb: int = 10  # rotate the event stream before it grows past this (MiB); 0: never by size
+    audit_keep_files: int = 100  # rotated files kept, newest first; 0: any number
+    audit_retention_days: int = 90  # rotated files removed once their newest event is this old; 0: never
     link_eventlog: bool = True  # cross-reference LibreNMS' eventlog after apply/rollback
     audit_sinks: List[Dict[str, Any]] = field(default_factory=list)  # see sinks.py
     # Not settings: what reading the others found wrong and fell back from, and where each kept audit_sinks entry

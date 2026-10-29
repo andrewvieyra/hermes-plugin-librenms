@@ -147,6 +147,8 @@ class Formats(unittest.TestCase):
         self.assertEqual(sinks.severity_of(_record("apply_started")), sinks.SEV_NOTICE)
         self.assertEqual(sinks.severity_of(_record("approval_decided", choice="deny")), sinks.SEV_NOTICE)
         self.assertEqual(sinks.severity_of(_record("approval_requested")), sinks.SEV_NOTICE)  # one never decided
+        for event in ("plans_pruned", "audit_pruned"):  # retention removed records: worth a look, not an alarm
+            self.assertEqual(sinks.severity_of(_record(event)), sinks.SEV_NOTICE, event)
         for event in ("apply_refused", "query_refused", "revert_irreversible", "run_recovered", "step_conflict"):
             self.assertEqual(sinks.severity_of(_record(event)), sinks.SEV_WARNING, event)
         self.assertEqual(sinks.severity_of(_record("apply_finished", outcome="failed")), sinks.SEV_WARNING)
