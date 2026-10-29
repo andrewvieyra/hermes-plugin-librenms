@@ -278,9 +278,10 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "warning, ok; unknown without a reading and for class state, whose meaning the API does not give), "
         "limit_low, limit_low_warn, limit_warn, limit, low_margin and high_margin (how far from the first limit "
         "below and above, in the reading's unit, negative past it), margin (the nearer) and nearest (low, high), "
-        "direction (rx, tx: dBm), port_id and port (the port a sensor is on, named for the page), alerting "
-        "(LibreNMS alerts on its limits), used/size and their *_bytes (memory, storage), stale (device not polled "
-        "lately: the last reading).",
+        "direction (rx, tx: dBm), port_id and port (the port a sensor is on, named for the page; an optic's "
+        "temperature, bias or voltage on its transceiver's entity is always found for a scope of at most 5 "
+        "devices), alerting (LibreNMS alerts on its limits), used/size and their *_bytes (memory, storage), stale "
+        "(device not polled lately: the last reading).",
         "summary": "in_scope, by_status, by_class, devices, hottest (the highest temperature), nearest_limit (the "
         "reading nearest a limit it has not crossed), without_limits, alerting_off, stale.",
         "filters": {

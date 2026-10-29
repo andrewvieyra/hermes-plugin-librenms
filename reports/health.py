@@ -13,9 +13,12 @@ rate over the last poll, as LibreNMS shows it.
 
 For the rows of the page, a sensor on a port is named with it: measured on the port's ifIndex, or on the inventory
 entity of one of its transceivers (:func:`.context.measured_on`), or for a dBm sensor, a description that starts with
-the port's name. The device's transceivers are read when the ifIndex names no port, and for a temperature, bias or
-voltage sensor on an inventory entity (:data:`OPTIC_CLASSES`), whose device's port names are read only when that
-entity is a transceiver's. A dBm sensor also carries its ``direction`` (``rx``, ``tx``) as its description says it.
+the port's name. The device's transceivers are read when the ifIndex names no port. A temperature, bias or voltage
+sensor on an inventory entity (:data:`OPTIC_CLASSES`) may be an optic's, but is most often the chassis's: it is tied
+on a device whose port names the page reads anyway, and for a scope of at most :data:`DEVICE_READS` devices on any
+other, whose transceivers are read first and its port names only when one holds that entity; a wider scope reads
+nothing for it. A LibreNMS without the transceivers route (an older release) has none, which a note says once. A dBm
+sensor also carries its ``direction`` (``rx``, ``tx``) as its description says it.
 
 When LibreNMS's answer is too large to read (past 16 MiB: tens of thousands of sensors), the sensors are read one
 device at a time instead (``devices/{id}/health``, the classes; ``.../device_<class>``, the ids; then
@@ -40,7 +43,6 @@ from ..client import LibreNMSError, is_digits
 from ..listing import natural_key
 from . import units
 from .context import (
-    PORT_MAP_READS,
     ReportContext,
     Request,
     View,
@@ -121,7 +123,7 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     kept = [item for item in every if _passes(item, req.filters)]
     kept.sort(key=_ORDERS[req.sort])
     page = kept[req.offset : req.offset + req.limit]
-    _name_ports(ctx, page)
+    _name_ports(ctx, page, narrow=len(ids) <= DEVICE_READS)
     _notes(ctx, every, kept, req.filters)
     return ctx.envelope(
         "health",
@@ -336,12 +338,13 @@ def _on_an_entity(sensor: Dict[str, Any] | None) -> bool:
     return sensor.get("sensor_class") in OPTIC_CLASSES and sensor.get("entPhysicalIndex") not in (None, "")
 
 
-def _name_ports(ctx: ReportContext, page: List[_Reading]) -> None:
+def _name_ports(ctx: ReportContext, page: List[_Reading], *, narrow: bool) -> None:
     """Name the port of each sensor of *page* that is on one, from its device's port names (at most 10 devices) and,
     where its ifIndex names no port, the device's transceivers; a read that fails leaves them unnamed, partial. A
     temperature, bias or voltage sensor on an inventory entity is on a port when that entity is one of the port's
-    transceivers': for those the transceivers are read first (at most 10 devices), and the ports only of a device
-    where one is."""
+    transceivers'. Most are a chassis's, so it is looked for only on a device whose port names are read anyway and,
+    in a *narrow* scope (at most :data:`DEVICE_READS` devices), on the others, whose transceivers are read first and
+    their ports only where one holds the entity."""
     by_device: Dict[Any, List[_Reading]] = {}
     maybe: Dict[Any, List[_Reading]] = {}
     for item in page:
@@ -351,24 +354,22 @@ def _name_ports(ctx: ReportContext, page: List[_Reading]) -> None:
             by_device.setdefault(item.row["device_id"], []).append(item)
         elif _on_an_entity(item.sensor):
             maybe.setdefault(item.row["device_id"], []).append(item)
-    entities: Dict[Any, Dict[str, Set[str]]] = {}
-    for number, (device_id, items) in enumerate(maybe.items()):
-        if number >= PORT_MAP_READS:
-            ctx.notes.append(
-                f"the transceivers of {len(maybe) - PORT_MAP_READS} more devices were not read, so their temperature, "
-                f"bias and voltage sensors are not tied to a port (a report reads them for at most {PORT_MAP_READS} "
-                "devices)"
-            )
-            break
-        entities[device_id] = _transceivers(ctx, device_id)
-        held = {entity for found in entities[device_id].values() for entity in found}
-        tied = [item for item in items if str((item.sensor or {}).get("entPhysicalIndex")) in held]
-        if tied:
-            by_device.setdefault(device_id, []).extend(tied)
+    optics = _Transceivers(ctx)
+    for device_id, items in maybe.items():
+        if device_id in by_device:  # its port names are read anyway: its transceivers at most once more
+            by_device[device_id].extend(items)
+        elif narrow:
+            held = {entity for found in optics.of(device_id).values() for entity in found}
+            tied = [item for item in items if str((item.sensor or {}).get("entPhysicalIndex")) in held]
+            if tied:
+                by_device[device_id] = tied
     if not by_device:
         return
     ports = ctx.ports_by_device(
-        by_device, "the ports of device {}'s sensors", "the ports of {} more devices' sensors were not named"
+        by_device,
+        "the ports of device {}'s sensors",
+        "the ports of {} more devices' sensors were not named",
+        "narrow the scope, or read fewer rows with limit",
     )
     for device_id, items in by_device.items():
         if device_id not in ports:
@@ -377,23 +378,49 @@ def _name_ports(ctx: ReportContext, page: List[_Reading]) -> None:
             sensor = item.sensor or {}
             port = _measured(sensor, ports[device_id], {})
             if port is None and sensor.get("entPhysicalIndex") not in (None, ""):
-                if device_id not in entities:
-                    entities[device_id] = _transceivers(ctx, device_id)
-                port = _measured(sensor, ports[device_id], entities[device_id]) if entities[device_id] else None
+                entities = optics.of(device_id)
+                port = _measured(sensor, ports[device_id], entities) if entities else None
             if port is None and sensor.get("sensor_class") == "dbm":
                 port = _named(sensor, ports[device_id])
             if port is not None:
                 item.row.update(port_id=port.get("port_id"), port=port_label(port))
 
 
-def _transceivers(ctx: ReportContext, device_id: Any) -> Dict[str, Set[str]]:
-    """A device's transceivers' inventory entities, by the port they are in (``devices/{id}/transceivers``)."""
-    found = ctx.optional(f"the transceivers of device {device_id}", "devices", device_id, "transceivers")
-    out: Dict[str, Set[str]] = {}
-    for row in rows_of(found):
-        if row.get("entity_physical_index") not in (None, "") and row.get("port_id") not in (None, ""):
-            out.setdefault(str(row["port_id"]), set()).add(str(row["entity_physical_index"]))
-    return out
+class _Transceivers:
+    """The devices' transceivers' inventory entities, by the port they are in (``devices/{id}/transceivers``), each
+    device's read once per report. A LibreNMS without the route (an older release) is read as having none, not as a
+    failure: a note says so once, and the route is not asked for again."""
+
+    def __init__(self, ctx: ReportContext) -> None:
+        self.ctx = ctx
+        self.read: Dict[Any, Dict[str, Set[str]]] = {}
+        self.missing = False
+
+    def of(self, device_id: Any) -> Dict[str, Set[str]]:
+        if self.missing:
+            return {}
+        if device_id not in self.read:
+            self.read[device_id] = self._read(device_id)
+        return self.read[device_id]
+
+    def _read(self, device_id: Any) -> Dict[str, Set[str]]:
+        what = f"the transceivers of device {device_id}"
+        try:
+            found = self.ctx.optional(what, "devices", device_id, "transceivers", raising=("route",))
+        except LibreNMSError as exc:
+            if exc.kind != "route":
+                raise
+            self.missing = True
+            self.ctx.notes.append(
+                "this LibreNMS has no transceivers route (an older release): no sensor is tied to a port through an "
+                "optic's inventory entity"
+            )
+            return {}
+        out: Dict[str, Set[str]] = {}
+        for row in rows_of(found):
+            if row.get("entity_physical_index") not in (None, "") and row.get("port_id") not in (None, ""):
+                out.setdefault(str(row["port_id"]), set()).add(str(row["entity_physical_index"]))
+        return out
 
 
 def _measured(

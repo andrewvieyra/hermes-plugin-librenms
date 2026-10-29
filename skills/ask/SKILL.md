@@ -1,7 +1,7 @@
 ---
 name: librenms-ask
 description: Answer questions about the network as LibreNMS sees it, over several turns, with the read-only librenms_report and librenms_query tools. Load when the user asks what is down, alerting or flapping, how busy a port or link is, link speeds and duplex, port descriptions and device names, LLDP/CDP neighbours, where a MAC or IP address is, VLANs, sensors and optics, BGP or OSPF sessions, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.10.1
+version: 0.10.2
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, network, questions]
@@ -296,7 +296,8 @@ else from the interface.
   (`summary.without_limits`), and a `state` sensor (a PSU or fan state) is `unknown`. "Is anything
   running hot" is `{"class": "temperature"}` with `sort` `value` (`summary.hottest`). Processors, memory
   and storage are read per device, for 5 devices at most: narrow the scope for them; one device's come
-  with its sensors when `filter.class` names none.
+  with its sensors when `filter.class` names none. An optic's temperature, bias or voltage is always
+  named with its `port` for a scope of 5 devices at most.
 - `devices`: `down_since` is read for up to 20 down devices on a page; a `disabled` device is not polled.
 - `bills`: a quota bill counts bytes (`used`, `quota`), a CDR bill a 95th percentile against its commit;
   `last_calculated` says how fresh the figures are.

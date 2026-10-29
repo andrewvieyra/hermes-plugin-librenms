@@ -6,6 +6,43 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-29
+
+What the review of 0.10.1 found in its own changes, each confirmed against the 0.10.1 code first.
+
+### Fixed
+- `health` no longer reads the transceivers of every device of the page whose temperature, bias (`current`) or
+  voltage sensor is on an inventory entity: chassis and inlet sensors on Cisco- and Juniper-style devices have one
+  too, so 0.10.1 read `devices/{id}/transceivers` for nearly every temperature sensor (10 devices, then a note that
+  the rest were not tied). "Is anything running hot" (`{"class": "temperature"}`, `sort` `value`) over 15 devices
+  whose chassis sensors are on entities of their own cost 12 requests instead of 2 and carried that note. Such a
+  sensor is now tied on a device whose port names the page reads anyway (its transceivers read at most once more)
+  and, for a scope of at most 5 devices (as processors and memory pools are read), on any other, whose transceivers
+  are read first and its port names only when one holds the entity; a wider scope reads nothing for it and adds no
+  note. The cap on the transceiver reads, and its note, are gone with it.
+- A LibreNMS without the transceivers routes (an older release) no longer makes `health` or `port` `partial`.
+  `health` answered `partial` with a reason per device (`the transceivers of device 16 not read: LibreNMS answered
+  HTTP 404 (route); ...`) though every reading was complete, and `port` with `transceivers not read`. As `routing`
+  reads a missing `ospfv3` route, the route is now read as none with one note, `health` does not ask for it again in
+  that report, and `port` leaves `transceivers` null; any other failure of those reads is still `partial`.
+- `health`'s and `routing`'s partial reason past the 10-device port-name cap says what to do, as the 0.10.1 entry
+  said every view's did: `narrow the scope, or read fewer rows with limit` for `health` (its rows past the cap have
+  no `port_id`) and `view port names one by its port_id` for `routing`'s OSPF neighbours, as `alerts` and `events`
+  say.
+- The README's report-envelope paragraph had a stray short line (`` `notes` say what to ``) from 0.10.1's re-wrap; it
+  is re-wrapped, its text unchanged. Two lines that 0.10.1 added to tests/test_report_health.py ran past the
+  120-column line length: one left with the cap assertion it was part of, the other's trailing comment has a line of
+  its own.
+
+### Changed
+- README, docs/architecture.md, docs/api-coverage.md, view help (`health`'s `port`) and `librenms:ask` say when an
+  optic's temperature, bias or voltage is tied to its port, and that a route an older LibreNMS lacks is a note.
+- tests/test_report_health.py: those sensors in a scope wider than `DEVICE_READS` (no read) and on a device whose
+  dBm sensor the page names (tied); the "running hot" page over 15 devices, with and without the transceivers route
+  (2 requests, no note, not partial); a LibreNMS without the route (one read, one note, a dBm sensor still named by
+  its description) and a real failure of it (partial); the advice past the port-name cap for `health` and
+  `routing`. tests/test_report_ports.py: `port` without the transceivers route, and with it failing.
+
 ## [0.10.1] - 2026-10-29
 
 The minor findings of the adversarial reviews of 0.7.0 (alerts) and 0.8.0 (health, routing) that were never sent to

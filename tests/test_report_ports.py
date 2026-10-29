@@ -450,6 +450,23 @@ class Port(PortCase):
             },
         )  # the port's device
 
+    def test_a_librenms_without_the_transceivers_route_is_not_partial(self):
+        self.fake.missing_routes.add("get_port_transceiver")  # an older LibreNMS
+        out = self.report(view="port", scope={"port": 1})
+        row = out["rows"][0]
+        # Gi1/0/1's optic hangs from its transceiver's entity, which this LibreNMS cannot say
+        self.assertEqual((row["transceivers"], row["optics"], out["partial"]), (None, [], False))
+        self.assertIn(
+            "this LibreNMS has no transceivers route (an older release): the port's transceivers are not listed, and "
+            "its optics are those measured on its ifIndex",
+            out["notes"],
+        )
+        self.fake.missing_routes.clear()
+        self.fake.fail_on("GET", "ports/1/transceiver", 500)  # a real failure still is partial
+        out = self.report(view="port", scope={"port": 1})
+        self.assertEqual((out["rows"][0]["transceivers"], out["partial"]), (None, True))
+        self.assertEqual(out["partial_reason"], "transceivers not read: LibreNMS answered HTTP 500 (server)")
+
     def test_a_deleted_port(self):
         out = self.report(view="port", scope={"port": 3})
         self.assertEqual(out["rows"][0]["port_id"], 3)

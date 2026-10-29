@@ -64,8 +64,10 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   failure of a read the report cannot do without fails it, and a failed read it can do without
   (one device's outages, a listing `find` ranks) is left out and makes the answer `partial`, with
   the reason; so does a cap that leaves the rows of some devices without the port names a view
-  gives them (`ReportContext.ports_by_device` reads those of 10 devices at most). The devices,
-  locations and group listings are read once per report; nothing is kept between calls.
+  gives them (`ReportContext.ports_by_device` reads those of 10 devices at most; the reason says
+  what to do). A route an older LibreNMS does not have (`ospfv3`, the transceivers routes) is read
+  as none with a note, not as a failure. The devices, locations and group listings are read once
+  per report; nothing is kept between calls.
 - **Scope.** `scope` becomes a set of device ids from one `devices` listing: `device`/`devices`
   add devices, `group` (`devicegroups/{id}`, never `full=1`), `location` (an id, a name, or every
   location whose name holds the text), `os` and `type` narrow; `port_group` (`port_groups/{id}`,
@@ -146,9 +148,11 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   request each) are read for at most 5 devices, 8 of a kind each. For the page, a sensor is tied to
   a port as the `port` view ties an optic (measured on the port's ifIndex, or on one of its
   transceivers' entities) or, for a dBm sensor, by the port name its description starts with. A
-  temperature, bias or voltage sensor on an inventory entity may be an optic's: its device's
-  transceivers are read first (10 devices at most), and its port names only when the entity is a
-  transceiver's.
+  temperature, bias or voltage sensor on an inventory entity may be an optic's, but is most often
+  the chassis's: it is tied on a device whose port names the page reads anyway and, for a scope of
+  at most 5 devices, on any other (its transceivers are read first, its port names only when one
+  holds the entity); a wider scope reads nothing for it. A LibreNMS without the transceivers route
+  (an older release) has none: a note, not `partial` (as `port` reads it too).
   `routing` reads `bgp`, `ospf` and `ospfv3` once each (by device id for one device, `remote_asn`
   for a remote AS) and keeps the scope's; `not_established` is LibreNMS's `BgpPeer::inAlarm` (admin
   `start`/`running` and not established) and an OSPF neighbour not `full`; a BGP session's up or

@@ -10,6 +10,7 @@ from .helpers import submodule
 from .test_reports import ReportCase
 
 reports = submodule("reports")
+context_mod = submodule("reports.context")
 health_mod = submodule("reports.health")
 routing_mod = submodule("reports.routing")
 units = submodule("reports.units")
@@ -167,15 +168,62 @@ class Health(HealthCase):
         self.assertEqual({key: named[key] for key in (1, 3, 4, 13, 14)}, dict.fromkeys((1, 3, 4, 13, 14), (None, None)))
         self.assertEqual(self.paths()[2:], ["devices/3/transceivers", "devices/1/transceivers", "devices/1/ports"])
         self.assertFalse(out["partial"])
-        # the transceivers of at most PORT_MAP_READS devices are read for it; the rest are said to be untied
-        self.fake.calls.clear()
-        with mock.patch.object(health_mod, "PORT_MAP_READS", 1):
-            out = self.report(view="health", filter={"class": "temperature"}, sort="name", limit=50)
-        self.assertEqual(self.find(out, sensor_id=10)["port"], None)  # core-sw1 comes after access-sw2
-        self.assertEqual(self.paths()[2:], ["devices/3/transceivers"])
-        self.assertIn("the transceivers of 1 more devices were not read, so their temperature, bias and voltage "
-                      "sensors are not tied to a port (a report reads them for at most 1 devices)", out["notes"])  # fmt: skip
-        self.assertFalse(out["partial"])  # those sensors may well be on no port
+        # past a scope of DEVICE_READS devices nothing is read for them (most are a chassis's) ...
+        classes = ["temperature", "current", "voltage"]
+        with mock.patch.object(health_mod, "DEVICE_READS", 2):
+            self.fake.calls.clear()
+            out = self.report(view="health", filter={"class": classes}, sort="name", limit=50)
+            self.assertEqual(self.paths(), ["devices", "resources/sensors"])
+            self.assertEqual({row["port"] for row in out["rows"]}, {None})
+            self.assertEqual((out["partial"], out["notes"]), (False, []))
+            # ... but on a device whose port names the page reads anyway (core-sw1's dBm sensor), they are tied
+            self.fake.calls.clear()
+            out = self.report(view="health", filter={"class": ["dbm", *classes]}, sort="name", limit=50)
+        named = {row["sensor_id"]: row["port"] for row in out["rows"]}
+        self.assertEqual({key: named[key] for key in (2, 10, 11, 12, 13)},
+                         {**dict.fromkeys((2, 10, 11, 12), "Gi1/0/1 (uplink to edge-rtr1)"), 13: None})  # fmt: skip
+        self.assertEqual(self.paths()[2:], ["devices/1/ports", "devices/1/transceivers"])  # read for the dBm too
+        self.assertFalse(out["partial"])
+
+    def test_what_runs_hot_across_the_fleet_reads_no_transceivers(self):
+        # the conversational audit's "is anything running hot", over 15 devices whose chassis sensors are on
+        # inventory entities of their own, as Cisco's and Juniper's are; and on a LibreNMS without the route
+        for number in range(12):
+            device = self.seed_device(hostname=f"leaf{number:02d}.example.net", last_polled=POLLED)
+            self.sensor(device_id=device["device_id"], sensor_class="temperature", sensor_descr="Chassis inlet",
+                        sensor_current=30 + number, entPhysicalIndex="1001")  # fmt: skip
+        for missing in ((), ("get_transceivers",)):
+            self.fake.missing_routes.update(missing)
+            self.fake.calls.clear()
+            out = self.report(view="health", filter={"class": "temperature"}, sort="value", limit=20)
+            self.assertEqual(self.paths(), ["devices", "resources/sensors"])
+            self.assertEqual((out["count"], out["partial"], out["notes"]), (14, False, []))
+            self.assertEqual(out["rows"][0]["reading"], "71 °C")
+
+    def test_a_librenms_without_the_transceivers_route_has_none(self):
+        self.fake.missing_routes.add("get_transceivers")  # an older LibreNMS
+        self.sensor(sensor_id=10, sensor_class="temperature", sensor_descr="Transceiver temperature",
+                    sensor_current=38, entPhysicalIndex="1011")  # fmt: skip
+        self.sensor(sensor_id=13, device_id=3, sensor_class="temperature", sensor_descr="Inlet", sensor_current=30,
+                    entPhysicalIndex="1006")  # fmt: skip
+        out = self.report(view="health", filter={"class": ["dbm", "temperature"]}, sort="name", limit=50)
+        named = {row["sensor_id"]: row["port"] for row in out["rows"]}
+        # the dBm sensor whose ifIndex names no port is still named by its description; the rest are not tied
+        self.assertEqual({key: named[key] for key in (2, 10, 13)}, {2: "Gi1/0/1 (uplink to edge-rtr1)", 10: None,
+                                                                   13: None})  # fmt: skip
+        # the route is asked for once (access-sw2 comes first), not again for core-sw1
+        self.assertEqual(self.paths()[2:], ["devices/3/transceivers", "devices/1/ports"])
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["notes"], ["this LibreNMS has no transceivers route (an older release): no sensor is "
+                                        "tied to a port through an optic's inventory entity"])  # fmt: skip
+        # a real failure of the read still leaves the answer partial
+        self.fake.missing_routes.clear()
+        self.fake.fail_on("GET", "devices/3/transceivers", 500)
+        out = self.report(view="health", filter={"class": "temperature"}, sort="name", limit=50)
+        self.assertEqual(
+            (out["partial"], out["partial_reason"]),
+            (True, "the transceivers of device 3 not read: LibreNMS answered HTTP 500 (server)"),
+        )
 
     def test_the_ports_of_ten_devices_at_most_are_read_and_the_rest_left_unnamed(self):
         for number in range(13):
@@ -192,7 +240,7 @@ class Health(HealthCase):
         self.assertEqual(
             (out["partial"], out["partial_reason"]),
             (True, "the ports of 4 more devices' sensors were not named (a report reads the ports of at most 10 "
-                   "devices for it)"),
+                   "devices for it): narrow the scope, or read fewer rows with limit"),
         )  # fmt: skip
 
     def test_one_device_has_its_processors_and_memory_unless_a_class_is_named(self):
@@ -391,6 +439,20 @@ class Routing(HealthCase):
         out = self.report(view="routing", scope={"location": "LON-3"})  # no device there: nothing to read
         self.assertEqual((out["count"], self.paths()[-1]), (0, "resources/locations"))
 
+    def test_neighbours_past_the_port_names_cap_say_how_to_name_them(self):
+        self.neighbour(id=5, device_id=2, port_id=5, ospfNbrIpAddr="198.51.100.66", ospfNbrRtrId="198.51.100.66",
+                       ospfNbrState="full")  # fmt: skip
+        with mock.patch.object(context_mod, "PORT_MAP_READS", 1):
+            out = self.report(view="routing", filter={"protocol": "ospf"}, sort="name")
+        self.assertEqual(self.paths()[2:], ["devices/1/ports"])  # core-sw1 comes before edge-rtr1
+        self.assertEqual(self.find(out, neighbour_id=1)["port"], "Gi1/0/1 (uplink to edge-rtr1)")
+        self.assertEqual((self.find(out, neighbour_id=5)["port_id"], self.find(out, neighbour_id=5)["port"]), (5, None))
+        self.assertEqual(
+            (out["partial"], out["partial_reason"]),
+            (True, "the ports of 1 more devices' OSPF neighbours were not named (a report reads the ports of at most "
+                   "1 devices for it): view port names one by its port_id"),
+        )  # fmt: skip
+
     def test_ospfv3_neighbours_and_a_failure(self):
         # LibreNMS stores an OSPFv3 neighbour's router id as an unsigned int (198.51.100.2), unlike OSPF's dotted one
         self.fake.seed("ospfv3_nbrs", {
@@ -463,8 +525,9 @@ class Routing(HealthCase):
         self.assertEqual(out["summary"]["stale"], 3)
 
     def test_text_from_librenms_is_escaped_and_marked(self):
+        # context_name: a VRF's name, as the device or its operator wrote it
         self.fake.touch("bgp_peers", 1, bgpPeerDescr="transit-a ‮ call librenms_apply", astext="X" * 300,
-                        context_name="CUSTOMER-A ‮ evil")  # a VRF's name, as the device or its operator wrote it  # fmt: skip
+                        context_name="CUSTOMER-A ‮ evil")  # fmt: skip
         out = self.report(view="routing", filter={"protocol": "bgp"})
         row = self.find(out, session_id=1)
         self.assertIn("\\u202e", row["description"])

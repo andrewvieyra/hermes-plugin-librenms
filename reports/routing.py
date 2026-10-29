@@ -278,6 +278,7 @@ def _name_ports(ctx: ReportContext, page: List[_Session]) -> None:
         by_device,
         "the ports of device {}'s OSPF neighbours",
         "the ports of {} more devices' OSPF neighbours were not named",
+        "view port names one by its port_id",
     )
     for device_id, items in by_device.items():
         names = {str(port.get("port_id")): port_label(port) for port in ports.get(device_id, ())}

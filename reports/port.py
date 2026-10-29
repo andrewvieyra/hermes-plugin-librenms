@@ -6,18 +6,19 @@ searched among every port (``ports/search/ifName,ifDescr,ifAlias/...``), and one
 (``#``, ``?``, ``%``, ``\\``) is a malformed argument that says to name the device. A name that could be several
 ports answers ``ambiguous`` with the candidates, as a device phrase does.
 
-Reads: the port itself (``ports/{id}?with=statistics``: every column, and its ports_statistics row for discards),
-then what may fail or be past the budget, leaving the answer partial: its LLDP/CDP neighbours (``devices/{id}/links``,
-those on this port), its transceivers (``ports/{id}/transceiver``), the dBm sensors of its optics
-(``resources/sensors``, those LibreNMS ties to the port: measured on its ifIndex, or on one of its transceivers), and
-the open faults about it (``faults`` in every open state, those whose entity is this port; never their details).
+Reads: the port itself (``ports/{id}?with=statistics``: every column, and its ports_statistics row for discards), then
+what may fail or be past the budget, leaving the answer partial: its LLDP/CDP neighbours (``devices/{id}/links``, those
+on this port), its transceivers (``ports/{id}/transceiver``; from a LibreNMS too old to have the route, not listed, with
+a note and not partial), the dBm sensors of its optics (``resources/sensors``, those LibreNMS ties to the port: measured
+on its ifIndex, or on one of its transceivers), and the open faults about it (``faults`` in every open state, those
+whose entity is this port; never their details).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Set, Tuple
 
-from ..client import is_digits
+from ..client import LibreNMSError, is_digits
 from ..listing import natural_key
 from ..routes import QueryError, normalise
 from . import fuzzy, units
@@ -252,8 +253,18 @@ def _neighbours(ctx: ReportContext, port_id: int, device_id: int | None) -> List
 
 def _transceivers(ctx: ReportContext, port_id: int) -> Tuple[List[Dict[str, Any]] | None, Set[str]]:
     """The port's transceivers (what they are, not their inventory entity), and the entities their sensors hang
-    from."""
-    rows = ctx.optional("transceivers", "ports", port_id, "transceiver")
+    from; None when they were not read, or, with a note and not partial, from a LibreNMS without the route (an older
+    release)."""
+    try:
+        rows = ctx.optional("transceivers", "ports", port_id, "transceiver", raising=("route",))
+    except LibreNMSError as exc:
+        if exc.kind != "route":
+            raise
+        ctx.notes.append(
+            "this LibreNMS has no transceivers route (an older release): the port's transceivers are not listed, and "
+            "its optics are those measured on its ifIndex"
+        )
+        return None, set()
     if rows is None:
         return None, set()
     keys = ("type", "vendor", "model", "serial", "connector", "distance", "ddm")

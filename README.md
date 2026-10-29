@@ -440,10 +440,13 @@ answer is too large to read (16 MiB) it reads the scope's devices one sensor at 
 request budget, which fits only a narrow question (a device and a class) and is otherwise
 `partial`. Processors, memory pools and storage have no fleet-wide route: a listing and a request
 per item, for at most 5 devices and 8 of a kind each. The port of a sensor on the page is named from
-its device's port names and, where its ifIndex names none, its transceivers; an optic's temperature,
-bias or voltage sensor that a device puts on the transceiver's inventory entity is found by reading
-the device's transceivers first (at most 10 devices), and its port names only when one is a
-transceiver's. Readings are the last poll's: the API keeps no history of them. `routing` reads
+its device's port names and, where its ifIndex names none, its transceivers. A temperature, bias or
+voltage sensor on an inventory entity is most often the chassis's, but may be an optic's that a
+device puts on the transceiver's entity: it is tied on a device whose port names the page reads
+anyway and, for a scope of at most 5 devices, on any other (its transceivers are read first, its
+port names only when one holds the entity); a wider scope reads nothing for it. A LibreNMS without
+the transceivers route (an older release) has none, which a note says, and is not `partial`.
+Readings are the last poll's: the API keeps no history of them. `routing` reads
 `bgp`, `ospf` and `ospfv3` once each (by device id for a scope of one device; `remote_asn` for
 `filter.remote_as`), and for the page the port names of the devices whose OSPF neighbours it lists;
 LibreNMS answers `ospfv3` with HTTP 500 when it has no OSPFv3 neighbour, which the report reads as
@@ -456,17 +459,16 @@ and needs no device listing, so a `ping` read gives LibreNMS's clock before it. 
 LibreNMS's bill listing once (with `period=previous` for the last period), which carries LibreNMS's
 own figures and each bill's ports.
 
-Every report carries `data_as_of` (LibreNMS's clock, from the `Date` of its answer), `timezone`
-(see `librenms_timezone`), `count`, `returned`, `offset`, `truncated` and `next_offset` (more rows:
-read on with `offset`), and `partial` with a `partial_reason` when the data itself is incomplete
-(the request budget ran out, as it can when LibreNMS's listing of every port is too large to read
-and the ports are read one device at a time, a read for one device failed, or the rows of more than
-10 devices name ports a view could not name, as it reads the port names of 10 devices at most);
-`notes` say what to
-do next. Rows are cut to `limit` (default 20, at most `max_query_results`; 10 for `find`) and to
-`max_result_chars`. Text from LibreNMS is clipped to 200 characters, escaped like every result,
-and named in `untrusted_fields`, whether it is in the rows, the scope or the summary (a page past
-the last row still marks the rule and device names its summary counts).
+Every report carries `data_as_of` (LibreNMS's clock, from the `Date` of its answer), `timezone` (see
+`librenms_timezone`), `count`, `returned`, `offset`, `truncated` and `next_offset` (more rows: read
+on with `offset`), and `partial` with a `partial_reason` when the data itself is incomplete (the
+request budget ran out, as it can when LibreNMS's listing of every port is too large to read and the
+ports are read one device at a time, a read for one device failed, or the rows of more than 10
+devices name ports a view could not name, as it reads the port names of 10 devices at most); `notes`
+say what to do next. Rows are cut to `limit` (default 20, at most `max_query_results`; 10 for
+`find`) and to `max_result_chars`. Text from LibreNMS is clipped to 200 characters, escaped like
+every result, and named in `untrusted_fields`, whether it is in the rows, the scope or the summary
+(a page past the last row still marks the rule and device names its summary counts).
 
 ### Operations
 
