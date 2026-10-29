@@ -63,6 +63,8 @@ comma was an HTTP 500) and must hold column names only.
 | every view | #83 `devices` (once; scope, names, states); for `scope.group` #21 and #20 by the group's id; for a `scope.location` no device is at, #134 |
 | `find` | #134, #21, #28; #103 when the term holds an interface name; #83 with `type=ipv4`, `ipv6` or `mac` when it is an address, and once more with an address no device holds when every device answered (an older LibreNMS reads an unknown `type` as no filter) |
 | `devices` | #60 for each down device on the page (at most 20) |
+| `ports`, `capacity` | #71 for each device of a scope of at most 10 devices, else #105 once (when it is too large to read, #71 per device within the budget; the answer is partial when the budget does not reach every device); for `scope.port_group` (`ports`) #28 and #29 by the group's id, then #99 for each of its ports when it has at most 10. Always a `columns` list of the ports table's own columns: `port_id`, `device_id`, `ifIndex`, `ifName`, `ifDescr`, `ifAlias`, `ifType`, `ifAdminStatus`, `ifOperStatus`, `ifSpeed`, `ifDuplex`, `ifMtu`, `ifLastChange`, `port_descr_speed`, `ifInOctets_rate`, `ifOutOctets_rate`, `ifInErrors_delta`, `ifOutErrors_delta`, `poll_time`, `poll_period`, `ignore`, `disabled` (a column LibreNMS lacks is an HTTP 400, so never `ifHighSpeed`, which the current schema folds into `ifSpeed`) |
+| `port` | #71 (by device id) or #103 to find the port by name; #99 with `with=statistics`; then #64, #102, #132 and #36 (`state=1,2,3,4,5`), each of which may fail and leave the answer partial |
 
 ## System
 
@@ -128,8 +130,8 @@ comma was an HTTP 500) and must hold column names only.
 
 | # | Route | Coverage |
 |---|---|---|
-| 28 | `GET port_groups` | query; report: `find` |
-| 29 | `GET port_groups/{name}` | query |
+| 28 | `GET port_groups` | query; report: `find`, `scope.port_group` |
+| 29 | `GET port_groups/{name}` | query; report: `scope.port_group` (`ports`), by the group's id, never `full=1` (every column of every port) |
 | 30 | `GET portgroups/multiport/bits/{id}` | refused: graph image |
 | 31 | `GET portgroups/{group}` | refused: graph image |
 | 32 | `POST port_groups` | not in 0.1.0: the API cannot delete a port group, so a create would have no inverse |
@@ -141,7 +143,7 @@ comma was an HTTP 500) and must hold column names only.
 | # | Route | Coverage |
 |---|---|---|
 | 35 | `GET faults/{id}` | query; planning reads. `{id}` must be a positive number (`0` or a negative id lists every open fault). Rows carry `entities` (the labels of the ports, sensors, processors, storage, services or BGP peers the rule matched, at most 10) instead of `details` (every column of every table the rule joins, for every matched row, and the alert's contacts); `fields: ["details"]` returns it without `contacts` |
-| 36 | `GET faults` | query, rows as #35; planning reads (the other open faults of the same device and rule) |
+| 36 | `GET faults` | query, rows as #35; planning reads (the other open faults of the same device and rule); report: `port` (`state=1,2,3,4,5`, the faults whose entity is the port; never their `details`) |
 | 37 | `PUT faults/{id}` | plan: `alert` `ack` (note tagged `[hermes:<plan id>]`; rollback unmutes, lossy); also the rollback of an unmute |
 | 38 | `PUT faults/unmute/{id}` | plan: `alert` `unmute` (rollback acknowledges again, lossy); also the rollback of an ack |
 | 39 | `GET alerts/{id}` | query (legacy alias of #35, checked and shaped alike) |
@@ -184,14 +186,14 @@ on the poller.
 | 61 | `GET devices/{hostname}/graphs/health/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/health` lists the graphs) |
 | 62 | `GET devices/{hostname}/graphs/wireless/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/wireless` lists the graphs) |
 | 63 | `GET devices/{hostname}/vlans` | query |
-| 64 | `GET devices/{hostname}/links` | query |
+| 64 | `GET devices/{hostname}/links` | query; report: `port` (by device id, the links on the port) |
 | 65 | `GET devices/{hostname}/graphs` | query (the list of graphs, not images) |
 | 66 | `GET devices/{hostname}/fdb` | query |
 | 67 | `GET devices/{hostname}/nac` | query |
 | 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (`0` lists every sensor of the class) |
 | 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (MySQL reads `1abc` as 1) |
 | 70 | `GET devices/{hostname}/wireless-sensors` | query |
-| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`) |
+| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; always by device id with a `columns` list |
 | 72 | `GET devices/{hostname}/ip` | query |
 | 73 | `GET devices/{hostname}/port_stack` | query |
 | 74 | `GET devices/{hostname}/transceivers` | query |
@@ -229,13 +231,13 @@ on the poller.
 
 | # | Route | Coverage |
 |---|---|---|
-| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag). `{portid}` must be a positive number here and on #100-#102 and #106 (MySQL reads `1abc` as port 1) |
+| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag). `{portid}` must be a positive number here and on #100-#102 and #106 (MySQL reads `1abc` as port 1); report: `port` (`with=statistics`: its ports_statistics row, for discards), `ports` for each port of a port group of at most 10 |
 | 100 | `GET ports/{portid}/fdb` | query |
 | 101 | `GET ports/{portid}/ip` | query |
-| 102 | `GET ports/{portid}/transceiver` | query |
-| 103 | `GET ports/search/{field}/{search?}` | query; with `{search}`, `{field}` is a column list and is trimmed like `columns`; alone, LibreNMS reads it as the search term over `ifAlias`, `ifDescr` and `ifName`; report: `find` (`ifName,ifDescr` and an interface name, with a `columns` list) |
+| 102 | `GET ports/{portid}/transceiver` | query; report: `port` |
+| 103 | `GET ports/search/{field}/{search?}` | query; with `{search}`, `{field}` is a column list and is trimmed like `columns`; alone, LibreNMS reads it as the search term over `ifAlias`, `ifDescr` and `ifName`; report: `find` (`ifName,ifDescr` and an interface name, with a `columns` list), `port` (`ifName,ifDescr,ifAlias` and the name or description given without `scope.device`) |
 | 104 | `GET ports/mac/{search}` | query (the MAC in any usual form; ports that learned it, fewest FDB entries first; `filter=first` gives that port alone) |
-| 105 | `GET ports` | query |
+| 105 | `GET ports` | query; report: `ports` and `capacity` (one listing with a `columns` list, filtered in the plugin) for the fleet, more than 10 devices, or a port group of more than 10 ports. LibreNMS sends it in no set order and without paging, so the plugin orders and pages it |
 | 106 | `GET ports/{portid}/description` | query; planning reads |
 | 107 | `PATCH ports/{portid}/description` | plan: `port` `update` (`description`; `""` clears it and unpins it, so the poller sets it from the device again; the body always carries the key, since LibreNMS clears the description when the key is missing; rollback restores the text, lossy) |
 
@@ -268,7 +270,7 @@ on the poller.
 | 129 | `GET resources/links/{id}` | query |
 | 130 | `GET resources/nac` | query |
 | 131 | `GET resources/nac/{mac}` | query; `{mac}` normalised as #122 |
-| 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device |
+| 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device; report: `port` (the dBm sensors on the port, filtered in the plugin) |
 | 133 | `GET resources/vlans` | query (`?hostname=` resolved) |
 | 134 | `GET resources/locations` | query; planning reads (lookup by name); report: `find`, `scope.location` when no device is at the location named |
 

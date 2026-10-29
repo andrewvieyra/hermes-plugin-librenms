@@ -153,11 +153,13 @@ set it to about half the window's token count (`32000` for 64K tokens).
 alert-log, eventlog and syslog times in that zone with no offset, and no API field says which zone
 it is, so a time such as `2026-10-28 10:02:00` is an hour off for a model that reads it as UTC when
 LibreNMS runs in Amsterdam. Every `librenms_report` answer names this zone in `timezone`, or says
-it is unknown while the setting is empty. The views that show fault and log times (alerts and
-events, in later releases) read them in this zone, and without it give them no age. The 0.4.0
-views show only times that are exact in any zone: device times (ISO-8601 UTC), outages (unix
-seconds) and uptimes, every age counted to LibreNMS's own clock (the `Date` of its answer). A name
-the host's zone database does not hold is refused and the setting stays empty.
+it is unknown while the setting is empty. The views that show fault and log times (the `port`
+view's open faults, and alerts and events in later releases) read them in this zone, and without
+it show them as LibreNMS wrote them, with no age. Every other time a report shows is exact in any
+zone: device times (ISO-8601 UTC), outages and port polls (unix seconds), uptimes and the age of a
+port's last change (counted from the device's uptime), every age counted to LibreNMS's own clock
+(the `Date` of its answer). A name the host's zone database does not hold is refused and the
+setting stays empty.
 
 A value that cannot be read as its setting's type fails closed: a flag takes the value that lets the
 model do least, a number its default (or its upper limit when it is too large), and an unknown
@@ -186,7 +188,7 @@ environment):
 | Tool | Writes | Purpose |
 |---|---|---|
 | `librenms_query` | no | Look up devices, ports, alerts, sensors and logs through any allowed API v0 GET path, or `{"action": "status"}` for connectivity, version and settings |
-| `librenms_report` | no | Answer a question in one call: `find` what a name, address or phrase could mean (ranked, with why), or report on `devices` (state, down since, uptime, last poll, naming checks) with names joined and counts summed |
+| `librenms_report` | no | Answer a question in one call: `find` what a name, address or phrase could mean (ranked, with why), or report on `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), one `port` in depth, or free-port `capacity`, with names joined, units worked out and counts summed |
 | `librenms_plan` | no | Validate and diff a list of operations; save a plan |
 | `librenms_apply` | yes | Apply a plan with preconditions, verified writes, a journal and auto-rollback; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or partially applied plan |
@@ -284,27 +286,44 @@ approval, and is available in every `write_mode`.
 |---|---|---|
 | `find` | What a hostname, sysName, display name, IP, MAC, interface name or phrase ("the core switch in SFO") could mean: devices, ports, locations, device groups and port groups, best first, each with a `score` and `why`, 10 an answer (`count` counts every candidate, `offset` reads on, and past 10 a note says to narrow the term). An IP or MAC that every device holds matches each; an older LibreNMS that ignores the address filter is detected and set aside. `ambiguous` is true when the best two score within 10 of each other: the model asks the user which one they mean | `term`; `filter.kind` |
 | `devices` | Per device: `status` (`up`, `down`, `disabled`, `ignored`, as LibreNMS decides them), `status_reason`, `down_since`/`down_for` (its open outage, read for up to 20 down devices on the page), `uptime`, `booted_at`, `last_polled` and its age, os, hardware, version, type, location, purpose, and `checks` (`naming_mismatch`: hostname and sysName name different hosts; `no_location`; `no_purpose`). `summary` counts states and checks | `scope`; `filter` `status`, `rebooted_within`, `not_polled_for` (`30m`, `24h`, `7d`), `naming_mismatch`, `no_location`, `no_purpose`, `os`, `type`; `sort` `name`, `status`, `uptime`, `last_polled` |
+| `ports` | Per port: `state` (`disabled` when administratively down, else its operational status: `up`, `down`, `lowerLayerDown`, `notPresent`, ...), `speed_bps`/`speed` (the circuit speed parsed from its description, `egress/ingress` such as `100M/20M`, as LibreNMS's web UI measures it; else `ifSpeed`), `in_bps`/`in` and `out_bps`/`out` (the octet rates times 8), `in_pct` against the ingress speed and `out_pct` against the egress speed, `util_pct` (the larger), `duplex`, `mtu`, errors per poll and per second, `last_change_age` (the device's uptime less `ifLastChange`; "over" when the port has not changed since boot, unknown past 497 days of uptime), `polled_at` and `stale` (not polled for two poll periods: the figures are not current), `no_description` (none, or only its own name), `ignored` and `polling_disabled`. `summary` counts states, `not_up` (administratively up, not up, not ignored and still polled: LibreNMS's down), ports over 80 %, with errors, stale and without a description, and names the busiest | `scope` (also `port_group`); `filter` `state`, `util_above_pct`, `errors`, `speed_below_mbps`, `duplex`, `no_description`, `type` (`ethernet` or an ifType), `text` (in its names or description); `sort` `name`, `util`, `util_in`, `util_out`, `errors`, `speed` |
+| `port` | One port, everything `ports` says of it and its ifIndex, MAC, VLAN, packets per second, discards (from its statistics), LLDP/CDP neighbours (named when LibreNMS monitors them), transceivers, the dBm sensors of its optics with their limits and state, and the open faults about it (rule, severity, state, first seen, note; never their details) | `scope.port`: a `port_id`, or with `scope.device` an interface name (`Gi1/0/5`, `GigabitEthernet1/0/5`) or description; without a device, a name is searched among every port (one holding `#`, `?`, `%` or `\` needs `scope.device`) |
+| `capacity` | Per device with physical ethernet ports: how many are `up`, `down` and `disabled`, `used_pct`, `free` (not up and unchanged for `idle_days`, by speed), and `free_unknown` (not up, but the device has not been up that long, or its uptime counter wrapped) | `scope`; `filter` `idle_days` (default 30); `sort` `name`, `free`, `used_pct` |
 
 `scope` narrows a report to devices: `device` (an id, a hostname, or a sysName, display name,
 first label, IP or phrase), `devices` (a list of them), `group` (a device group's name or id),
 `location` (a name, an id, or part of a name: every location that holds it, as LibreNMS's own
-`type=location` filter reads it), `os` and `type`; every key given must hold. A device named by
-anything but its id or hostname resolves only when exactly one device matches it exactly, or only
-one matches every word of the phrase; the result says how (`scope.resolved`). Otherwise the
-report answers `ambiguous: true` with the candidates and reports nothing, rather than guess.
+`type=location` filter reads it), `os` and `type`; every key given must hold. `ports` also takes
+`port_group` (a port group's name or id), and `port` takes `port`. A device named by anything but
+its id or hostname resolves only when exactly one device matches it exactly, or only one matches
+every word of the phrase; the result says how (`scope.resolved`). Otherwise the report answers
+`ambiguous: true` with the candidates and reports nothing, rather than guess; so does a port name
+that could be several ports.
 
 ```json
 {"view": "find", "term": "core switch sfo"}
 {"view": "devices", "filter": {"status": "down"}}
 {"view": "devices", "scope": {"location": "SFO"}, "filter": {"rebooted_within": "24h"}}
 {"view": "devices", "filter": {"not_polled_for": "15m"}, "sort": "last_polled"}
+{"view": "ports", "sort": "util", "limit": 10}
+{"view": "ports", "scope": {"device": "core-sw1"}, "filter": {"state": "down"}}
+{"view": "ports", "filter": {"util_above_pct": 80}}
+{"view": "port", "scope": {"device": "core-sw1", "port": "Gi1/0/48"}}
+{"view": "capacity", "scope": {"group": "access-switches"}, "sort": "free"}
 ```
+
+A port view reads the ports of a scope of up to 10 devices one device at a time, and otherwise
+one listing of every port, always naming the columns it needs; LibreNMS keeps their counters in
+mixed units (octets per second, bit/s, Mbit/s, hundredths of a second of sysUpTime), and the
+report does the arithmetic. Rates are LibreNMS's average over its last poll (about five minutes):
+the API keeps no history of a port's traffic, only bills do.
 
 Every report carries `data_as_of` (LibreNMS's clock, from the `Date` of its answer), `timezone`
 (see `librenms_timezone`), `count`, `returned`, `offset`, `truncated` and `next_offset` (more rows:
 read on with `offset`), and `partial` with a `partial_reason` when the data itself is incomplete
-(the request budget ran out, or a read for one device failed); `notes` say what to do next. Rows
-are cut to `limit` (default 20, at most `max_query_results`; 10 for `find`) and to
+(the request budget ran out, as it can when LibreNMS's listing of every port is too large to read
+and the ports are read one device at a time, or a read for one device failed); `notes` say what to
+do next. Rows are cut to `limit` (default 20, at most `max_query_results`; 10 for `find`) and to
 `max_result_chars`. Text from LibreNMS is clipped to 200 characters, escaped like every result,
 and named in `untrusted_fields`.
 
@@ -469,7 +488,8 @@ status and of an error, which is LibreNMS's answer, the `note` of an empty answe
 and `warnings`, dry-run `conflicts`, and the `journal`, `report`, `eventlog`, `failure`,
 `auto_rollback_error`, `apply`, `rollback`, `checks` and `steps` of apply, rollback and
 `librenms_plans`; for a report, the keys of its rows and scope that hold such text, such as
-`hostname`, `sysName`, `location`, `purpose`, `port` and a candidate's `why`), and before them an
+`hostname`, `sysName`, `location`, `purpose`, `port`, `description`, a neighbour's
+`remote_hostname` and a candidate's `why`), and before them an
 `untrusted_notice` telling the model that this is data, not instructions. The plugin's own keys (`next_step`, `note` on a cut listing, counts) are not listed.
 Refusals and errors are the plugin's own text and carry no marker of their own, but they may quote
 LibreNMS: an `error` holds LibreNMS's error message, the refusal of an unknown hostname names the
@@ -561,7 +581,7 @@ commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query
 listing.py    librenms_query's where and sort over the rows read
-reports/      librenms_report: views (find, devices), shared reads, scope, budgets, units, ranking
+reports/      librenms_report: views (find, devices, ports, port, capacity), shared reads, scope, budgets, units, ranking
 redact.py     credential masking, clipping, terminal-safe text
 diff.py       value normalisation and field-level diffs
 resources/    one module per resource: validate, resolve, diff, execute, verify, revert

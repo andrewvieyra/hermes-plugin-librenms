@@ -69,7 +69,7 @@ def _derive(ctx: ReportContext, device: Dict[str, Any]) -> _Device:
     at its last poll less its uptime, known only while LibreNMS polls it and finds it up."""
     state = device_state(device)
     polled = units.utc_time(device.get("last_polled"))
-    uptime = _seconds(device.get("uptime"))
+    uptime = units.seconds(device.get("uptime"))
     booted = None
     if polled is not None and uptime and state != "disabled" and truthy(device.get("status")):
         booted = polled - timedelta(seconds=uptime)
@@ -89,17 +89,6 @@ def _derive(ctx: ReportContext, device: Dict[str, Any]) -> _Device:
         checks=[check for check in CHECKS if _CHECKED[check](device)],
     )
     return _Device(row, polled, booted, uptime)
-
-
-def _seconds(value: Any) -> int | None:
-    """A count of seconds LibreNMS holds (``uptime``): a positive whole number, else None (0 is not known). Past
-    :data:`~.units.PLAUSIBLE_S` (a century, as :func:`.units.duration` reads it) it is a counter that wrapped or was
-    never set, also None: ``devices.uptime`` is a bigint, and a boot that far back may not be a date at all."""
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return None
-    return number if 0 < number <= units.PLAUSIBLE_S else None
 
 
 def _naming_mismatch(device: Dict[str, Any]) -> bool:

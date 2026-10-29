@@ -6,6 +6,89 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
+### Added
+- View `ports` of `librenms_report` (feat-port-utilisation-derived, conv-units-derived-values). LibreNMS keeps a
+  port's counters raw and in mixed units: `ifInOctets_rate` is bytes per second over the last poll, `ifSpeed` bit/s,
+  `ifHighSpeed` (older releases) Mbit/s, `ifLastChange` the device's sysUpTime in hundredths of a second, and the
+  circuit speed parsed from the description (`port_descr_speed`, `egress/ingress`) is what LibreNMS's web UI
+  measures against. The one route that computes utilisation (the ifName route) is refused, so a model reading
+  `ifInOctets_rate` 125000000 on a 1G uplink reported 125 Mbps and 12.5 % for a link running at 1 Gbit/s and 100 %,
+  and a 10G port at 1 GB/s read as 10 % instead of 80 %. Each row now carries the port's `state` (`disabled` when
+  administratively down, else its operational status: `up`, `down`, `lowerLayerDown`, `notPresent`, ...),
+  `speed_bps`/`speed` and `speed_source` (`circuit`, `ifSpeed`, or `ifHighSpeed` beside an `ifSpeed` stuck at
+  4294967295; 0 is not known), `in_speed_bps`/`out_speed_bps` when the circuit differs by direction, `in_bps`/`in`
+  and `out_bps`/`out` (octets times 8), `in_pct` against the ingress speed and `out_pct` against the egress speed
+  (as the verifier corrected the finding; null when the speed is not known), `util_pct`, `duplex`, `mtu`, errors per
+  poll and per second, `last_change_age_s`/`last_change_age` (the device's uptime less `ifLastChange`, plus the time
+  since the poll; a lower bound, "over ...", when it is 0 and the port has not changed since the SNMP agent started;
+  unknown past 497 days of uptime, when the 32-bit counter may have wrapped, or when the two disagree), `polled_at`
+  and `stale` (not polled for two poll periods, as a device that is down keeps its last rates: a stale port passes
+  neither `util_above_pct` nor `errors` and sorts last by utilisation), `no_description` (an empty `ifAlias`, or one
+  that only repeats `ifName` or `ifDescr`), `ignored` and `polling_disabled`. `summary` counts states, `not_up`
+  (administratively up, not up, not ignored and still polled: what LibreNMS counts as down, `Port::scopeIsDown`),
+  ports over 80 %, with errors, stale and without a description, and names the busiest. Filters `state` (one or a
+  list), `util_above_pct`, `errors`, `speed_below_mbps`, `duplex`, `no_description`, `type` (`ethernet`, every
+  physical ethernet port, or an ifType) and `text` (in its ifName, ifDescr or description); sorts `name`, `util`,
+  `util_in`, `util_out` (busiest first), `errors` and `speed` (slowest first), each with a unique tie-break. A scope
+  of up to 10 devices is read one device at a time (`devices/{id}/ports`), anything larger in one `ports` listing
+  filtered in the plugin, always with a list of the ports table's own columns (never `ifHighSpeed`, which the
+  current schema no longer has: a column LibreNMS lacks is an HTTP 400). A listing too large to read (16 MiB) falls
+  back to one device at a time within the request budget and says so in a note; the answer is partial only when the
+  budget does not reach every device in scope (or a device's read fails).
+- `scope.port_group` for view `ports`: a port group by id or name (any case; else the one group whose name holds
+  every word, and `ambiguous` with the candidates when several could be meant, saying to call again with the
+  group's `port_group_id` or exact name), read with `port_groups/{id}`, never `full=1`. Its ports are read one at
+  a time up to 10, else from the listing.
+- View `port`: one port in depth. `scope.port` is a `port_id`, or with `scope.device` its interface name in any
+  case, a short form of a long one (`Gi1/0/5` for `GigabitEthernet1/0/5`), its port_id among the device's ports, or
+  its description (exactly, else every word of it); without a device, a name or description is searched among every
+  port (`ports/search/ifName,ifDescr,ifAlias/...`); one that path cannot hold (`#`, `?`, `%`, `\`, an empty part, as
+  in a description `Circuit #4411`) is a malformed argument that says to name the device or give the port_id, never
+  an audited refusal. A name that could be several ports answers `ambiguous` with port candidates and reports
+  nothing. The row is the `ports` row plus ifIndex, ifName, ifDescr, admin and operational status, MAC, VLAN,
+  unicast packets per second, discards per poll and per second (`ports/{id}?with=statistics`), its LLDP/CDP
+  neighbours (`devices/{id}/links`, the remote device named when LibreNMS monitors it), its transceivers
+  (`ports/{id}/transceiver`), the dBm sensors of its optics with their limits and `status` as LibreNMS's Sensor
+  scopes decide it (`resources/sensors`: those measured on its ifIndex, or on one of its transceivers' entities) and
+  the open faults about it (`faults` in every open state, whose entity is the port: rule, severity, state, first
+  seen read in `librenms_timezone`, note; never their details or contacts). Each of those reads may fail or meet the
+  budget, leaving the answer partial. Its `scope` names the port's device, however the port was given.
+- View `capacity` (question 53 of the conversational audit): per device with physical ethernet ports
+  (ethernet ifTypes, no sub-interface or logical unit such as `Gi0/0/0.100` or `ge-0/0/0.0`; a channel of a
+  broken-out Junos port such as `xe-0/0/48:0` counts), how many are `up`, `down` and `disabled`, `used_pct`,
+  `free` (not up and unchanged for `idle_days`, 30 by default, by speed) and `free_unknown` (not up, but the
+  device has not been up that long, its uptime is not known or sysUpTime may have wrapped, so the port cannot be
+  dated that far back). Sorts `name`, `free` (most first), `used_pct` (fullest first); `summary` totals them.
+- The operator questions of the conversational audit about ports that these views target, each answered in one
+  or two calls from the summary or the rows and tested as such (tests/test_report_ports.py): ports down on a
+  switch (1), ports down that should be up (2), ports with errors now (3), discards on a port (4, for one port),
+  when a port last changed state (5), how busy an uplink is (8), the busiest ports in the network and on one
+  switch (9, 10), links above 80 % (11), utilisation of a device group and of a port group (14, 15), ports at
+  100M or half duplex (16, two calls), ports without a description on a switch and fleet-wide (21, 22), free
+  ports per access switch (53), and a customer port on a circuit slower than its interface.
+- `reports/units`: `circuit_speeds` (a `port_descr_speed` as LibreNMS's `Port::circuitSpeeds` reads it,
+  egress and ingress), `seconds` (a counter of seconds, which `devices` used privately) and `number`. Report
+  filters take numbers (`number`), and a choice filter takes its values in any letter case and holds them as
+  LibreNMS spells them (`lowerLayerDown`). `reports/context` gains the port and port-group candidates `find`
+  already showed, `sensor_status` and the fault states, for the views to come.
+- The fake LibreNMS: the ports table in the real schema's columns and order (so a column list is checked as
+  LibreNMS checks it), `ports_statistics` and `ports/{id}?with=statistics`, `ports/{id}/transceiver`, the
+  uplink's discards, and faults whose `entity_type` is `interface`, the morph name LibreNMS gives a port.
+
+### Changed
+- `librenms_query`'s description gives the units of the raw port columns (`ifIn/OutOctets_rate` bytes per
+  second, `ifSpeed` bit/s, `ifLastChange` sysUpTime in hundredths of a second) and points to view `ports`; its
+  busiest-ports example gave way to that within the schema budget. The skill has a units table for raw port
+  rows, the columns to ask for, the sensor paths of a device, the port questions and the views that answer
+  them, how to read utilisation, `stale` and `last_change_age`, and what the API cannot tell (traffic history
+  outside bills, err-disabled ports, flaps). The six tool schemas take 15.8 KB of the 16 KB budget.
+
+### Fixed
+- An ambiguous `scope.group` said to call again with the group's "hostname or id"; it now says its `group_id`
+  or exact name, as an ambiguous `scope.port_group` says its `port_group_id` or exact name.
+
 ## [0.4.0] - 2026-10-29
 
 ### Added

@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.4.0
+version: 0.5.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -14,7 +14,7 @@ Six tools, one rule: **nothing is written to LibreNMS without a plan the user ha
 | Tool | Writes? | Use it to |
 |---|---|---|
 | `librenms_query` | no | Read any allowed API v0 GET path (devices, ports, faults, rules, logs, ...); `{"action": "status"}` for connectivity, version and write mode |
-| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), view `devices` (state, down since, uptime, last poll, naming checks), with a summary and named rows |
+| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), `port` (one port in depth), `capacity` (free ports), with a summary and named rows |
 | `librenms_plan` | no | Turn desired changes into a diff, preconditions and a `plan_id` |
 | `librenms_apply` | yes | Execute a reviewed plan step by step; automatic rollback on failure; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or failed plan from its journal, newest step first |
@@ -48,11 +48,50 @@ answer small.
   "hostnames that do not match sysName" (`naming_mismatch`), "devices without a location" (`no_location`)
   and "how many are down" (`summary.by_status`, over every row that passed the filter, not only those
   shown). Narrow it with `scope`: `device`, `devices`, `group`, `location` (part of a name), `os`, `type`.
-- Units are in the key names (`uptime_s` seconds, beside `uptime` "100d 0h"); times ending `Z` are UTC.
-  Say how current the data is (`data_as_of`). `truncated` means more rows (read on with `next_offset` as
-  `offset`); `partial` means the data itself is incomplete (`partial_reason`): say so, never present it
-  as complete. `timezone` "unknown" means LibreNMS's server-local times (faults, logs) have no known zone:
-  do not turn them into ages.
+- View `ports` answers "which ports on sw1 are down" (`scope` `{"device": "sw1"}`, `filter`
+  `{"state": "down"}`; `summary.not_up` counts every port that is administratively up, not up, not
+  ignored and still polled, which is what LibreNMS calls down; rows say `ignored` and
+  `polling_disabled`), "the busiest ports" or "top talkers on core-sw1" (`sort` `util`, `limit` 10),
+  "which links are above 80 %" (`util_above_pct`: 80), "which ports have errors" (`errors`: true, `sort`
+  `errors`), "ports at 100M or half duplex" (`speed_below_mbps`: 1000, or `duplex`: `half`, each with
+  `state` `up`: two calls), "ports without a description" (`no_description`), "how busy is the uplink"
+  (`text`: `uplink`), and the utilisation of a device group or port group (`scope` `group` or
+  `port_group`). View `port` (`scope` `{"device": "sw1", "port": "Gi1/0/5"}`, or a `port_id`) adds, for
+  one port, when it last changed, discards, its LLDP/CDP neighbours, transceiver, optic levels and open
+  alerts. View `capacity` answers "how many free ports on each access switch" (`free`: not up and
+  unchanged for `idle_days`, 30 by default; `free_unknown` when the device has not been up that long).
+- Units are in the key names (`uptime_s` seconds, beside `uptime` "100d 0h"; `in_bps` bit/s beside
+  `in` "812 Mbit/s"; `*_pct` percent); times ending `Z` are UTC. Say how current the data is
+  (`data_as_of`). `truncated` means more rows (read on with `next_offset` as `offset`); `partial` means
+  the data itself is incomplete (`partial_reason`): say so, never present it as complete. `timezone`
+  "unknown" means LibreNMS's server-local times (faults, logs) have no known zone: do not turn them into
+  ages.
+- Ports: `in_pct` and `out_pct` are measured against the circuit speed when the description gives one
+  (`speed_source` `circuit`, which may differ by direction: `100M/20M` is 100 Mbit/s out, 20 Mbit/s in),
+  else the interface speed; null when the speed is not known. Rates are LibreNMS's average over its last
+  poll (about five minutes), not peaks. `stale: true` means the port was not polled lately (its device is
+  down or unreachable): its figures are old, say so. `state` `disabled` is a port shut down on purpose,
+  not a fault. `last_change_age` "over 100d 0h" means it has not changed since the device booted.
+- What LibreNMS's API cannot tell: a port's traffic history, averages or 95th percentile over a week (only
+  bills have that), which ports are err-disabled (LibreNMS shows them as down) and how often a port
+  flapped (the eventlog, `librenms_query` `logs/eventlog/<hostname>`, has the changes). Say so rather
+  than guess.
+- Reading raw port rows with `librenms_query` instead, name the columns in `params.columns` (LibreNMS
+  sends only `ifName` without them), e.g. `port_id,ifName,ifAlias,ifAdminStatus,ifOperStatus,ifSpeed,`
+  `port_descr_speed,ifInOctets_rate,ifOutOctets_rate,ifInErrors_delta,ifOutErrors_delta`, and mind the
+  units below. A device's sensors: `devices/<hostname>/health` lists its classes,
+  `devices/<hostname>/health/device_<class>` their ids, and `.../device_<class>/<sensor_id>` one sensor
+  with its value and limits.
+
+  | Column | Unit |
+  |---|---|
+  | `ifInOctets_rate`, `ifOutOctets_rate` | bytes per second over the last poll (`poll_period`, about 300 s): times 8 for bit/s |
+  | `ifSpeed` | bit/s (0 is not known); `ifHighSpeed`, in older releases, is Mbit/s |
+  | `port_descr_speed` | the circuit speed from the description, `egress/ingress` |
+  | `ifInErrors_delta`, `ifInErrors_rate` | errors in the last poll, and per second |
+  | `ifLastChange` | the device's sysUpTime at the last change, in hundredths of a second: the time since is the device's `uptime` (seconds) minus `ifLastChange` / 100 |
+  | `poll_time`, outages' `going_down` | unix seconds |
+  | `uptime`, `bgpPeerFsmEstablishedTime`, availability `duration` | seconds |
 
 ## Procedure
 

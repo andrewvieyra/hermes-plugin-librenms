@@ -96,7 +96,9 @@ filters and sorts it takes) registered in `reports.VIEWS`. It reads only through
 resolves `scope` with `ReportContext.scope`, and answers with `ReportContext.envelope`: rows that
 name their device (`brief`) and port (`port_label`), units in key names with readable twins
 (`reports/units`), a `summary` over every row that passed the filter, a stable order with a
-unique tie-break, and `partial` whenever data is missing. Add its name, filters and sorts to the
+unique tie-break, and `partial` whenever data is missing. A view about ports reads them with
+`reports.ports.read_ports` and derives what they mean with `reports.ports.facts`, so every view
+gives a port the same speed, utilisation, state and age. Add its name, filters and sorts to the
 schema (within the budget), and tests in `tests/test_reports.py`: the happy path, units and edge
 cases, filters, sorts and paging, the call budget, the output budget, and the GET-only, allow-list
 and no-credential assertions. Then the README's Reports table, the skill, and the routes it reads

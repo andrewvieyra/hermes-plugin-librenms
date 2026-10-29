@@ -167,7 +167,7 @@ class Foundation(ReportCase):
 class Arguments(ReportCase):
     def test_malformed_arguments_say_what_to_send(self):
         cases = [
-            ({"view": "ports"}, "view must be one of find, devices"),
+            ({"view": "graphs"}, "view must be one of find, devices, ports, port, capacity"),
             ({"view": "find"}, "view find needs a term"),
             ({"view": "devices", "term": "core"}, "term is for view find"),
             ({"view": "devices", "scope": "core-sw1"}, "scope must be an object"),
@@ -230,6 +230,7 @@ class Scope(ReportCase):
             [("device", "core-rtr1.example.net"), ("device", "core-sw1.example.net")],
         )
         self.assertIn("ask the user which one", out["notes"][-1])
+        self.assertIn("then call again with its hostname or id", out["notes"][-1])
         self.assertIn("why", out["untrusted_fields"])
         # two devices that share a sysName: neither is the device that name means
         self.seed_device(hostname="core-sw1-new.example.net", sysName="core-sw1")
@@ -336,6 +337,7 @@ class Scope(ReportCase):
         out = self.report(view="devices", scope={"group": "core"})
         self.assertTrue(out["ambiguous"])
         self.assertEqual([c["name"] for c in out["candidates"]], ["core-routers", "core-switches"])
+        self.assertIn("then call again with its group_id or exact name", out["notes"][0])
 
 
 class Find(ReportCase):

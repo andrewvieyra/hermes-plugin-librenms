@@ -48,13 +48,13 @@ _TABLES = (
     "devices", "locations", "device_groups", "services", "rules", "faults", "ports", "eventlog", "poller_groups",
     "port_groups", "links", "sensors", "transceivers", "components", "bgp_peers", "ospf_nbrs", "alert_log", "syslog",
     "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills", "ipv4_addresses",
-    "ipv6_addresses",
+    "ipv6_addresses", "ports_statistics",
 )  # fmt: skip
 _ID_KEYS = {
     "devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id",
     "sensors": "sensor_id", "bgp_peers": "bgpPeer_id", "syslog": "seq", "vlans": "vlan_id",
     "ports_fdb": "ports_fdb_id", "ports_nac": "ports_nac_id", "availability": "availability_id", "bills": "bill_id",
-    "ipv4_addresses": "ipv4_address_id", "ipv6_addresses": "ipv6_address_id",
+    "ipv4_addresses": "ipv4_address_id", "ipv6_addresses": "ipv6_address_id", "ports_statistics": "port_id",
 }  # fmt: skip
 
 # App\Http\Resources\Device, in its key order (dependency_parent_* only where list_devices loads parents).
@@ -78,10 +78,30 @@ _DEVICE_FILLABLE = frozenset(
 _DEVICE_FLAGS = frozenset({"status", "ignore", "ignore_status", "disabled", "disable_notify", "override_sysLocation"})
 _OBSERVED = ("os", "sysName", "version", "hardware", "features", "serial", "icon", "type", "ip")
 _ASSOCIATION_MODES = {"ifIndex": 1, "ifName": 2, "ifDescr": 3, "ifAlias": 4}
+# The ports table in schema order (no ifHighSpeed: the poller folds it into ifSpeed). The counters are bigint unsigned:
+# ifInOctets_rate is bytes per second over poll_period, ifLastChange the device's sysUpTime in timeticks.
+_COUNTERS = tuple(
+    f"if{way}{counter}{suffix}"
+    for counter in ("UcastPkts", "Errors", "Octets")
+    for way in ("In", "Out")
+    for suffix in ("", "_prev", "_delta", "_rate")
+)
 _PORT_COLUMNS = (
-    "port_id", "device_id", "port_descr_type", "port_descr_descr", "ifIndex", "ifName", "ifDescr", "ifAlias",
-    "ifType", "ifSpeed", "ifMtu", "ifPhysAddress", "ifAdminStatus", "ifOperStatus", "ifVlan", "ignore", "disabled",
-    "deleted", "ifInOctets_rate", "ifOutOctets_rate", "poll_time",
+    "port_id", "device_id", "port_descr_type", "port_descr_descr", "port_descr_circuit", "port_descr_speed",
+    "port_descr_notes", "ifDescr", "ifName", "portName", "ifIndex", "ifSpeed", "ifSpeed_prev", "ifConnectorPresent",
+    "ifOperStatus", "ifOperStatus_prev", "ifAdminStatus", "ifAdminStatus_prev", "ifDuplex", "ifMtu", "ifType",
+    "ifAlias", "ifPhysAddress", "ifLastChange", "ifVlan", "ifTrunk", "ifVrf", "ignore", "disabled", "deleted",
+    "pagpOperationMode", "pagpPortState", "pagpPartnerDeviceId", "pagpPartnerLearnMethod", "pagpPartnerIfIndex",
+    "pagpPartnerGroupIfIndex", "pagpPartnerDeviceName", "pagpEthcOperationMode", "pagpDeviceId", "pagpGroupIfIndex",
+    *_COUNTERS, "poll_time", "poll_prev", "poll_period",
+)  # fmt: skip
+# ports_statistics (PortStatistic, one row per port), which ports/{id}?with=statistics adds as "statistics".
+_PORT_STATISTICS_COLUMNS = ("port_id",) + tuple(
+    f"if{way}{counter}{suffix}"
+    for way, counter in (("In", "NUcastPkts"), ("Out", "NUcastPkts"), ("In", "Discards"), ("Out", "Discards"),
+                         ("In", "UnknownProtos"), ("In", "BroadcastPkts"), ("Out", "BroadcastPkts"),
+                         ("In", "MulticastPkts"), ("Out", "MulticastPkts"))
+    for suffix in ("", "_prev", "_delta", "_rate")
 )  # fmt: skip
 _SERVICE_COLUMNS = (
     "service_id", "device_id", "service_ip", "service_type", "service_desc", "service_param", "service_ignore",
@@ -166,7 +186,9 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
               "alert_operation_id": None, "devices": [], "groups": [], "locations": []},
     "faults": {"entity_type": None, "entity_id": None, "entity_key": "", "alerted": 1, "open": 1, "severity": "ok",
                "note": "", "info": None, "details": None},
-    "ports": {**dict.fromkeys(_PORT_COLUMNS), **{"ignore": 0, "disabled": 0, "deleted": 0, "ifMtu": 1500}},
+    "ports": {**dict.fromkeys(_PORT_COLUMNS),
+              **{"ignore": 0, "disabled": 0, "deleted": 0, "ifMtu": 1500, "ifLastChange": 0, "ifVrf": 0}},
+    "ports_statistics": dict.fromkeys(_PORT_STATISTICS_COLUMNS),
     "eventlog": {"type": "system", "reference": None, "username": None, "severity": 2},
     "port_groups": {"desc": None, "ports": []},
     "links": {**dict.fromkeys(_LINK_COLUMNS), "active": 1, "protocol": "lldp", "remote_device_id": 0},
@@ -244,6 +266,7 @@ _ROUTES = (
     ("GET", "logs/syslog/{hostname?}", "list_syslog", "_list_logs"),
     ("GET", "logs/alertlog/{hostname?}", "list_alertlog", "_list_logs"),
     ("GET", "ports/{portid}", "get_port_info", "_get_port_info"),
+    ("GET", "ports/{portid}/transceiver", "get_port_transceiver", "_get_port_transceiver"),
     ("GET", "ports/search/{field}/{search?}", "search_ports", "_search_ports"),
     ("GET", "ports/mac/{search}", "search_mac", "_search_mac"),
     ("GET", "ports", "get_all_ports", "_get_all_ports"),
@@ -1429,8 +1452,23 @@ class FakeLibreNMS:
         return self.tables["ports"].get(int(match.group(1)) if match else 0)
 
     def _get_port_info(self, r: _Req) -> FakeResponse:
+        """``get_port_info``: the port as a one-row list (none for an unknown id), deleted or not; ``with=statistics``
+        adds its ports_statistics rows (``vlans`` and ``device``, which LibreNMS also allows, are not modelled)."""
         port = self._port(r.args["portid"])
-        return _api_success([{k: port[k] for k in _PORT_COLUMNS}] if port else [], "port")
+        if port is None:
+            return _api_success([], "port")
+        row = {k: port[k] for k in _PORT_COLUMNS}
+        if r.params.get("with") == "statistics":
+            row["statistics"] = self._rows("ports_statistics", _PORT_STATISTICS_COLUMNS, port_id=port["port_id"])
+        return _api_success([row], "port")
+
+    def _get_port_transceiver(self, r: _Req) -> FakeResponse:
+        """``Port::find($id)->transceivers()``: an unknown port is a null LibreNMS calls a method on, a 500."""
+        port = self._port(r.args["portid"])
+        if port is None:
+            return _server_error()
+        rows = self._rows("transceivers", _TRANSCEIVER_COLUMNS, port_id=port["port_id"])
+        return _api_success(rows, "transceivers")
 
     def _get_port_description(self, r: _Req) -> FakeResponse:
         port = self._port(r.args["portid"])
@@ -2142,13 +2180,14 @@ def seeded() -> FakeLibreNMS:
         "id": 2, "name": "High CPU", "severity": "critical", "builder": high_cpu, "alert_operation_id": 1,
         "notify_per_entity": True, "devices": [1], "groups": [1],
     })  # fmt: skip
+    # entity_type is the morph name AppServiceProvider gives the entity's model: "interface" for a Port
     for row in (
-        {"id": 1, "rule_id": 1, "device_id": 2, "entity_type": "port", "entity_id": 5, "entity_key": "port:5",
+        {"id": 1, "rule_id": 1, "device_id": 2, "entity_type": "interface", "entity_id": 5, "entity_key": "port:5",
          "state": 1, "timestamp": "2026-10-28 10:02:00", "details": {"rule": [{"port_id": 5, "ifName": "Gi0/0/0"}]}},
-        {"id": 2, "rule_id": 1, "device_id": 2, "entity_type": "port", "entity_id": 6, "entity_key": "port:6",
+        {"id": 2, "rule_id": 1, "device_id": 2, "entity_type": "interface", "entity_id": 6, "entity_key": "port:6",
          "state": 2, "timestamp": "2026-10-28 09:10:00", "info": {"until_clear": False},
          "note": "2026-10-28 09:15:00 - Ack (alice) carrier ticket 4411"},
-        {"id": 3, "rule_id": 1, "device_id": 3, "entity_type": "port", "entity_id": 9, "entity_key": "port:9",
+        {"id": 3, "rule_id": 1, "device_id": 3, "entity_type": "interface", "entity_id": 9, "entity_key": "port:9",
          "state": 1, "timestamp": "2026-10-28 08:30:00"},
         {"id": 4, "rule_id": 2, "device_id": 1, "state": 1, "timestamp": "2026-10-28 11:40:00"},
         {"id": 5, "rule_id": 2, "device_id": 1, "state": 0, "open": 0, "timestamp": "2026-10-27 22:00:00"},
@@ -2188,12 +2227,15 @@ def seeded() -> FakeLibreNMS:
 
 def _seed_reports(fake: FakeLibreNMS) -> None:
     """What the read-only report routes show: interface addresses (IPv4 and IPv6, for ``devices?type=ipv4|ipv6``), a
-    port group, LLDP/CDP links (one to an unmonitored neighbour), sensors (one past its limit, an optic), a
-    transceiver, NTP components, BGP sessions (one idle, one without a state), OSPF neighbours, alert-log rows whose
-    details carry contacts, syslog, VLANs, a MAC learned on an access port and on the uplink, a NAC session, ARP
-    entries, outages and availability, and two CDR bills (one over its commit)."""
+    port group, the uplink's discards (ports_statistics), LLDP/CDP links (one to an unmonitored neighbour), sensors
+    (one past its limit, an optic), a transceiver, NTP components, BGP sessions (one idle, one without a state), OSPF
+    neighbours, alert-log rows whose details carry contacts, syslog, VLANs, a MAC learned on an access port and on the
+    uplink, a NAC session, ARP entries, outages and availability, and two CDR bills (one over its commit)."""
     seed = fake.seed
     seed("port_groups", {"id": 1, "name": "uplinks", "desc": "Core and WAN uplinks", "ports": [1, 5, 6]})
+    seed("ports_statistics", {"port_id": 1, "ifInDiscards": 120, "ifInDiscards_prev": 120, "ifInDiscards_delta": 0,
+                              "ifInDiscards_rate": 0, "ifOutDiscards": 9042, "ifOutDiscards_prev": 9000,
+                              "ifOutDiscards_delta": 42, "ifOutDiscards_rate": 0})  # fmt: skip
     seed("port_groups", {"id": 2, "name": "spare"})
     for row in (
         {"id": 1, "local_device_id": 1, "local_port_id": 1, "remote_hostname": "edge-rtr1", "protocol": "cdp",

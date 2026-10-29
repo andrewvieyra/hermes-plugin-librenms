@@ -6,9 +6,10 @@ and result envelope.
   does (:func:`routes.match`, so a refused route stays unreachable), counts it against :data:`CALL_BUDGET`, reads
   LibreNMS's 404-for-an-empty-list as no rows and takes the rows from the route's result key. The devices,
   locations and group listings are read at most once per report; nothing is kept between calls.
-- Scope: :meth:`ReportContext.scope` turns ``scope`` into a set of device ids. A device given by a phrase rather
-  than its id or hostname is ranked (:mod:`.fuzzy`) and resolves only when one device matches exactly, or only one
-  matches every word; otherwise the report answers ``ambiguous`` with the candidates (:class:`Ambiguous`).
+- Scope: :meth:`ReportContext.scope` turns ``scope`` into a set of device ids (and a port group into its port ids).
+  A device given by a phrase rather than its id or hostname is ranked (:mod:`.fuzzy`) and resolves only when one
+  device matches exactly, or only one matches every word; otherwise the report answers ``ambiguous`` with the
+  candidates (:class:`Ambiguous`). A device or port group named by part of its name resolves the same way.
 - Envelope: :meth:`ReportContext.envelope` puts every view's answer in one shape (``scope``, ``data_as_of``,
   ``timezone``, ``count``/``returned``/``offset``/``truncated``/``next_offset``, ``partial``/``partial_reason``,
   ``summary``, ``rows``, ``notes``) with every string from LibreNMS clipped (:data:`LABEL_CHARS`) and the keys that
@@ -43,7 +44,16 @@ TIMEZONE_UNKNOWN = "unknown — set librenms_timezone"
 CANDIDATE_TEXT = ("hostname", "display", "sysName", "location", "purpose", "hardware", "name", "desc", "port", "why")
 # LibreNMS's device states, as its Device scopes decide them (isDisabled, isIgnored, isDown, isUp), first wins.
 STATES = ("disabled", "ignored", "down", "up")
+# A fault's state (LibreNMS's AlertState), and the ones a fault is open in.
+FAULT_STATES = {0: "recovered", 1: "active", 2: "acknowledged", 3: "worse", 4: "better", 5: "changed"}
+OPEN_FAULT_STATES = "1,2,3,4,5"
 _TRUE = frozenset({"1", "true", "yes", "on"})
+# What names one candidate of an ambiguous scope value for certain, by scope key; a device's hostname or id otherwise.
+_CALL_AGAIN_WITH = {
+    "port": "its port_id",
+    "group": "its group_id or exact name",
+    "port_group": "its port_group_id or exact name",
+}
 
 
 class ArgumentError(ValueError):
@@ -89,8 +99,8 @@ class Request:
 @dataclass(frozen=True)
 class View:
     """A report view: its builder and the arguments it takes. ``filters`` maps each filter name to its kind
-    (``bool``, ``duration``, ``text``, or a tuple of the values a ``choice`` takes); ``sorts`` lists the orders, the
-    default first."""
+    (``bool``, ``duration``, ``number``, ``text``, or a tuple of the values a ``choice`` takes); ``sorts`` lists the
+    orders, the default first."""
 
     name: str
     build: Callable[[ReportContext, Request], Dict[str, Any]]
@@ -103,10 +113,12 @@ class View:
 
 @dataclass
 class Scope:
-    """A resolved scope: the device ids it covers (None: every device) and what the result says about it."""
+    """A resolved scope: the device ids it covers (None: every device, when no key narrows the devices), the port
+    ids of its port group (None: no port group was given), and what the result says about it."""
 
     ids: Set[int] | None
     summary: Dict[str, Any]
+    port_ids: Set[int] | None = None
 
 
 def truthy(value: Any) -> bool:
@@ -223,8 +235,17 @@ def request(view: View, args: Dict[str, Any], settings: Any) -> Request:
     return Request(term, args.get("scope"), filters(view, args.get("filter")), sort.strip().lower(), limit, offset)
 
 
+def number_arg(what: str, value: Any) -> float:
+    """A number the model gave (or its digits as text): finite, 0 or more."""
+    found = None if isinstance(value, bool) else units.number(value)
+    if found is None or found < 0:
+        raise ArgumentError(f"{what} takes a number, 0 or more (got {_shown(value)})")
+    return found
+
+
 def filters(view: View, raw: Any) -> Dict[str, Any]:
-    """The ``filter`` argument as typed values: a flag, a duration in seconds, a text, or the set of choices."""
+    """The ``filter`` argument as typed values: a flag, a duration in seconds, a number, a text, or the set of
+    choices (any letter case; held as the view spells them)."""
     if raw is None or raw == {}:
         return {}
     if not isinstance(raw, dict):
@@ -243,13 +264,16 @@ def filters(view: View, raw: Any) -> Dict[str, Any]:
             out[key] = units.parse_duration(value)
             if out[key] is None:
                 raise ArgumentError(f"filter.{key} takes a duration such as 30m, 24h or 7d (at most a year)")
+        elif kind == "number":
+            out[key] = number_arg(f"filter.{key}", value)
         elif kind == "text":
             out[key] = term_arg(f"filter.{key}", value)
         else:
+            spelled = {choice.casefold(): choice for choice in kind}
             items = value if isinstance(value, list) and value else [value]
-            if not all(isinstance(item, str) and item.strip().lower() in kind for item in items):
+            if not all(isinstance(item, str) and item.strip().casefold() in spelled for item in items):
                 raise ArgumentError(f"filter.{key} takes {', '.join(kind)}, or a list of them")
-            out[key] = frozenset(item.strip().lower() for item in items)
+            out[key] = frozenset(spelled[item.strip().casefold()] for item in items)
     return out
 
 
@@ -391,9 +415,10 @@ class ReportContext:
     # -- scope ------------------------------------------------------------------------------------------------------
     def scope(self, raw: Any, accepted: Tuple[str, ...]) -> Scope:
         """*raw* (the ``scope`` argument) as the device ids it names. ``device`` and ``devices`` add devices; ``group``,
-        ``location``, ``os`` and ``type`` narrow to theirs (all given must hold). Raises :class:`ArgumentError` for a
-        key the view does not take, :class:`Ambiguous` for a device or group that could be several, and
-        :class:`ReportError` for one that is none."""
+        ``location``, ``os`` and ``type`` narrow to theirs (all given must hold); ``port_group`` names the ports the
+        view keeps (:attr:`Scope.port_ids`). Raises :class:`ArgumentError` for a key the view does not take,
+        :class:`Ambiguous` for a device or group that could be several, and :class:`ReportError` for one that is
+        none."""
         devices = self.devices()
         if raw is None or raw == {}:
             return Scope(None, {"fleet": True, "device_count": len(devices)})
@@ -433,6 +458,9 @@ class ReportContext:
                     self.notes.append(f"no device has {key} {_shown(wanted)}; the {key} values LibreNMS holds: "
                                       + ", ".join(held[:30]) + (" ..." if len(held) > 30 else ""))  # fmt: skip
                 chosen = ids if chosen is None else chosen & ids
+        port_ids = None
+        if "port_group" in raw:
+            port_ids, summary["port_group"] = self._port_group(raw["port_group"])
         ids = chosen if chosen is not None else set(devices)
         out: Dict[str, Any] = {"device_count": len(ids), **summary}
         if len(ids) <= SCOPE_SHOWN:
@@ -441,7 +469,7 @@ class ReportContext:
             out["resolved"] = resolved[:SCOPE_SHOWN]
             if len(resolved) > SCOPE_SHOWN:
                 out["resolved_count"] = len(resolved)
-        return Scope(ids, out)
+        return Scope(chosen, out, port_ids)
 
     def resolve_device(self, key: str, ref: Any) -> Tuple[int, str | None]:
         """The device *ref* names: an id or exact hostname as it is; else the one device a phrase matches exactly
@@ -470,10 +498,33 @@ class ReportContext:
         )
 
     def _group(self, ref: Any) -> Tuple[Set[int], Dict[str, Any]]:
-        """The members of a device group given by id or name (any case; else the one group whose name matches the
-        words), read with ``devicegroups/{id}``, never ``full=1``."""
-        text = term_arg("scope.group", ref)
+        """The members of a device group given by id or name (:meth:`_named_group`), read with
+        ``devicegroups/{id}``, never ``full=1``."""
         groups = self.listing("groups", "devicegroups")
+        group = self._named_group("group", "device group", groups, ref, group_candidate)
+        rows = self.get("devicegroups", group["id"])
+        devices = self.devices()
+        ids = {int(row["device_id"]) for row in rows_of(rows) if is_digits(row.get("device_id"))} & set(devices)
+        return ids, {"group_id": int(group["id"]), "name": group.get("name")}
+
+    def _port_group(self, ref: Any) -> Tuple[Set[int], Dict[str, Any]]:
+        """The port ids of a port group given by id or name (:meth:`_named_group`), read with ``port_groups/{id}``,
+        never ``full=1`` (which returns every column of every port)."""
+        groups = self.listing("port_groups", "port_groups")
+        group = self._named_group("port_group", "port group", groups, ref, port_group_candidate)
+        rows = self.get("port_groups", group["id"])
+        ids = {int(row["port_id"]) for row in rows_of(rows) if is_digits(row.get("port_id"))}
+        if not ids:
+            self.notes.append(f"port group {_shown(group.get('name'))} holds no ports")
+        return ids, {"port_group_id": int(group["id"]), "name": group.get("name"), "ports": len(ids)}
+
+    def _named_group(
+        self, key: str, what: str, groups: List[Dict[str, Any]], ref: Any, candidate: Callable[..., Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """The device or port group (one of *groups*) that *ref* names: its id, its name in any case, else the one
+        group whose name (or description) matches every word of it. Several that could be meant are
+        :class:`Ambiguous`; none is a :class:`ReportError` naming the groups there are."""
+        text = term_arg(f"scope.{key}", ref)
         found = [
             group
             for group in groups
@@ -492,18 +543,16 @@ class ReportContext:
             if len(full) == 1:
                 found = [full[0][1]]
             elif ranked:
-                raise Ambiguous("group", text, [group_candidate(g, m) for m, g in ranked])
+                raise Ambiguous(key, text, [candidate(g, m) for m, g in ranked])
             else:
                 names = ", ".join(_shown(g.get("name")) for g in groups[:10]) or "none"
-                raise ReportError(f"scope.group {_shown(text)}: LibreNMS has no device group by that name or id; "
-                                  f"its groups: {names}")  # fmt: skip
+                listed = "groups" if key == "group" else f"{what}s"
+                raise ReportError(f"scope.{key} {_shown(text)}: LibreNMS has no {what} by that name or id; its "
+                                  f"{listed}: {names}")  # fmt: skip
         group = found[0]
         if not is_digits(group.get("id")):
-            raise ReportError(f"device group {_shown(group.get('name'))} has no id LibreNMS can be asked by")
-        rows = self.get("devicegroups", group["id"])
-        devices = self.devices()
-        ids = {int(row["device_id"]) for row in rows_of(rows) if is_digits(row.get("device_id"))} & set(devices)
-        return ids, {"group_id": int(group["id"]), "name": group.get("name")}
+            raise ReportError(f"{what} {_shown(group.get('name'))} has no id LibreNMS can be asked by")
+        return group
 
     def _location(self, ref: Any) -> Tuple[Set[int], Dict[str, Any]]:
         """The devices at a location given by id, by name (any case), or by part of a name: every location whose name
@@ -572,9 +621,10 @@ class ReportContext:
         """The answer when a scope value could be several things: no rows, the candidates (``count``, ``returned``
         and ``offset`` count them, at most :data:`MAX_CANDIDATES` an answer, best first), and what to do."""
         total = len(exc.candidates)
+        naming = _CALL_AGAIN_WITH.get(exc.key, "its hostname or id")
         self.notes.append(
             f"scope.{exc.key} {_shown(exc.term)} could be any of {total} candidates: ask the user which one they "
-            "mean, then call again with its hostname or id; nothing was reported for it"
+            f"mean, then call again with {naming}; nothing was reported for it"
         )
         if total > MAX_CANDIDATES:
             self.notes.append(
@@ -608,7 +658,7 @@ def _scope_text(summary: Dict[str, Any]) -> List[str]:
         keys += ["hostname", "display"]
     if summary.get("resolved"):
         keys.append("why")
-    if summary.get("group"):
+    if summary.get("group") or summary.get("port_group"):
         keys.append("name")
     if (summary.get("location") or {}).get("locations"):
         keys.append("locations")
@@ -624,6 +674,40 @@ def group_candidate(group: Dict[str, Any], found: fuzzy.Match) -> Dict[str, Any]
         row["type"] = group["type"]
     row.update(score=found.score, why=found.why)
     return row
+
+
+def port_group_candidate(group: Dict[str, Any], found: fuzzy.Match) -> Dict[str, Any]:
+    """A port group as a candidate: its id, name and description, and the score and why of its match."""
+    row: Dict[str, Any] = {"kind": "port_group", "port_group_id": group.get("id"), "name": group.get("name")}
+    if group.get("desc"):
+        row["desc"] = group["desc"]
+    row.update(score=found.score, why=found.why)
+    return row
+
+
+def port_candidate(port: Dict[str, Any], device: Dict[str, Any] | None, found: fuzzy.Match) -> Dict[str, Any]:
+    """A port as a candidate: its id, its device, its label and state, and the score and why of its match."""
+    row: Dict[str, Any] = {"kind": "port", "port_id": port.get("port_id")}
+    row.update(brief(device) if device is not None else {"device_id": port.get("device_id")})
+    row.update(port=port_label(port), status=port_state(port), score=found.score, why=found.why)
+    return row
+
+
+def sensor_status(sensor: Dict[str, Any]) -> str | None:
+    """``critical``, ``warning`` or ``ok`` as LibreNMS's Sensor scopes decide it: past ``sensor_limit`` or below
+    ``sensor_limit_low`` is critical, past the ``_warn`` limits a warning (a limit not set never trips); None
+    without a current value."""
+    current = units.number(sensor.get("sensor_current"))
+    if current is None:
+        return None
+
+    def past(high: str, low: str) -> bool:
+        top, bottom = units.number(sensor.get(high)), units.number(sensor.get(low))
+        return (top is not None and current > top) or (bottom is not None and current < bottom)
+
+    if past("sensor_limit", "sensor_limit_low"):
+        return "critical"
+    return "warning" if past("sensor_limit_warn", "sensor_limit_low_warn") else "ok"
 
 
 def rows_of(value: Any) -> List[Dict[str, Any]]:

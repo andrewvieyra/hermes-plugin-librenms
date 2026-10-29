@@ -26,11 +26,10 @@ from .context import (
     ReportContext,
     Request,
     View,
-    brief,
     group_candidate,
     hostname_order,
-    port_label,
-    port_state,
+    port_candidate,
+    port_group_candidate,
     rows_of,
 )
 
@@ -191,12 +190,8 @@ def _port_groups(ctx: ReportContext, term: fuzzy.Term) -> List[Found]:
         matched = fuzzy.name_match(term, "name", group.get("name"), group.get("desc"))
         if matched is None:
             continue
-        candidate: Dict[str, Any] = {"kind": "port_group", "port_group_id": group.get("id"), "name": group.get("name")}
-        if group.get("desc"):
-            candidate["desc"] = group["desc"]
-        candidate.update(score=matched.score, why=matched.why)
         key = (KINDS.index("port_group"), natural_key(group.get("name")), str(group.get("id")))
-        out.append((matched, key, candidate))
+        out.append((matched, key, port_group_candidate(group, matched)))
     return out
 
 
@@ -212,12 +207,9 @@ def _ports(ctx: ReportContext, term: fuzzy.Term) -> List[Found]:
         matched = fuzzy.port_match(term, port, device)
         if matched is None:
             continue
-        candidate: Dict[str, Any] = {"kind": "port", "port_id": port.get("port_id")}
-        candidate.update(brief(device) if device is not None else {"device_id": port.get("device_id")})
-        candidate.update(port=port_label(port), status=port_state(port), score=matched.score, why=matched.why)
         hostname = device.get("hostname") if device is not None else None
         key = (KINDS.index("port"), natural_key(hostname), natural_key(port.get("ifName")), str(port.get("port_id")))
-        out.append((matched, key, candidate))
+        out.append((matched, key, port_candidate(port, device, matched)))
     return out
 
 

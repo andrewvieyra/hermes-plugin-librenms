@@ -584,6 +584,20 @@ class Ports(_FakeCase):
         self.assertEqual((body["port"][0]["deleted"], "count" in body), (1, False))
         self.assertEqual(self.call("GET", "ports/99")[1], {"status": "ok", "port": []})
 
+    def test_port_info_with_statistics_and_the_transceiver_route(self):
+        port = self.call("GET", "ports/1")[1]["port"][0]
+        self.assertEqual(list(port)[:6], ["port_id", "device_id", "port_descr_type", "port_descr_descr",
+                                          "port_descr_circuit", "port_descr_speed"])  # fmt: skip
+        self.assertEqual((port["ifLastChange"], "statistics" in port, "ifHighSpeed" in port), (0, False, False))
+        [stats] = self.call("GET", "ports/1", {"with": "statistics"})[1]["port"][0]["statistics"]
+        self.assertEqual((stats["port_id"], stats["ifOutDiscards_delta"]), (1, 42))
+        self.assertEqual(self.call("GET", "ports/2", {"with": "statistics"})[1]["port"][0]["statistics"], [])
+        self.assertEqual(self.call("GET", "ports/1/transceiver")[1]["transceivers"][0]["model"], "GLC-LH-SMD")
+        self.assertEqual(self.call("GET", "ports/2/transceiver")[1], {"status": "ok", "transceivers": []})
+        self.assertEqual(self.call("GET", "ports/99/transceiver"), (500, {"message": "Server Error"}))
+        self.assertEqual(self.call("GET", "ports", {"columns": "port_id,ifHighSpeed"})[1]["message"],
+                         "Invalid columns: ifHighSpeed")  # fmt: skip
+
     def test_a_null_description_leaves_the_key_out(self):
         self.assertEqual(self.call("GET", "ports/3/description")[1], {"status": "ok"})
         self.assertEqual(self.call("GET", "ports/1/description")[1]["port_description"], "uplink to edge-rtr1")

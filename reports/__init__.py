@@ -6,21 +6,22 @@ listings and joining ids in its head (``librenms_query`` stays the escape hatch 
 only through :meth:`context.ReportContext.get`, the same route allow-list as librenms_query, within a budget of
 requests; it never writes.
 
-Views: :mod:`.find` (what a name or phrase could mean, ranked) and :mod:`.devices` (state, outages, uptime, polls and
-naming checks). Shared pieces: :mod:`.context` (reads, budgets, scope, envelope), :mod:`.fuzzy` (ranking) and
-:mod:`.units` (units and times).
+Views: :mod:`.find` (what a name or phrase could mean, ranked), :mod:`.devices` (state, outages, uptime, polls and
+naming checks), :mod:`.ports` (``ports``: state, speed, utilisation, errors and age of each port; ``capacity``: ports
+in use and free per device) and :mod:`.port` (one port in depth). Shared pieces: :mod:`.context` (reads, budgets,
+scope, envelope), :mod:`.fuzzy` (ranking) and :mod:`.units` (units and times).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from . import devices, find
+from . import devices, find, port, ports
 from .context import Ambiguous, ArgumentError, CallBudget, ReportContext, ReportError, View, request
 
 __all__ = ["VIEWS", "ArgumentError", "ReportError", "run"]
 
-VIEWS: Dict[str, View] = {view.name: view for view in (find.VIEW, devices.VIEW)}
+VIEWS: Dict[str, View] = {view.name: view for view in (find.VIEW, devices.VIEW, ports.VIEW, port.VIEW, ports.CAPACITY)}
 
 
 def run(client: Any, settings: Any, args: Dict[str, Any], *, call_budget: int | None = None) -> Dict[str, Any]:

@@ -27,8 +27,8 @@ v0 route to what the plugin does with it.
 | `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused. Its natural order also orders reports | `redact` |
 | `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings, partial reasons), scope resolution with ambiguity, argument checks, the result envelope | `client`, `routes`, `listing`, `redact`, `settings` |
 | `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
-| `reports/units` | Rates, speeds, percentages and durations with their readable forms; zone-safe times, and server-local times read in `librenms_timezone` | none |
-| `reports/find`, `reports/devices` | The views; `reports/__init__` holds their registry and `run` | `reports/context` |
+| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; zone-safe times, and server-local times read in `librenms_timezone` | none |
+| `reports/find`, `reports/devices`, `reports/ports`, `reports/port` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
@@ -66,7 +66,8 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   between calls.
 - **Scope.** `scope` becomes a set of device ids from one `devices` listing: `device`/`devices`
   add devices, `group` (`devicegroups/{id}`, never `full=1`), `location` (an id, a name, or every
-  location whose name holds the text), `os` and `type` narrow. A device named by an id or its exact
+  location whose name holds the text), `os` and `type` narrow; `port_group` (`port_groups/{id}`,
+  never `full=1`) names the ports a port view keeps, and the `port` view's `port` one port. A device named by an id or its exact
   hostname is that device. Anything else is ranked (`reports/fuzzy`) and resolves only when one
   device matches exactly (sysName, display name, first label, IP) or only one matches every word of
   the phrase; otherwise the answer is `ambiguous: true` with the candidates and no report, so a
@@ -77,8 +78,11 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   `rows`, `notes`. Strings from LibreNMS are clipped to 200 characters (counted as escaped). The
   handler then fits the result to `max_result_chars` as it fits a query's, cutting rows and saying
   where to read on.
-- **Time.** Device times are ISO-8601 UTC and outages unix seconds, so ages are exact and are
-  counted to LibreNMS's own clock. Fault, alert-log, eventlog and syslog times are server-local
+- **Time.** Device times are ISO-8601 UTC and outages and port polls unix seconds, so ages are
+  exact and are counted to LibreNMS's own clock. A port's last change is sysUpTime in hundredths
+  of a second, so its age is the device's uptime less that, plus the time since the poll: unknown
+  past 497 days of uptime (the 32-bit counter may have wrapped), and only a lower bound when it is
+  0 (unchanged since the SNMP agent started). Fault, alert-log, eventlog and syslog times are server-local
   `Y-m-d H:i:s`, and no API field names the server's zone (`system`'s `local_date` is the date of
   the LibreNMS commit), so `reports/units` reads them only in `librenms_timezone` and otherwise
   gives them no age; `timezone` says which zone a report used.
@@ -87,7 +91,15 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   groups, 10 an answer (`count` counts them all), `ambiguous` when the best two score within 10.
   `devices` gives each device's state as LibreNMS's own filters decide it, its open outage (read
   for the down devices of the page, at most 20), uptime and boot time, last poll and the naming
-  checks, with counts in `summary`.
+  checks, with counts in `summary`. `ports` reads the port rows of the scope (one device at a
+  time up to 10 devices, else one listing, with a column list) and derives what LibreNMS keeps as
+  raw counters in mixed units: the state, the speed it is measured against (the circuit speed in
+  the description first, egress and ingress apart), bit rates and percentages, errors per poll and
+  per second, the age of the last change, whether the figures are current, and whether it has a
+  description of its own; `summary` counts states and finds the busiest. `port` adds, for one
+  port, its discards, neighbours, transceivers, dBm sensors with their limits and open faults
+  (never their details). `capacity` counts each device's physical ethernet ports by state and
+  those free (not up and unchanged for `idle_days`).
 
 ## The plan document
 
