@@ -6,6 +6,71 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-29
+
+The minor findings of the adversarial reviews of 0.7.0 (alerts) and 0.8.0 (health, routing) that were never sent to
+a fix step, each confirmed against the 0.10.0 code first. The 0.8.0 review's OSPFv3 router-id fix already shipped
+in 0.9.0 (listed under its Fixed). Of the twelve, two parts had been fixed since: `help.py`'s over-long `units` line
+was re-wrapped in 0.9.0, and `SKILL.md`'s "up to a day" for a window without `librenms_timezone` left with the
+question guidance in 0.10.0 (`librenms:ask` says 26h, as the code, help, README and CHANGELOG do).
+
+### Security
+- A `librenms_report` answer whose page has no row now carries `untrusted_fields` and `untrusted_notice` when its
+  summary holds text from LibreNMS. The marker was given only for rows or a scope that names devices, so a
+  fleet-wide page past the last row, or one whose rows a filter removed after the summary was counted, returned rule
+  names (`alerts`' `by_rule`; `alert_history`'s `top_rules`), device names (`alert_history`'s `top_devices`, whose
+  `display` is often the sysName the device sets), sensor descriptions (`health`'s `hottest`, `nearest_limit`), the
+  device an address was found on (`locate`) or a login's result (`events` of the authlog) unmarked, though escaped
+  and clipped: `{"view": "alert_history", "filter": {"by": "device", "fired": false}}` answered no row and a
+  `top_devices` display of `IGNORE PREVIOUS INSTRUCTIONS ...` without the marker. The envelope now marks an answer
+  whenever its rows, its scope or its summary (at any depth) hold a value under one of the view's text keys.
+- `routing` names `context` (a session's or neighbour's SNMP context: a VRF's name, which the device or its operator
+  writes) in `untrusted_fields`; it was escaped and clipped but not named.
+
+### Fixed
+- `alert_history` reads a rule's `extra` as LibreNMS documents it, a JSON string, as well as an object: a rule whose
+  `extra` is `'{"mute": true, ...}'` is `muted` and does not notify, so `filter.notifies: false` keeps it and
+  `summary.rules_without_notifications` counts it (it read as not muted). The JSON-object decoder that the alert-rule
+  resource used is now `client.json_object`, shared by both.
+- `alert_history`'s flaps are found before `filter.state` and `filter.entity` narrow the entries: a flap is an alert
+  raised after a recovery, so `filter.state: "alerted"` (or an entity, which a recovery entry does not carry) counted
+  every flap as 0 and `sort: "flaps"` ordered by nothing. The filters on rules still apply first. View `help` says so
+  under `state`.
+- A view that names the ports of its rows from their devices' port names (`alerts`, `health`, `routing`, `events`,
+  `ReportContext.ports_by_device`) reads those of 10 devices at most; the rows of the devices past that cap kept no
+  port name, or `events`' `filter.port` searched no further, with only a note. The answer is now `partial`, with
+  that reason and what to do (`view port names one by its port_id`), as `devices` is past its outage reads.
+- `health` ties an optic's temperature, bias (`current`) and voltage sensors to its port when the device puts them on
+  the transceiver's inventory entity rather than on the port's ifIndex, as `measured_on`, the 0.8.0 CHANGELOG, the
+  README and docs/architecture.md already said: only a dBm sensor or one measured on the port's ifIndex was looked
+  for. For such a sensor the device's transceivers are read first (at most 10 devices; past that a note says the
+  rest are not tied), and its port names only when the entity is one of a transceiver's, so a chassis sensor on an
+  entity of its own costs one read and makes no port read.
+- `routing` with `filter.protocol: "ospfv3"` on a LibreNMS without the `ospfv3` route answers none with the note,
+  as the docs said, instead of failing with the 404; the 404 was read as none only when another protocol was read
+  too. Any other failure of the only protocol asked for still fails the report.
+- `routing`'s `filter.enabled` keeps a BGP session only when its `enabled` is the value asked for: a session whose
+  admin status is neither `start`/`running` nor `stop`/`halted` (`enabled` null) matched `enabled: false`, though
+  `summary.by_protocol.bgp.disabled` did not count it. It now matches neither; help, the README and `librenms:ask`
+  say so.
+- View `help` ignores `limit` and `offset`, which a model may fill in with their defaults, and an empty `scope` or
+  `filter` (`[]` or `{}`): `{"view": "help", "topic": "alerts", "limit": 20}` was refused. A scope or filter that
+  names anything, a sort, a term or a window is still refused.
+- A scope key a view does not take is refused naming the view and pointing to view `help`, as a filter or sort key
+  is and as the README and docs/architecture.md said: it answered `this view takes scope keys ..., not 'port'`.
+
+### Changed
+- `ReportContext.scope` takes the `View` (its scope keys and name) instead of its scope keys.
+- The 0.8.0 section of this CHANGELOG has its over-long `routing` line re-wrapped; its text is unchanged.
+- tests/test_report_alerts.py: every view's help examples past their last row keep the marker their summary needs
+  (alerts, alert_history, health, locate and events checked to need it); an `alerts` page past the end; an
+  `alert_history` answer with no row; a rule's `extra` as JSON text (muted, `"0"`, PHP's `[]`); flaps with
+  `filter.state` and `filter.entity`; the port-name cap with `PORT_MAP_READS` patched to 1; help's ignored and
+  refused arguments; the scope refusal. tests/test_report_health.py: an optic's temperature, bias and voltage
+  sensors on a transceiver's entity, a chassis sensor on an entity of its own (no port read), a fan on that entity
+  (not read for), the cap on the transceiver reads; a dBm page across 14 devices (10 port reads, 4 devices unnamed,
+  partial); `ospfv3` alone without the route; `context` marked; an unknown BGP admin status.
+
 ## [0.10.0] - 2026-10-29
 
 ### Added
@@ -189,9 +254,10 @@ All notable changes to this project are documented here. The format follows
   alarms on (`BgpPeer::inAlarm`: enabled and not established; an OSPF neighbour not full); a note says `twoWay` is
   the steady state between two routers that are neither DR nor BDR. LibreNMS's HTTP 500 `Error retrieving
   ospfv3_nbrs` (no OSPFv3 neighbour) is read as none, and so, with a note, is the 404 of a LibreNMS too old to have
-  the route; any other failure of a protocol leaves it out, partial, unless it is the only one read. Filters `protocol`, `not_established`, `enabled`, `state`, `remote_as` (`65001`,
-  `AS65001`, asdot `1.10`), `text`; sorts `state` (down first, then shut down, then up), `name`, `up_for`
-  (shortest first), `remote_as`. `summary`: `by_protocol`, `not_established`, `devices`, `by_state`, `stale`.
+  the route; any other failure of a protocol leaves it out, partial, unless it is the only one read. Filters
+  `protocol`, `not_established`, `enabled`, `state`, `remote_as` (`65001`, `AS65001`, asdot `1.10`), `text`; sorts
+  `state` (down first, then shut down, then up), `name`, `up_for` (shortest first), `remote_as`. `summary`:
+  `by_protocol`, `not_established`, `devices`, `by_state`, `stale`.
 - View `help` explains both views (filters, sorts, rows, summary, examples, which the tests run), and its `units`
   line says a health reading's value is in its row's `unit`.
 - The operator questions of the conversational audit about device health and routing, each answered in one call

@@ -39,7 +39,7 @@ class _Device:
 
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The devices in scope that pass the filter, in the order asked for, a page of them with their outages."""
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     devices = ctx.devices()
     ids = scope.ids if scope.ids is not None else set(devices)
     every = [_derive(ctx, devices[device_id]) for device_id in devices if device_id in ids]

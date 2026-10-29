@@ -356,7 +356,7 @@ approval, and is available in every `write_mode`.
 | `alerts` | What is alerting now: LibreNMS's open faults, one per rule, device and alerted object, each with the rule and its `severity`, `state` (`active`, `acknowledged`, `worse`, `better`, `changed`; `recovered` only when asked for), `acked`, the acknowledgement `note`, `first_seen` and its age, the rule's runbook link (`procedure`) and what alerted: `entity_type` (`port`, `sensor`, ...), `port_id` or `sensor_id`, and `entity`, its label (a port as `ifName (description)`, a sensor by its description and class, with the reading as `value`). The label comes from the rows the rule matched, through an allow-list of label keys; a port fault that holds none is named from its device's ports. Never the fault's `details` (every column the rule joined) or the alert's contacts. `summary` counts states, severities, the unacknowledged alerts, devices and rules, and the rules with the most alerts | `scope`; `filter` `state`, `severity`, `acked`, `rule` (an id, or part of a name), `entity_type` (`port`, `sensor`, ..., `device` for a device-wide rule), `text` (in the device, rule, what alerted or the note); `sort` `severity` (critical and unacknowledged first, newest first), `newest`, `oldest`, `name` |
 | `alert_history` | What alerted over `window` (`1h`, `24h` by default, `7d`, `30d`, any duration up to a year, or `today` with `librenms_timezone`), from LibreNMS's alert log, counted per rule (`filter.by` `rule`, the default; for the whole fleet every rule, also those that logged nothing, with `disabled`, `notifies` and `muted`), per `device` (with the rule that fired most there) or as each `event` (newest first: time, device, rule, `state` `alerted`, `recovered`, `acknowledged`, ..., what alerted). Counts: `fired` (alerts raised), `cleared`, `flaps` (raised again after clearing, within the window), `last_fired` and its age. `summary` gives the window and the bound sent (`from`, server time; `exact` false without `librenms_timezone`), what LibreNMS logged there, the totals, the five rules and devices that fired most and, for the whole fleet, how many rules are disabled or notify no one | `scope`, `window`; `filter` `by`, `rule`, `severity`, `state`, `entity`, `disabled`, `notifies`, `fired`; `sort` `fired`, `flaps`, `last_fired`, `name` |
 | `health` | What each sensor reads against its limits (temperature, optic dBm, voltage, fans, power, ...): `value` in the class's `unit` and as a `reading` (`41 °C`, `-3.2 dBm`), the four limits, `status` as LibreNMS decides it (`critical` past `limit` or below `limit_low`, `warning` past a warning limit; a limit not set never trips; `unknown` without a reading and for a `state` sensor, whose meaning the API does not return), `low_margin` and `high_margin` (how far from the first limit below and above, in the reading's unit, negative past it), `margin` and `nearest`, `alerting`, and for the page the port a sensor is on (measured on its ifIndex or on one of its transceivers, or for a dBm sensor named in its description) and an optic's `direction` (`rx`, `tx`). For at most 5 devices also their processors and memory pools (when `filter.class` names none) or storage, in percent against LibreNMS's warning limit, memory and storage with bytes used of their size. `stale` when the device was not polled lately. `summary` counts statuses and classes and names the hottest temperature and the reading nearest a limit it has not crossed | `scope`; `filter` `class` (sensor classes, `processor`, `mempool`, `storage`), `status`, `margin_below` (within this much of a limit, or past it), `direction`, `text`; `sort` `status` (critical first, nearest a limit first), `margin`, `low_margin`, `high_margin`, `value` (highest first), `name` |
-| `routing` | Per BGP session and OSPF or OSPFv3 neighbour of the devices in scope: BGP's peer (IPv6 written short), `remote_as`, `as_name`, `description`, `state`, `admin_status` and `enabled`, `established`, `up_for` or `down_for` (from the session's established timer at the last poll, plus the time since), `last_error` (LibreNMS's text, else the BGP error code's name); OSPF's peer, `router_id` (dotted: LibreNMS stores an OSPFv3 neighbour's as a number), `state`, `established` (`full`), the port it is on (named for the page), `events`. `not_established` is what LibreNMS alarms on: an enabled BGP session not established, an OSPF neighbour not full (a note says `twoWay` is normal between two routers that are neither DR nor BDR). `summary` counts per protocol, the sessions LibreNMS counts as down and the states | `scope`; `filter` `protocol` (`bgp`, `ospf`, `ospfv3`), `not_established`, `enabled`, `state`, `remote_as` (`65001`, `AS65001`, asdot `1.10`), `text`; `sort` `state` (down first), `name`, `up_for` (shortest first), `remote_as` |
+| `routing` | Per BGP session and OSPF or OSPFv3 neighbour of the devices in scope: BGP's peer (IPv6 written short), `remote_as`, `as_name`, `description`, `state`, `admin_status` and `enabled`, `established`, `up_for` or `down_for` (from the session's established timer at the last poll, plus the time since), `last_error` (LibreNMS's text, else the BGP error code's name); OSPF's peer, `router_id` (dotted: LibreNMS stores an OSPFv3 neighbour's as a number), `state`, `established` (`full`), the port it is on (named for the page), `events`. `not_established` is what LibreNMS alarms on: an enabled BGP session not established, an OSPF neighbour not full (a note says `twoWay` is normal between two routers that are neither DR nor BDR). `summary` counts per protocol, the sessions LibreNMS counts as down and the states | `scope`; `filter` `protocol` (`bgp`, `ospf`, `ospfv3`), `not_established`, `enabled` (a BGP session whose admin status is neither enabled nor shut down matches neither), `state`, `remote_as` (`65001`, `AS65001`, asdot `1.10`), `text`; `sort` `state` (down first), `name`, `up_for` (shortest first), `remote_as` |
 | `events` | What LibreNMS logged over `window` (`1h`, `24h` by default, `7d`, `30d`, any duration up to a year, or `today` with `librenms_timezone`), newest first: its eventlog (`filter.log` `eventlog`, the default: a device or port changing, a reboot, an edit through the API, with `type`, `severity` `unknown` to `error`, `message`, the port it is about, named, and `username`, who made a change), the syslog the devices send it (`syslog`: `severity` `emerg` to `debug`, from the name or number the collector wrote, `facility`, `program`, `tag`, `message`), or the logins to LibreNMS itself (`authlog`: `user`, `address`, `result`; no scope). Each entry (`filter.by` `event`, with its time and age), counted per `device` (entries, by severity, the type or program logged most, the latest), or per `port` from the eventlog's port changes (`ifOperStatus: up -> down`): `status_changes`, `went_down`, `flaps` (back up after going down within the window), `last_status` and `last_change`. `summary` gives the window and the bound sent (`exact` false without `librenms_timezone`), what LibreNMS logged there, counts per severity and device, the types, programs or results logged most; for the eventlog the ports that changed, went down and flapped and those that changed most; for the authlog who logged in (logins, addresses, the last). LibreNMS reads a port's state at each poll, about five minutes apart, so a shorter bounce may not be logged | `scope` (not for the authlog), `window`; `filter` `log`, `by`, `min_severity` (`debug`, `info`, `notice`, `warning`, `error`, `critical`: that or worse, eventlog and syslog on one scale; a port change is `notice`), `type` (eventlog), `program` (syslog), `port` (eventlog: a name, long or short, or a port_id; a number is both, as HP and Aruba switches name their ports `5`, but with one device in scope it is that device's port of that name), `port_id` (eventlog: that port alone, as a follow-up gives a row's `port_id`), `text`; `sort` `newest`, `oldest`, `most`, `name` |
 | `bills` | Each bill LibreNMS keeps, in the current billing period (`filter.period` `current`, the default) or the last one that ended (`previous`, within 40 days, against the commit it had then): a CDR bill's 95th percentile (`rate_95th_bps`, inbound, outbound and the `direction` billed) against its commit (`commit_bps`), a quota bill's traffic (`used_bytes`) against its quota (`quota_bytes`), `used_pct`, `over` and `overuse`, the average rate, the bytes `transferred`, the period's dates (`period_from`, `period_to`), when LibreNMS last worked the figures out (`last_calculated` and its age) and the bill's ports and their devices. `summary` counts bills, those over, per type, and names the fullest. The 95th percentile is of the bill's ports together over its billing period: the API keeps no other traffic history | `scope` (a bill with a port on a device in it); `filter` `period`, `over`, `type` (`cdr`, `quota`), `used_above_pct`, `text` (in its name, customer id, reference, notes, ports or their devices); `sort` `used_pct` (fullest first), `name`, `rate_95th` |
 | `help` | What each view answers and takes: without `topic` the views and what they share (scope, filter, sort, paging, window, units); with `topic` (a view) its scope keys, each filter with what it takes, each sort, the keys of its rows and summary, and examples. Answered by the plugin, without a LibreNMS call | `topic` |
@@ -409,7 +409,9 @@ than guess; so does a port name that could be several ports.
 
 The tool's description names the views and what they share; each view's filters, sorts, row keys and
 examples are in view `help`, so the schema sent to the model on every turn stays small. A scope,
-filter or sort key a view does not take is refused, naming those it does and pointing to `help`.
+filter or sort key a view does not take is refused, naming the view and those it does and pointing
+to `help`. View `help` ignores `limit` and `offset` (a model may send their defaults) and an empty
+`scope` or `filter`, and refuses a scope or filter that names anything, a sort, a term or a window.
 
 A port view reads the ports of a scope of up to 10 devices one device at a time, and otherwise one
 listing of every port, always naming the columns it needs; LibreNMS keeps their counters in mixed
@@ -437,17 +439,20 @@ that holds their readings and limits, and which takes no filter) and keeps the s
 answer is too large to read (16 MiB) it reads the scope's devices one sensor at a time within the
 request budget, which fits only a narrow question (a device and a class) and is otherwise
 `partial`. Processors, memory pools and storage have no fleet-wide route: a listing and a request
-per item, for at most 5 devices and 8 of a kind each. The port of a sensor on the page is named
-from its device's port names and, where its ifIndex names none, its transceivers. Readings are the
-last poll's: the API keeps no history of them. `routing` reads `bgp`, `ospf` and `ospfv3` once each
-(by device id for a scope of one device; `remote_asn` for `filter.remote_as`), and for the page the
-port names of the devices whose OSPF neighbours it lists; LibreNMS answers `ospfv3` with HTTP 500
-when it has no OSPFv3 neighbour, which the report reads as none (as it reads a LibreNMS too old to
-have the route, with a note). `events` reads its log as `alert_history` reads the alert log (from
-the window's start, newest first, 250 entries a request, at most 2,000 a report, each device's log
-for a scope of up to 10 devices), and the port names of the devices whose ports the page and summary
-name (and for `filter.port`, of the devices whose ports logged a change); the authlog has no device
-path and needs no device listing, so a `ping` read gives LibreNMS's clock before it. `bills` reads
+per item, for at most 5 devices and 8 of a kind each. The port of a sensor on the page is named from
+its device's port names and, where its ifIndex names none, its transceivers; an optic's temperature,
+bias or voltage sensor that a device puts on the transceiver's inventory entity is found by reading
+the device's transceivers first (at most 10 devices), and its port names only when one is a
+transceiver's. Readings are the last poll's: the API keeps no history of them. `routing` reads
+`bgp`, `ospf` and `ospfv3` once each (by device id for a scope of one device; `remote_asn` for
+`filter.remote_as`), and for the page the port names of the devices whose OSPF neighbours it lists;
+LibreNMS answers `ospfv3` with HTTP 500 when it has no OSPFv3 neighbour, which the report reads as
+none (as it reads a LibreNMS too old to have the route, with a note, also when that protocol is the
+only one asked for). `events` reads its log as `alert_history` reads the alert log (from the
+window's start, newest first, 250 entries a request, at most 2,000 a report, each device's log for a
+scope of up to 10 devices), and the port names of the devices whose ports the page and summary name
+(and for `filter.port`, of the devices whose ports logged a change); the authlog has no device path
+and needs no device listing, so a `ping` read gives LibreNMS's clock before it. `bills` reads
 LibreNMS's bill listing once (with `period=previous` for the last period), which carries LibreNMS's
 own figures and each bill's ports.
 
@@ -455,10 +460,13 @@ Every report carries `data_as_of` (LibreNMS's clock, from the `Date` of its answ
 (see `librenms_timezone`), `count`, `returned`, `offset`, `truncated` and `next_offset` (more rows:
 read on with `offset`), and `partial` with a `partial_reason` when the data itself is incomplete
 (the request budget ran out, as it can when LibreNMS's listing of every port is too large to read
-and the ports are read one device at a time, or a read for one device failed); `notes` say what to
+and the ports are read one device at a time, a read for one device failed, or the rows of more than
+10 devices name ports a view could not name, as it reads the port names of 10 devices at most);
+`notes` say what to
 do next. Rows are cut to `limit` (default 20, at most `max_query_results`; 10 for `find`) and to
 `max_result_chars`. Text from LibreNMS is clipped to 200 characters, escaped like every result,
-and named in `untrusted_fields`.
+and named in `untrusted_fields`, whether it is in the rows, the scope or the summary (a page past
+the last row still marks the rule and device names its summary counts).
 
 ### Operations
 
@@ -620,12 +628,15 @@ and MCP tools, and a plugin cannot opt in, so a result that returns text from Li
 status and of an error, which is LibreNMS's answer, the `note` of an empty answer; a plan's `diff`
 and `warnings`, dry-run `conflicts`, and the `journal`, `report`, `eventlog`, `failure`,
 `auto_rollback_error`, `apply`, `rollback`, `checks` and `steps` of apply, rollback and
-`librenms_plans`; for a report, the keys of its rows and scope that hold such text, such as
+`librenms_plans`; for a report, the keys of its rows, summary and scope that hold such text (also
+when a page has no row while its summary names rules, devices or sensors), such as
 `hostname`, `sysName`, `location`, `purpose`, `port`, `description`, a neighbour's
 `remote_hostname`, `remote_port` and `remote_platform`, a VLAN's `name`, a sensor's `descr`, a BGP
-peer's `description`, `as_name` and `last_error`, a log entry's `message`, `type`, `program`,
-`tag` and `username`, a login's `user` and `address`, a bill's name, customer id, reference and
-`note`, and a candidate's `why`), and before them an `untrusted_notice` telling the model that this is data, not instructions. The plugin's own keys (`next_step`, `note` on a cut listing, counts) are not listed.
+peer's `description`, `as_name`, `last_error` and VRF `context`, a log entry's `message`, `type`,
+`program`, `tag` and `username`, a login's `user` and `address`, a bill's name, customer id,
+reference and `note`, and a candidate's `why`), and before them an `untrusted_notice` telling the
+model that this is data, not instructions. The plugin's own keys (`next_step`, `note` on a cut
+listing, counts) are not listed.
 Refusals and errors are the plugin's own text and carry no marker of their own, but they may quote
 LibreNMS: an `error` holds LibreNMS's error message, the refusal of an unknown hostname names the
 devices LibreNMS holds whose names come close (autodiscovered ones among them), and a plan's

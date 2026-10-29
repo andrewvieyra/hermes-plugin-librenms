@@ -29,6 +29,7 @@ from .context import Ambiguous, ArgumentError, CallBudget, ReportContext, Report
 __all__ = ["HELP", "VIEWS", "ArgumentError", "ReportError", "help_answer", "is_help", "run"]
 
 HELP = "help"  # the view the plugin answers itself
+HELP_IGNORES = ("limit", "offset")  # paging, which help has no rows for
 VIEWS: Dict[str, View] = {
     view.name: view
     for view in (
@@ -45,9 +46,15 @@ def is_help(args: Dict[str, Any]) -> bool:
 
 
 def help_answer(args: Dict[str, Any]) -> Dict[str, Any]:
-    """View ``help`` (:func:`.help.answer`): the views, or one of them (``topic``). Raises :class:`ArgumentError`
-    for a topic that is no view, or an argument help does not take."""
-    extra = sorted(key for key, value in args.items() if key not in ("view", "topic") and value not in (None, "", {}))
+    """View ``help`` (:func:`.help.answer`): the views, or one of them (``topic``). ``limit`` and ``offset``, which
+    a model may fill in with their defaults, and an empty scope or filter are ignored: help has no rows to page.
+    Raises :class:`ArgumentError` for a topic that is no view, or an argument that would say help reports on
+    something (a scope or filter that names anything, a sort, a term, a window)."""
+    extra = sorted(
+        key
+        for key, value in args.items()
+        if key not in ("view", "topic", *HELP_IGNORES) and value not in (None, "", {}, [])
+    )
     if extra:
         raise ArgumentError(f"view help takes topic (a view's name) alone, not {', '.join(extra)}")
     return help.answer(VIEWS, args.get("topic"))

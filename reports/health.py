@@ -12,9 +12,10 @@ unit is the class's (:data:`.units.SENSOR_UNITS`). A counter sensor (``rrd_type`
 rate over the last poll, as LibreNMS shows it.
 
 For the rows of the page, a sensor on a port is named with it: measured on the port's ifIndex, or on the inventory
-entity of one of its transceivers (:func:`.context.measured_on`; the device's transceivers are read only when the
-ifIndex names no port), or for a dBm sensor, a description that starts with the port's name. A dBm sensor also
-carries its ``direction`` (``rx``, ``tx``) as its description says it.
+entity of one of its transceivers (:func:`.context.measured_on`), or for a dBm sensor, a description that starts with
+the port's name. The device's transceivers are read when the ifIndex names no port, and for a temperature, bias or
+voltage sensor on an inventory entity (:data:`OPTIC_CLASSES`), whose device's port names are read only when that
+entity is a transceiver's. A dBm sensor also carries its ``direction`` (``rx``, ``tx``) as its description says it.
 
 When LibreNMS's answer is too large to read (past 16 MiB: tens of thousands of sensors), the sensors are read one
 device at a time instead (``devices/{id}/health``, the classes; ``.../device_<class>``, the ids; then
@@ -39,6 +40,7 @@ from ..client import LibreNMSError, is_digits
 from ..listing import natural_key
 from . import units
 from .context import (
+    PORT_MAP_READS,
     ReportContext,
     Request,
     View,
@@ -64,6 +66,9 @@ DEVICE_READS = 5  # devices whose processors, memory pools or storage a report r
 ITEM_READS = 8  # processors, memory pools or storage volumes of one device a report reads
 IDS_SHOWN = 10  # device ids a partial reason names
 TEXT_KEYS = ("hostname", "display", "descr", "port")
+# An optic's diagnostics besides its power (dbm): its temperature, laser bias current and supply voltage, which some
+# devices put on the transceiver's inventory entity rather than on the port's ifIndex.
+OPTIC_CLASSES = frozenset({"temperature", "current", "voltage"})
 # Per device kind: its id, description, percentage and warning-limit keys, and the used and total bytes it has.
 _KINDS: Dict[str, Tuple[str, str, str, str, str | None, str | None]] = {
     "processor": ("processor_id", "processor_descr", "processor_usage", "processor_perc_warn", None, None),
@@ -101,7 +106,7 @@ class _Reading:
 
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The readings in scope that pass the filter, in the order asked for, a page of them with their ports named."""
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     devices = ctx.devices()
     ids = scope.ids if scope.ids is not None else set(devices)
     classes = req.filters.get("class")
@@ -316,19 +321,50 @@ def _folded(row: Dict[str, Any]) -> str:
 
 # -- ports -----------------------------------------------------------------------------------------------------------
 def _on_a_port(sensor: Dict[str, Any] | None) -> bool:
-    """Whether a sensor may be on a port: LibreNMS measured it on one, or it is an optic's dBm sensor."""
+    """Whether a sensor may be on a port by what it says itself: LibreNMS measured it on one, or it is an optic's dBm
+    sensor."""
     if sensor is None:
         return False
     return sensor.get("entPhysicalIndex_measured") == "ports" or sensor.get("sensor_class") == "dbm"
 
 
+def _on_an_entity(sensor: Dict[str, Any] | None) -> bool:
+    """Whether a sensor may be one of an optic's diagnostics (:data:`OPTIC_CLASSES`) on its transceiver's inventory
+    entity, which only the device's transceivers tell."""
+    if sensor is None:
+        return False
+    return sensor.get("sensor_class") in OPTIC_CLASSES and sensor.get("entPhysicalIndex") not in (None, "")
+
+
 def _name_ports(ctx: ReportContext, page: List[_Reading]) -> None:
     """Name the port of each sensor of *page* that is on one, from its device's port names (at most 10 devices) and,
-    where its ifIndex names no port, the device's transceivers; a read that fails leaves them unnamed, partial."""
+    where its ifIndex names no port, the device's transceivers; a read that fails leaves them unnamed, partial. A
+    temperature, bias or voltage sensor on an inventory entity is on a port when that entity is one of the port's
+    transceivers': for those the transceivers are read first (at most 10 devices), and the ports only of a device
+    where one is."""
     by_device: Dict[Any, List[_Reading]] = {}
+    maybe: Dict[Any, List[_Reading]] = {}
     for item in page:
-        if _on_a_port(item.sensor) and item.row["device_id"] is not None:
+        if item.row["device_id"] is None:
+            continue
+        if _on_a_port(item.sensor):
             by_device.setdefault(item.row["device_id"], []).append(item)
+        elif _on_an_entity(item.sensor):
+            maybe.setdefault(item.row["device_id"], []).append(item)
+    entities: Dict[Any, Dict[str, Set[str]]] = {}
+    for number, (device_id, items) in enumerate(maybe.items()):
+        if number >= PORT_MAP_READS:
+            ctx.notes.append(
+                f"the transceivers of {len(maybe) - PORT_MAP_READS} more devices were not read, so their temperature, "
+                f"bias and voltage sensors are not tied to a port (a report reads them for at most {PORT_MAP_READS} "
+                "devices)"
+            )
+            break
+        entities[device_id] = _transceivers(ctx, device_id)
+        held = {entity for found in entities[device_id].values() for entity in found}
+        tied = [item for item in items if str((item.sensor or {}).get("entPhysicalIndex")) in held]
+        if tied:
+            by_device.setdefault(device_id, []).extend(tied)
     if not by_device:
         return
     ports = ctx.ports_by_device(
@@ -337,14 +373,13 @@ def _name_ports(ctx: ReportContext, page: List[_Reading]) -> None:
     for device_id, items in by_device.items():
         if device_id not in ports:
             continue
-        entities: Dict[str, Set[str]] | None = None
         for item in items:
             sensor = item.sensor or {}
             port = _measured(sensor, ports[device_id], {})
             if port is None and sensor.get("entPhysicalIndex") not in (None, ""):
-                if entities is None:
-                    entities = _transceivers(ctx, device_id)
-                port = _measured(sensor, ports[device_id], entities) if entities else None
+                if device_id not in entities:
+                    entities[device_id] = _transceivers(ctx, device_id)
+                port = _measured(sensor, ports[device_id], entities[device_id]) if entities[device_id] else None
             if port is None and sensor.get("sensor_class") == "dbm":
                 port = _named(sensor, ports[device_id])
             if port is not None:

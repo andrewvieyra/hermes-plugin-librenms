@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
-from ..client import LibreNMSError, is_digits
+from ..client import LibreNMSError, is_digits, json_object
 from ..listing import natural_key
 from ..redact import alert_entities
 from . import units
@@ -111,8 +111,9 @@ def _rule_wanted(wanted: str, rule_id: Any, name: Any) -> bool:
 
 def _muted(extra: Any) -> bool:
     """Whether the alert engine sends nothing for a rule muted in the LibreNMS UI: RunAlerts tests ``!
-    empty($rextra['mute'])``, where PHP takes ``"0"`` as empty (as resources.alert_rule reads it)."""
-    value = extra.get("mute") if isinstance(extra, dict) else None
+    empty($rextra['mute'])``, where PHP takes ``"0"`` as empty (as resources.alert_rule reads it). *extra* is the
+    rule's as LibreNMS returns it: an object, or the JSON text of one (:func:`client.json_object`)."""
+    value = (json_object(extra) or {}).get("mute")
     return bool(value) and value != "0"
 
 
@@ -141,7 +142,7 @@ class _Alert:
 
 def build_alerts(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The faults on the devices in scope that pass the filter, in the order asked for, a page of them."""
-    scope = ctx.scope(req.scope, ALERTS.scope_keys)
+    scope = ctx.scope(req.scope, ALERTS)
     devices = ctx.devices()
     alerts = []
     for fault in _read_faults(ctx, req.filters):
@@ -376,7 +377,7 @@ class _Tally:
 def build_history(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The alert log of the devices in scope over the window, counted per rule, per device, or as events."""
     by = next(iter(req.filters.get("by", {"rule"})))
-    scope = ctx.scope(req.scope, HISTORY.scope_keys)
+    scope = ctx.scope(req.scope, HISTORY)
     rules = _rules(ctx)
     # placed after the first reads, so it is counted back from LibreNMS's clock
     since = ctx.since(req.window or HISTORY.window or "24h")
@@ -385,8 +386,10 @@ def build_history(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     entries = [_entry(devices, row) for row in raw]
     if scope.ids is not None:
         entries = [entry for entry in entries if entry.device_id in scope.ids]
-    entries = [entry for entry in entries if _entry_passes(entry, rules, req.filters)]
+    entries = [entry for entry in entries if _rule_passes(entry.rule_id, _rule_of(rules, entry.rule_id), req.filters)]
+    # before filter.state and filter.entity, which would drop the recoveries a flap is found by
     flaps = _flaps(entries)
+    entries = [entry for entry in entries if _entry_passes(entry, req.filters)]
     if by == "event":
         rows = _event_rows(ctx, entries, rules, req)
     elif by == "device":
@@ -473,10 +476,8 @@ def _rule_passes(rule_id: Any, rule: Dict[str, Any] | None, filters: Dict[str, A
     return True
 
 
-def _entry_passes(entry: _Entry, rules: Dict[int, Dict[str, Any]] | None, filters: Dict[str, Any]) -> bool:
-    """Whether an entry counts: the filters on its rule, its state, what alerted."""
-    if not _rule_passes(entry.rule_id, _rule_of(rules, entry.rule_id), filters):
-        return False
+def _entry_passes(entry: _Entry, filters: Dict[str, Any]) -> bool:
+    """Whether an entry of a rule the filters keep counts: its state, what alerted."""
     if "state" in filters and entry.state not in filters["state"]:
         return False
     return "entity" not in filters or filters["entity"].casefold() in str(entry.entity or "").casefold()

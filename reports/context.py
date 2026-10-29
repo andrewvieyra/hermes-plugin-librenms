@@ -693,12 +693,13 @@ class ReportContext:
         """The ports of each of *device_ids*, in that order, by name (:data:`PORT_NAME_COLUMNS`, never every column),
         for at most :data:`PORT_MAP_READS` devices, each read once per report. A read that fails or is past the
         budget leaves that device out and the answer partial, *what* naming what was not read (``{}``: the device's
-        id); a note counts the devices past the cap in *rest*'s words (``{}``: how many), then *advice*."""
+        id); so do the devices past the cap, which the partial reason counts in *rest*'s words (``{}``: how many),
+        then *advice*."""
         ids = list(dict.fromkeys(device_ids))
         out: Dict[Any, List[Dict[str, Any]]] = {}
         for number, device_id in enumerate(ids):
             if number >= PORT_MAP_READS:
-                self.notes.append(
+                self.partial(
                     f"{rest.format(len(ids) - PORT_MAP_READS)} (a report reads the ports of at most {PORT_MAP_READS} "
                     "devices for it)" + (f": {advice}" if advice else "")
                 )
@@ -736,21 +737,25 @@ class ReportContext:
         return row
 
     # -- scope ------------------------------------------------------------------------------------------------------
-    def scope(self, raw: Any, accepted: Tuple[str, ...]) -> Scope:
+    def scope(self, raw: Any, view: View) -> Scope:
         """*raw* (the ``scope`` argument) as the device ids it names. ``device`` and ``devices`` add devices; ``group``,
         ``location``, ``os`` and ``type`` narrow to theirs (all given must hold); ``port_group`` names the ports the
-        view keeps (:attr:`Scope.port_ids`). Raises :class:`ArgumentError` for a key the view does not take,
-        :class:`Ambiguous` for a device or group that could be several, and :class:`ReportError` for one that is
-        none."""
+        view keeps (:attr:`Scope.port_ids`). Raises :class:`ArgumentError` for a key *view* does not take (naming
+        those it does and where they are explained), :class:`Ambiguous` for a device or group that could be several,
+        and :class:`ReportError` for one that is none."""
         devices = self.devices()
         if raw is None or raw == {}:
             return Scope(None, {"fleet": True, "device_count": len(devices)})
         if not isinstance(raw, dict):
             raise ArgumentError('scope must be an object, e.g. {"device": "core-sw1"} or {"location": "SFO"}')
+        accepted = view.scope_keys
         unknown = [_shown(key) for key in raw if key not in accepted]
         if unknown:
-            takes = f"takes scope keys {', '.join(accepted)}" if accepted else "takes no scope"
-            raise ArgumentError(f"this view {takes}, not {', '.join(unknown)}")
+            if accepted:
+                takes, hint = f"takes scope keys {', '.join(accepted)}", help_hint(view)
+            else:
+                takes, hint = "takes no scope", f'view help with topic "{view.name}" says what it takes'
+            raise ArgumentError(f"view {view.name} {takes}, not {', '.join(unknown)}; {hint}")
         chosen: Set[int] | None = None
         summary: Dict[str, Any] = {}
         resolved: List[Dict[str, Any]] = []
@@ -920,11 +925,14 @@ class ReportContext:
         extra: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """A view's answer: *rows* (the page from *offset* on) of *count* rows in all, the *summary*, and the rest of
-        the envelope. *text_keys* are the row keys that hold text from LibreNMS, which ``untrusted_fields`` names with
-        those of the scope; strings are clipped to :data:`LABEL_CHARS` as escaped."""
+        the envelope. *text_keys* are the keys of the rows and the summary that hold text from LibreNMS, which
+        ``untrusted_fields`` names with those of the scope whenever the answer holds any: rows, a scope that names
+        something, or a summary that names rules, devices or sensors (also when the page has no row: past the last,
+        or every row filtered out); strings are clipped to :data:`LABEL_CHARS` as escaped."""
         out: Dict[str, Any] = {"success": True, "view": view, **(extra or {})}
         scoped = _scope_text(scope.summary)
-        if rows or scoped:
+        text_keys = tuple(text_keys)
+        if rows or scoped or _holds_text(summary, frozenset(text_keys)):
             out.update(untrusted(*dict.fromkeys([*text_keys, *scoped])))
         out["scope"] = for_model(scope.summary, LABEL_CHARS)
         out.update(self._stamp())
@@ -986,6 +994,17 @@ def _scope_text(summary: Dict[str, Any]) -> List[str]:
     if (summary.get("location") or {}).get("locations"):
         keys.append("locations")
     return keys
+
+
+def _holds_text(value: Any, keys: frozenset) -> bool:
+    """Whether *value* (a summary) holds, at any depth, a value under one of *keys* (text from LibreNMS)."""
+    if isinstance(value, dict):
+        return any(
+            (key in keys and value[key] not in (None, "", [], {})) or _holds_text(value[key], keys) for key in value
+        )
+    if isinstance(value, list):
+        return any(_holds_text(item, keys) for item in value)
+    return False
 
 
 def group_candidate(group: Dict[str, Any], found: fuzzy.Match) -> Dict[str, Any]:

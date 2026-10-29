@@ -63,8 +63,9 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   counted against a budget of 30 requests. LibreNMS's 404 for an empty list is no rows; any other
   failure of a read the report cannot do without fails it, and a failed read it can do without
   (one device's outages, a listing `find` ranks) is left out and makes the answer `partial`, with
-  the reason. The devices, locations and group listings are read once per report; nothing is kept
-  between calls.
+  the reason; so does a cap that leaves the rows of some devices without the port names a view
+  gives them (`ReportContext.ports_by_device` reads those of 10 devices at most). The devices,
+  locations and group listings are read once per report; nothing is kept between calls.
 - **Scope.** `scope` becomes a set of device ids from one `devices` listing: `device`/`devices`
   add devices, `group` (`devicegroups/{id}`, never `full=1`), `location` (an id, a name, or every
   location whose name holds the text), `os` and `type` narrow; `port_group` (`port_groups/{id}`,
@@ -73,12 +74,13 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   device matches exactly (sysName, display name, first label, IP) or only one matches every word of
   the phrase; otherwise the answer is `ambiguous: true` with the candidates and no report, so a
   phrase never quietly widens or picks a scope.
-- **Envelope.** `success`, `view`, the untrusted marker (the row and scope keys that hold text from
-  LibreNMS), `scope`, `data_as_of` (LibreNMS's `Date`, else the plugin's clock), `timezone`,
-  `count`, `returned`, `offset`, `truncated`/`next_offset`, `partial`/`partial_reason`, `summary`,
-  `rows`, `notes`. Strings from LibreNMS are clipped to 200 characters (counted as escaped). The
-  handler then fits the result to `max_result_chars` as it fits a query's, cutting rows and saying
-  where to read on.
+- **Envelope.** `success`, `view`, the untrusted marker (the row, summary and scope keys that hold
+  text from LibreNMS, whenever the answer holds any: also a page with no row whose summary names
+  rules, devices or sensors), `scope`, `data_as_of` (LibreNMS's `Date`, else the plugin's clock),
+  `timezone`, `count`, `returned`, `offset`, `truncated`/`next_offset`, `partial`/`partial_reason`,
+  `summary`, `rows`, `notes`. Strings from LibreNMS are clipped to 200 characters (counted as
+  escaped). The handler then fits the result to `max_result_chars` as it fits a query's, cutting
+  rows and saying where to read on.
 - **Time.** Device times are ISO-8601 UTC and outages and port polls unix seconds, so ages are
   exact and are counted to LibreNMS's own clock. A port's last change is sysUpTime in hundredths
   of a second, so its age is the device's uptime less that, plus the time since the poll: unknown
@@ -143,15 +145,20 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   within the budget, partial otherwise. Processors, memory pools and storage (the same routes, one
   request each) are read for at most 5 devices, 8 of a kind each. For the page, a sensor is tied to
   a port as the `port` view ties an optic (measured on the port's ifIndex, or on one of its
-  transceivers' entities) or, for a dBm sensor, by the port name its description starts with.
+  transceivers' entities) or, for a dBm sensor, by the port name its description starts with. A
+  temperature, bias or voltage sensor on an inventory entity may be an optic's: its device's
+  transceivers are read first (10 devices at most), and its port names only when the entity is a
+  transceiver's.
   `routing` reads `bgp`, `ospf` and `ospfv3` once each (by device id for one device, `remote_asn`
   for a remote AS) and keeps the scope's; `not_established` is LibreNMS's `BgpPeer::inAlarm` (admin
   `start`/`running` and not established) and an OSPF neighbour not `full`; a BGP session's up or
   down time is its established timer at the last poll plus the time since; an OSPF router id is
   written dotted (LibreNMS stores an OSPFv3 neighbour's as its 32-bit number). LibreNMS's `ospfv3`
   route answers HTTP 500 `Error retrieving ospfv3_nbrs` for no neighbour, read as none (as is the
-  404 of a LibreNMS without the route, with a note); any other failure of a protocol leaves it out,
-  partial, unless it is the one asked for. `events` reads the eventlog, the syslog or the authlog
+  404 of a LibreNMS without the route, with a note, also when it is the one protocol asked for); any
+  other failure of a protocol leaves it out, partial, unless it is the one asked for. `enabled` is
+  BGP's admin status `start`/`running` (true) or `stop`/`halted` (false); a session with another
+  status passes neither filter value. `events` reads the eventlog, the syslog or the authlog
   through the same log reader as `alert_history` (`ReportContext.read_log`: from the window's
   start, newest first, 250 entries a request, at most 2,000, per device for a scope of up to 10;
   the authlog, LibreNMS's own logins, has no device path and takes no scope), and shows each
@@ -170,7 +177,9 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   sorts, row keys and examples are view `help`'s (`reports/help`), answered in the handler before a
   client is made. A filter's line says what it takes from the view's own definition, and a test
   holds every view's filters and sorts to a line each in `help` and runs every example. A scope,
-  filter or sort key a view does not take is refused, naming those it does and pointing to `help`.
+  filter or sort key a view does not take is refused, naming the view and those it does and
+  pointing to `help`. Help itself ignores `limit`, `offset` and an empty scope or filter, which a
+  model may send as their defaults, and refuses any argument that would narrow or order a report.
 
 ## The plan document
 
@@ -649,7 +658,7 @@ for the re-read to settle, not a second request.
   `redact.clip` and `redact.cut` count a character as long as its escape, so every limit on text
   from LibreNMS (`for_model`'s, an alert entity's, a linked eventlog row's, the text of an error)
   bounds what the model reads, though the text stays raw where it is kept. A report reuses all of
-  this: its `untrusted_fields` names the label keys of its rows and scope.
+  this: its `untrusted_fields` names the label keys of its rows, summary and scope.
 - A result for the model stays within `max_result_chars` (default 60,000 characters). Hermes saves
   a larger one to a file and shows the model a 1,500-character preview of it (past 100,000
   characters, or 15% of the context window on a smaller model), and `register_tool` offers a plugin

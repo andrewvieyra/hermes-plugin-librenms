@@ -77,7 +77,7 @@ def _whole(value: Any) -> int | None:
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The bills on the devices in scope that pass the filter, for the period asked for, in the order asked for."""
     period = next(iter(req.filters.get("period", {"current"})))
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     devices = ctx.devices()
     raw = ctx.get("bills", params={"period": "previous"} if period == "previous" else None)
     bills = [_bill(ctx, devices, row, period) for row in rows_of(raw)]

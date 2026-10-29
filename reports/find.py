@@ -43,7 +43,7 @@ Found = Tuple[fuzzy.Match, Tuple[Any, ...], Dict[str, Any]]
 
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The candidates for ``term`` of the kinds ``filter.kind`` names (all by default), best first."""
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     term = fuzzy.Term.parse(req.term or "")
     kinds = req.filters.get("kind") or frozenset(KINDS)
     found: List[Found] = []

@@ -175,8 +175,15 @@ class Arguments(ReportCase):
             ({"view": "locate"}, "view locate needs a term: an IPv4 or MAC address"),
             ({"view": "devices", "term": "core"}, "term is for views find and locate; view devices is narrowed"),
             ({"view": "devices", "scope": "core-sw1"}, "scope must be an object"),
-            ({"view": "devices", "scope": {"port_group": "uplinks"}}, "takes scope keys device, devices, group"),
-            ({"view": "find", "term": "core", "scope": {"device": 1}}, "this view takes no scope"),
+            (
+                {"view": "devices", "scope": {"port_group": "uplinks"}},
+                "view devices takes scope keys device, devices, group, location, os, type, not 'port_group'; view "
+                'help with topic "devices" says what each does',
+            ),
+            (
+                {"view": "find", "term": "core", "scope": {"device": 1}},
+                "view find takes no scope, not 'device'; view help with topic \"find\" says what it takes",
+            ),
             ({"view": "devices", "filter": {"util_above_pct": 80}}, "takes filter keys status, rebooted_within"),
             ({"view": "devices", "filter": {"status": "broken"}}, "filter.status takes disabled, ignored, down, up"),
             ({"view": "devices", "filter": {"rebooted_within": "yesterday"}}, "a duration such as 30m, 24h or 7d"),

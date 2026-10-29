@@ -465,6 +465,17 @@ def is_digits(value: Any) -> bool:
     return isinstance(value, str) and value.isascii() and value.isdigit()
 
 
+def json_object(value: Any) -> Dict[str, Any] | None:
+    """A JSON object column as LibreNMS may return it (decoded, or still a JSON string, as an alert rule's ``extra``
+    and ``builder``), else None."""
+    if isinstance(value, str):
+        try:
+            value = jsonlib.loads(value)
+        except ValueError:
+            return None
+    return dict(value) if isinstance(value, dict) else None
+
+
 def path(*segments: Any) -> str:
     """``devices/sw%201/ports`` from ``("devices", "sw 1", "ports")``, each segment through :func:`seg`."""
     return "/".join(seg(segment) for segment in segments)

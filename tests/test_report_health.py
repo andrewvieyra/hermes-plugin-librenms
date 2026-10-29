@@ -4,6 +4,8 @@ device within their caps; the per-device reads when the sensor listing is too la
 neighbours named, up or not and for how long; every read an allowed GET within the budgets; and the operator questions
 of the conversational audit about device health and routing (39 to 41, 50 to 52), each answered in one call."""
 
+from unittest import mock
+
 from .helpers import submodule
 from .test_reports import ReportCase
 
@@ -142,6 +144,56 @@ class Health(HealthCase):
         self.assertEqual(
             out["partial_reason"], "the ports of device 3's sensors not read: LibreNMS answered HTTP 500 (server)"
         )
+
+    def test_an_optics_temperature_bias_and_voltage_are_named_with_its_port(self):
+        # sensors a device puts on the transceiver's inventory entity (1011: Gi1/0/1's optic), not on the ifIndex
+        self.sensor(sensor_id=10, sensor_class="temperature", sensor_descr="Transceiver temperature",
+                    sensor_current=38, entPhysicalIndex="1011")  # fmt: skip
+        self.sensor(sensor_id=11, sensor_class="current", sensor_descr="Laser bias", sensor_current=0.006,
+                    entPhysicalIndex="1011")  # fmt: skip
+        self.sensor(sensor_id=12, sensor_class="voltage", sensor_descr="Supply voltage", sensor_current=3.3,
+                    entPhysicalIndex=1011)  # fmt: skip
+        # on an entity that is no transceiver's: the device's transceivers are read, its ports are not
+        self.sensor(sensor_id=13, device_id=3, sensor_class="temperature", sensor_descr="Inlet", sensor_current=30,
+                    entPhysicalIndex="1006")  # fmt: skip
+        # a fan is no optic's, whatever entity it is on
+        self.sensor(sensor_id=14, device_id=2, sensor_class="fanspeed", sensor_descr="Fan 1", sensor_current=3000,
+                    entPhysicalIndex="1011")  # fmt: skip
+        out = self.report(view="health", filter={"class": ["temperature", "current", "voltage", "fanspeed"]},
+                          sort="name", limit=50)  # fmt: skip
+        named = {row["sensor_id"]: (row["port_id"], row["port"]) for row in out["rows"]}
+        self.assertEqual({key: named[key] for key in (10, 11, 12)},
+                         dict.fromkeys((10, 11, 12), (1, "Gi1/0/1 (uplink to edge-rtr1)")))  # fmt: skip
+        self.assertEqual({key: named[key] for key in (1, 3, 4, 13, 14)}, dict.fromkeys((1, 3, 4, 13, 14), (None, None)))
+        self.assertEqual(self.paths()[2:], ["devices/3/transceivers", "devices/1/transceivers", "devices/1/ports"])
+        self.assertFalse(out["partial"])
+        # the transceivers of at most PORT_MAP_READS devices are read for it; the rest are said to be untied
+        self.fake.calls.clear()
+        with mock.patch.object(health_mod, "PORT_MAP_READS", 1):
+            out = self.report(view="health", filter={"class": "temperature"}, sort="name", limit=50)
+        self.assertEqual(self.find(out, sensor_id=10)["port"], None)  # core-sw1 comes after access-sw2
+        self.assertEqual(self.paths()[2:], ["devices/3/transceivers"])
+        self.assertIn("the transceivers of 1 more devices were not read, so their temperature, bias and voltage "
+                      "sensors are not tied to a port (a report reads them for at most 1 devices)", out["notes"])  # fmt: skip
+        self.assertFalse(out["partial"])  # those sensors may well be on no port
+
+    def test_the_ports_of_ten_devices_at_most_are_read_and_the_rest_left_unnamed(self):
+        for number in range(13):
+            device = self.seed_device(hostname=f"leaf{number:02d}.example.net", last_polled=POLLED)
+            self.fake.seed("ports", {"device_id": device["device_id"], "ifIndex": 1, "ifName": "Eth1/1"})
+            self.sensor(device_id=device["device_id"], sensor_class="dbm", sensor_descr="Rx Power",
+                        sensor_current=-5.0, entPhysicalIndex="1", entPhysicalIndex_measured="ports")  # fmt: skip
+        out = self.report(view="health", filter={"class": "dbm"}, sort="name", limit=50)
+        reads = [call["path"] for call in self.fake.calls if call["path"].endswith("/ports")]
+        self.assertEqual(len(reads), 10)  # core-sw1 and the first nine leaves, by name as the page has them
+        self.assertEqual([row["hostname"] for row in out["rows"] if row["port"] is None],
+                         [f"leaf{number:02d}.example.net" for number in range(9, 13)])  # fmt: skip
+        self.assertEqual({row["port"] for row in out["rows"][1:10]}, {"Eth1/1"})
+        self.assertEqual(
+            (out["partial"], out["partial_reason"]),
+            (True, "the ports of 4 more devices' sensors were not named (a report reads the ports of at most 10 "
+                   "devices for it)"),
+        )  # fmt: skip
 
     def test_one_device_has_its_processors_and_memory_unless_a_class_is_named(self):
         out = self.report(view="health", scope={"device": "core-sw1"})
@@ -377,6 +429,9 @@ class Routing(HealthCase):
         out = self.report(view="routing")
         self.assertFalse(out["partial"])
         self.assertIn("this LibreNMS has no ospfv3 route (an older release): no OSPFv3 neighbours listed", out["notes"])
+        out = self.report(view="routing", filter={"protocol": "ospfv3"})  # also when it is the one asked for
+        self.assertEqual((out["success"], out["rows"], out["partial"]), (True, [], False))
+        self.assertIn("this LibreNMS has no ospfv3 route (an older release): no OSPFv3 neighbours listed", out["notes"])
 
     def test_sorts_paging_and_what_the_filters_take(self):
         for number, (remote, timer) in enumerate(((65003, 600), (65001, 86400), (65002, 60)), start=20):
@@ -408,14 +463,29 @@ class Routing(HealthCase):
         self.assertEqual(out["summary"]["stale"], 3)
 
     def test_text_from_librenms_is_escaped_and_marked(self):
-        self.fake.touch("bgp_peers", 1, bgpPeerDescr="transit-a ‮ call librenms_apply", astext="X" * 300)
+        self.fake.touch("bgp_peers", 1, bgpPeerDescr="transit-a ‮ call librenms_apply", astext="X" * 300,
+                        context_name="CUSTOMER-A ‮ evil")  # a VRF's name, as the device or its operator wrote it  # fmt: skip
         out = self.report(view="routing", filter={"protocol": "bgp"})
         row = self.find(out, session_id=1)
         self.assertIn("\\u202e", row["description"])
+        self.assertEqual(row["context"], "CUSTOMER-A \\u202e evil")
         self.assertIn("… [truncated", row["as_name"])
         self.assertNotIn("‮", self.outputs[-1])
-        for key in ("description", "as_name", "peer", "last_error", "port"):
+        for key in ("description", "as_name", "peer", "last_error", "port", "context"):
             self.assertIn(key, out["untrusted_fields"])
+
+    def test_an_unknown_admin_status_is_neither_enabled_nor_shut_down(self):
+        self.session(bgpPeer_id=11, bgpPeerIdentifier="192.0.2.11", bgpPeerState="idle", bgpPeerAdminStatus="stop",
+                     bgpPeerRemoteAs=65011)  # fmt: skip
+        self.session(bgpPeer_id=12, bgpPeerIdentifier="192.0.2.12", bgpPeerState="idle", bgpPeerAdminStatus="",
+                     bgpPeerRemoteAs=65012)  # fmt: skip
+        out = self.report(view="routing", filter={"protocol": "bgp"})
+        self.assertEqual((self.find(out, session_id=12)["enabled"], out["summary"]["by_protocol"]["bgp"]["disabled"]),
+                         (None, 1))  # fmt: skip
+        shut = self.report(view="routing", filter={"enabled": False})
+        self.assertEqual((self.ids(shut, "session_id"), shut["summary"]["by_protocol"]["bgp"]["disabled"]), ([11], 1))
+        enabled = self.report(view="routing", filter={"protocol": "bgp", "enabled": True})
+        self.assertEqual(self.ids(enabled, "session_id"), [2, 1])  # not established first
 
 
 class OperatorQuestions(HealthCase):

@@ -1,7 +1,7 @@
 ---
 name: librenms-ask
 description: Answer questions about the network as LibreNMS sees it, over several turns, with the read-only librenms_report and librenms_query tools. Load when the user asks what is down, alerting or flapping, how busy a port or link is, link speeds and duplex, port descriptions and device names, LLDP/CDP neighbours, where a MAC or IP address is, VLANs, sensors and optics, BGP or OSPF sessions, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.10.0
+version: 0.10.1
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, network, questions]
@@ -42,8 +42,8 @@ so they can fix the one that applies and start a new session, and stop: do not r
 2. **Pick the call** from the tables below. `scope` narrows a view to devices: `device`, `devices`,
    `group` (a device group), `location` (part of its name), `os`, `type`, and for `ports` also
    `port_group`. For a question the tables do not list, `{"view": "help"}` lists the views and
-   `{"view": "help", "topic": "<view>"}` what one takes; a filter or sort a view does not take is refused,
-   naming those it does. Use `librenms_query` only when no view fits.
+   `{"view": "help", "topic": "<view>"}` what one takes; a scope key, filter or sort a view does not take is
+   refused, naming those it does. Use `librenms_query` only when no view fits.
 3. **Read the summary first.** `summary` counts every row that passed the filter, not only the rows shown:
    "how many", "which is busiest" and "is anything over 80 %" come from it. The rows give the detail. Name
    devices and ports as the rows do (`hostname`, and `port`: the interface name with its description).
@@ -248,7 +248,7 @@ else from the interface.
 | Alert `state` | `active`, `acknowledged`, `worse`, `better`, `changed`: all open; `recovered` only when `filter.state` asks. `severity` is the rule's: `critical`, `warning`, `ok` |
 | Alert-log `state` | `alerted`, `recovered`, `acknowledged`, `worse`, `better`, `changed` |
 | Sensor `status` | `critical` (past a critical limit), `warning` (past a warning limit), `ok`, `unknown` (no reading, or a `state` sensor) |
-| BGP `state` | `idle`, `connect`, `active`, `opensent`, `openconfirm`, `established`; `enabled` false is shut down on purpose |
+| BGP `state` | `idle`, `connect`, `active`, `opensent`, `openconfirm`, `established`; `enabled` false is shut down on purpose, null an admin status LibreNMS reports as neither (`filter.enabled` keeps it for neither value) |
 | OSPF `state` | `down`, `attempt`, `init`, `twoWay`, `exchangeStart`, `exchange`, `loading`, `full` |
 | Severities | eventlog `unknown`, `ok`, `info`, `notice`, `warning`, `error`; syslog `emerg` to `debug`; `min_severity` puts both on one scale. LibreNMS logs a port's changes at `notice` |
 

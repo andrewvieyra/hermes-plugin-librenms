@@ -246,7 +246,7 @@ TOPICS: Dict[str, Dict[str, Any]] = {
             "by": "Rows per rule (default), device, or event.",
             "rule": "A rule: its id, or part of its name.",
             "severity": "Of rules of this severity.",
-            "state": "Count only entries in these states.",
+            "state": "Count only entries in these states; a flap still counts when its recovery is filtered out.",
             "entity": "What alerted holds this (a port's name, a sensor's description).",
             "disabled": "Rules that are disabled (true) or enabled.",
             "notifies": "Rules that send notifications (true) or none (no alert operation, or muted).",
@@ -323,7 +323,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
             "protocol": "Only these protocols.",
             "not_established": "What LibreNMS alarms on (true): enabled BGP sessions not established, OSPF "
             "neighbours not full; or the rest.",
-            "enabled": "BGP sessions administratively enabled (true) or shut down; OSPF neighbours count as enabled.",
+            "enabled": "BGP sessions administratively enabled (true) or shut down (false); one whose admin status is "
+            "neither (unknown) matches neither. OSPF neighbours count as enabled.",
             "state": "In these states (BGP: idle ... established; OSPF: down ... twoWay ... full).",
             "remote_as": "BGP sessions to this AS: 65001, AS65001 or asdot 1.10.",
             "text": "In the peer's address, router id, AS name or description, or the device's name.",

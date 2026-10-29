@@ -14,12 +14,11 @@ keys every API write drops, and the alert engine reads it live: update and delet
 from __future__ import annotations
 
 import copy
-import json
 import re
 from typing import Any, Dict, List, Tuple
 
 from .. import diff, redact
-from ..client import LibreNMSError, is_digits, path
+from ..client import LibreNMSError, is_digits, json_object, path
 from .base import Field, PartialWrite, Resource, StepError
 
 _FLAGS = ("invert", "recovery", "acknowledgement")  # stored in the rule's ``extra``; absent = the engine's default
@@ -75,16 +74,6 @@ _OPERATORS = frozenset({
 })  # fmt: skip
 _VALUELESS = frozenset({"is_empty", "is_not_empty", "is_null", "is_not_null"})
 _BETWEEN = frozenset({"between", "not_between"})
-
-
-def _object(value: Any) -> Dict[str, Any] | None:
-    """A JSON object column as LibreNMS may return it (decoded, or still a JSON string), else None."""
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return None
-    return dict(value) if isinstance(value, dict) else None
 
 
 def _ids(value: Any, key: str) -> List[int] | None:
@@ -287,10 +276,10 @@ class AlertRule(Resource):
         for key in _REQUIRED:
             if key not in raw:
                 raise refused(key)
-        extra = {} if raw["extra"] in (None, "", "[]", []) else _object(raw["extra"])  # PHP encodes {} as []
+        extra = {} if raw["extra"] in (None, "", "[]", []) else json_object(raw["extra"])  # PHP encodes {} as []
         if extra is None or not isinstance(extra.get("options") or {}, dict):
             raise refused("extra")
-        builder = _object(raw["builder"])
+        builder = json_object(raw["builder"])
         if builder is None:
             raise refused("builder")
         rule = {**raw, "extra": extra, "builder": builder}

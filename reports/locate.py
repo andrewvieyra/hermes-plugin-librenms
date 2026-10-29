@@ -55,7 +55,6 @@ TEXT_KEYS = ("hostname", "display", "port", "context")
 _EDGE_KEYS = (
     "mac", "device_id", "hostname", "port_id", "port", "neighbour", "vlans", "macs_learned", "last_seen_age",
 )  # fmt: skip
-_NO_VIEW_SCOPE: Tuple[str, ...] = ()
 
 
 def address(text: str) -> Tuple[str, str]:
@@ -89,7 +88,7 @@ def readable(digits: str) -> str:
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The switch ports and ARP entries for the address in ``term``, the likely edge port first."""
     kind, value = address(req.term or "")
-    scope = ctx.scope(req.scope, _NO_VIEW_SCOPE)
+    scope = ctx.scope(req.scope, VIEW)
     devices = ctx.devices()
     if kind == "ip":
         arp = rows_of(ctx.get("resources", "ip", "arp", value))

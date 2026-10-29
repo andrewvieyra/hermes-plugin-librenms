@@ -214,7 +214,7 @@ def _misdescribed(row: Dict[str, Any], device: Dict[str, Any] | None, port: Dict
 # -- the view --------------------------------------------------------------------------------------------------------
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The links of the devices in scope that pass the filter, in the order asked for, a page of them."""
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     links = read_links(ctx, scope)
     devices = ctx.devices()
     ports = read_ends(ctx, links)

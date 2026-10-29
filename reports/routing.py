@@ -67,6 +67,7 @@ TEXT_KEYS = (
     "description",
     "last_error",
     "port",
+    "context",
 )
 _LABELS = {"bgp": "BGP sessions", "ospf": "OSPF neighbours", "ospfv3": "OSPFv3 neighbours"}
 _PROTOCOL_ORDER = {protocol: number for number, protocol in enumerate(PROTOCOLS)}
@@ -97,7 +98,7 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     filters = dict(req.filters)
     if "remote_as" in filters:
         filters["remote_as"] = asn(filters["remote_as"])
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     devices = ctx.devices()
     ids = scope.ids if scope.ids is not None else set(devices)
     protocols = [protocol for protocol in PROTOCOLS if protocol in filters.get("protocol", PROTOCOLS)]
@@ -157,12 +158,12 @@ def _read(ctx: ReportContext, protocol: str, params: Dict[str, Any], *, required
         body = exc.body if isinstance(exc.body, dict) else {}
         if protocol == "ospfv3" and exc.status == 500 and body.get("message") == OSPFV3_NONE:
             return []
+        if exc.kind == "route":  # also when it is the only protocol asked for
+            ctx.notes.append(f"this LibreNMS has no {protocol} route (an older release): no {_LABELS[protocol]} listed")
+            return []
         if required:
             raise
-        if exc.kind == "route":
-            ctx.notes.append(f"this LibreNMS has no {protocol} route (an older release): no {_LABELS[protocol]} listed")
-        else:
-            ctx.partial(f"{what} not read: LibreNMS answered {failure(exc)}")
+        ctx.partial(f"{what} not read: LibreNMS answered {failure(exc)}")
     return []
 
 
@@ -292,7 +293,7 @@ def _passes(item: _Session, filters: Dict[str, Any]) -> bool:
             return False
         if key == "not_established" and item.alarm != wanted:
             return False
-        if key == "enabled" and (row.get("enabled", True) is True) != wanted:
+        if key == "enabled" and row.get("enabled", True) is not wanted:  # an unknown admin status matches neither
             return False
         if key == "state" and row["state"] not in wanted:
             return False

@@ -62,7 +62,7 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
             "view port needs scope.port: a port_id, or an interface name or description with scope.device, e.g. "
             '{"device": "core-sw1", "port": "Gi1/0/5"}'
         )
-    named = ctx.scope(raw, VIEW.scope_keys)
+    named = ctx.scope(raw, VIEW)
     device_id = next(iter(named.ids)) if "device" in raw and named.ids else None
     port = _read(ctx, _port_id(ctx, raw["port"], device_id))
     devices = ctx.devices()

@@ -164,7 +164,7 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     by = _one(req.filters, "by", "event")
     _check(log, by, req)
     if log.per_device:
-        scope = ctx.scope(req.scope, VIEW.scope_keys)
+        scope = ctx.scope(req.scope, VIEW)
         devices = ctx.devices()
     else:  # LibreNMS's own logins: no device's, and no device listing to read, so the window is placed by its clock
         scope, devices = Scope(None, {}), {}

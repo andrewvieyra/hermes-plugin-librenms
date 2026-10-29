@@ -323,7 +323,7 @@ def _age_text(seconds: int | None, at_least: bool) -> str | None:
 # -- view ports ------------------------------------------------------------------------------------------------------
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The ports in scope that pass the filter, in the order asked for, a page of them."""
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     every = described(ctx, scope)
     kept = [item for item in every if _passes(item, req.filters)]
     kept.sort(key=_ORDERS[req.sort])
@@ -454,7 +454,7 @@ VIEW = View(
 # -- view capacity ---------------------------------------------------------------------------------------------------
 def build_capacity(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """Per device in scope with an ethernet port: its ethernet ports by state and how many are free."""
-    scope = ctx.scope(req.scope, CAPACITY.scope_keys)
+    scope = ctx.scope(req.scope, CAPACITY)
     idle_days = req.filters.get("idle_days", IDLE_DAYS)
     idle = idle_days * 86400
     per_device: Dict[Any, List[Port]] = {}

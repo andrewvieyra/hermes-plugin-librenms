@@ -52,7 +52,7 @@ def read_vlans(ctx: ReportContext, scope: Scope) -> List[Dict[str, Any]]:
 def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     """The VLANs of the devices in scope that pass the filter, in the order asked for, a page of them, with their
     ports when one VLAN on a few devices is asked for."""
-    scope = ctx.scope(req.scope, VIEW.scope_keys)
+    scope = ctx.scope(req.scope, VIEW)
     devices = ctx.devices()
     every = []
     for raw in read_vlans(ctx, scope):

@@ -377,7 +377,7 @@ class Port(PortCase):
         for scope, message in (
             (None, "view port needs scope.port"),
             ({"device": "core-sw1"}, "view port needs scope.port"),
-            ({"port": "Gi1/0/1", "port_group": "uplinks"}, "this view takes scope keys device, port"),
+            ({"port": "Gi1/0/1", "port_group": "uplinks"}, "view port takes scope keys device, port, not"),
             ({"port": True}, "scope.port takes a name, an id or a few words"),
         ):
             out = self.report(view="port", scope=scope)
@@ -501,7 +501,7 @@ class Capacity(PortCase):
         self.assertEqual(self.hostnames(self.report(view="capacity", sort="free"))[0], "access-sw2.example.net")
         self.assertEqual(self.hostnames(self.report(view="capacity", sort="used_pct"))[0], "core-sw1.example.net")
         out = self.report(view="capacity", scope={"port_group": "uplinks"})
-        self.assertIn("this view takes scope keys device, devices, group, location, os, type", out["error"])
+        self.assertIn("view capacity takes scope keys device, devices, group, location, os, type", out["error"])
         self.assertIn(
             "filter.idle_days takes a number", self.report(view="capacity", filter={"idle_days": "x"})["error"]
         )

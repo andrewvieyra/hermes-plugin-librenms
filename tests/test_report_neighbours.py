@@ -469,7 +469,7 @@ class Locate(NeighbourCase):
             self.assertIn(message, out["error"], term)
         self.assertEqual(self.fake.calls, [])  # refused before anything is read
         out = self.report(view="locate", term="192.0.2.50", scope={"device": 1})
-        self.assertIn("this view takes no scope", out["error"])
+        self.assertIn("view locate takes no scope", out["error"])
 
     def test_a_failed_read_it_can_do_without_is_partial(self):
         self.fake.fail_on("GET", "resources/fdb/.*", 500)
