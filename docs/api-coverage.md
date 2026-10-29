@@ -65,6 +65,9 @@ comma was an HTTP 500) and must hold column names only.
 | `devices` | #60 for each down device on the page (at most 20) |
 | `ports`, `capacity` | #71 for each device of a scope of at most 10 devices, else #105 once (when it is too large to read, #71 per device within the budget; the answer is partial when the budget does not reach every device); for `scope.port_group` (`ports`) #28 and #29 by the group's id, then #99 for each of its ports when it has at most 10. Always a `columns` list of the ports table's own columns: `port_id`, `device_id`, `ifIndex`, `ifName`, `ifDescr`, `ifAlias`, `ifType`, `ifAdminStatus`, `ifOperStatus`, `ifSpeed`, `ifDuplex`, `ifMtu`, `ifLastChange`, `port_descr_speed`, `ifInOctets_rate`, `ifOutOctets_rate`, `ifInErrors_delta`, `ifOutErrors_delta`, `poll_time`, `poll_period`, `ignore`, `disabled` (a column LibreNMS lacks is an HTTP 400, so never `ifHighSpeed`, which the current schema folds into `ifSpeed`) |
 | `port` | #71 (by device id) or #103 to find the port by name; #99 with `with=statistics`; then #64, #102, #132 and #36 (`state=1,2,3,4,5`), each of which may fail and leave the answer partial |
+| `neighbours` | #64 for each device of a scope of at most 10 devices, else #128 once; then the ports of the devices at both ends (every local device, and each monitored neighbour whose port LibreNMS matched) as `ports` reads them: #71 per device up to 10, the local devices first, else #105, and when that is too large to read #71 per device within the request budget, the local devices first (a failed read, or a neighbour the budget leaves out, leaves those links without their figures, partial) |
+| `locate` | a MAC: #104, #122 (its 12 hex digits) and #125 (the MAC with colons); an IPv4 address: #125, then #104 and #122 for each MAC found (at most 3); then #133 (`?hostname=`, at most 5 devices, else once), #64 for the devices that learned it (at most 10, else #128) and #99 for the router interfaces of the ARP entries (at most 5), each of which may fail and leave the answer partial |
+| `vlans` | #63 for each device of a scope of at most 10 devices, else #133 once; with `filter.vlan`, #71 with `with=vlans` for each device that has it, when they are at most 10 |
 
 ## System
 
@@ -185,15 +188,15 @@ on the poller.
 | 60 | `GET devices/{hostname}/outages` | query; report: `devices` (`down_since`, by device id, for at most 20 down devices a page) |
 | 61 | `GET devices/{hostname}/graphs/health/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/health` lists the graphs) |
 | 62 | `GET devices/{hostname}/graphs/wireless/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/wireless` lists the graphs) |
-| 63 | `GET devices/{hostname}/vlans` | query |
-| 64 | `GET devices/{hostname}/links` | query; report: `port` (by device id, the links on the port) |
+| 63 | `GET devices/{hostname}/vlans` | query; report: `vlans` for a scope of at most 10 devices, by device id (its rows carry no `device_id`) |
+| 64 | `GET devices/{hostname}/links` | query; report: `port` (by device id, the links on the port), `neighbours` for a scope of at most 10 devices, `locate` (the devices that learned the MAC, to tell uplinks from edge ports) |
 | 65 | `GET devices/{hostname}/graphs` | query (the list of graphs, not images) |
 | 66 | `GET devices/{hostname}/fdb` | query |
 | 67 | `GET devices/{hostname}/nac` | query |
 | 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (`0` lists every sensor of the class) |
 | 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (MySQL reads `1abc` as 1) |
 | 70 | `GET devices/{hostname}/wireless-sensors` | query |
-| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; always by device id with a `columns` list |
+| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; `neighbours` for the devices at both ends of the links (as `ports` reads them); `vlans` with `with=vlans` for the devices of one VLAN (at most 10); always by device id with a `columns` list |
 | 72 | `GET devices/{hostname}/ip` | query |
 | 73 | `GET devices/{hostname}/port_stack` | query |
 | 74 | `GET devices/{hostname}/transceivers` | query |
@@ -231,12 +234,12 @@ on the poller.
 
 | # | Route | Coverage |
 |---|---|---|
-| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag). `{portid}` must be a positive number here and on #100-#102 and #106 (MySQL reads `1abc` as port 1); report: `port` (`with=statistics`: its ports_statistics row, for discards), `ports` for each port of a port group of at most 10 |
+| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag). `{portid}` must be a positive number here and on #100-#102 and #106 (MySQL reads `1abc` as port 1); report: `port` (`with=statistics`: its ports_statistics row, for discards), `ports` for each port of a port group of at most 10, `locate` for the router interface of an ARP entry (at most 5) |
 | 100 | `GET ports/{portid}/fdb` | query |
 | 101 | `GET ports/{portid}/ip` | query |
 | 102 | `GET ports/{portid}/transceiver` | query; report: `port` |
 | 103 | `GET ports/search/{field}/{search?}` | query; with `{search}`, `{field}` is a column list and is trimmed like `columns`; alone, LibreNMS reads it as the search term over `ifAlias`, `ifDescr` and `ifName`; report: `find` (`ifName,ifDescr` and an interface name, with a `columns` list), `port` (`ifName,ifDescr,ifAlias` and the name or description given without `scope.device`) |
-| 104 | `GET ports/mac/{search}` | query (the MAC in any usual form; ports that learned it, fewest FDB entries first; `filter=first` gives that port alone) |
+| 104 | `GET ports/mac/{search}` | query (the MAC in any usual form; ports that learned it, fewest FDB entries first; `filter=first` gives that port alone); report: `locate` (every port, as the 12 hex digits) |
 | 105 | `GET ports` | query; report: `ports` and `capacity` (one listing with a `columns` list, filtered in the plugin) for the fleet, more than 10 devices, or a port group of more than 10 ports. LibreNMS sends it in no set order and without paging, so the plugin orders and pages it |
 | 106 | `GET ports/{portid}/description` | query; planning reads |
 | 107 | `PATCH ports/{portid}/description` | plan: `port` `update` (`description`; `""` clears it and unpins it, so the poller sets it from the device again; the body always carries the key, since LibreNMS clears the description when the key is missing; rollback restores the text, lossy) |
@@ -260,18 +263,18 @@ on the poller.
 | # | Route | Coverage |
 |---|---|---|
 | 121 | `GET resources/fdb` | query |
-| 122 | `GET resources/fdb/{mac}` | query; LibreNMS compares `{mac}` with the stored 12 hex digits exactly, so a MAC in any usual form is sent as those digits, and anything else is refused (`0` would list the whole table) |
+| 122 | `GET resources/fdb/{mac}` | query; LibreNMS compares `{mac}` with the stored 12 hex digits exactly, so a MAC in any usual form is sent as those digits, and anything else is refused (`0` would list the whole table); report: `locate` (each entry's VLAN and last update) |
 | 123 | `GET resources/fdb/{mac}/detail` | query (parses any form); the MAC as LibreNMS writes it and its vendor (`mac_oui`) are returned under `extra` |
 | 124 | `GET resources/ip/addresses/{address_family?}` | query |
-| 125 | `GET resources/ip/arp/{query}/{cidr?}` | query |
+| 125 | `GET resources/ip/arp/{query}/{cidr?}` | query; report: `locate` (an IPv4 address, or the MAC as `00:11:22:33:44:55`, which LibreNMS's `FILTER_VALIDATE_MAC` takes) |
 | 126 | `GET resources/ip/networks/{address_family?}` | query |
 | 127 | `GET resources/ip/networks/{id}/ip` | query; `{id}` must be a positive number |
-| 128 | `GET resources/links` | query |
+| 128 | `GET resources/links` | query; report: `neighbours` for a scope of more than 10 devices, `locate` when more than 10 devices learned the MAC |
 | 129 | `GET resources/links/{id}` | query |
 | 130 | `GET resources/nac` | query |
 | 131 | `GET resources/nac/{mac}` | query; `{mac}` normalised as #122 |
 | 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device; report: `port` (the dBm sensors on the port, filtered in the plugin) |
-| 133 | `GET resources/vlans` | query (`?hostname=` resolved) |
+| 133 | `GET resources/vlans` | query (`?hostname=` resolved); report: `vlans` for a scope of more than 10 devices, `locate` (`?hostname=` a device id, for each of at most 5 devices that learned the MAC, else once) to number a forwarding entry's VLAN |
 | 134 | `GET resources/locations` | query; planning reads (lookup by name); report: `find`, `scope.location` when no device is at the location named |
 
 ## Inventory, port security

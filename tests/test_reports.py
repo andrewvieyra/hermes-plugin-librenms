@@ -167,9 +167,10 @@ class Foundation(ReportCase):
 class Arguments(ReportCase):
     def test_malformed_arguments_say_what_to_send(self):
         cases = [
-            ({"view": "graphs"}, "view must be one of find, devices, ports, port, capacity"),
-            ({"view": "find"}, "view find needs a term"),
-            ({"view": "devices", "term": "core"}, "term is for view find"),
+            ({"view": "graphs"}, "view must be one of find, devices, ports, port, capacity, neighbours, locate, vlans"),
+            ({"view": "find"}, "view find needs a term: a hostname, sysName, IP, interface or a few words"),
+            ({"view": "locate"}, "view locate needs a term: an IPv4 or MAC address"),
+            ({"view": "devices", "term": "core"}, "term is for views find and locate; view devices is narrowed"),
             ({"view": "devices", "scope": "core-sw1"}, "scope must be an object"),
             ({"view": "devices", "scope": {"port_group": "uplinks"}}, "takes scope keys device, devices, group"),
             ({"view": "find", "term": "core", "scope": {"device": 1}}, "this view takes no scope"),
@@ -418,7 +419,7 @@ class Find(ReportCase):
         [row] = out["rows"]
         self.assertEqual(row["device_id"], 3)
         self.assertIn("its ARP table holds '001122334455'", row["why"])
-        self.assertIn("resources/fdb/<mac>/detail", out["notes"][-1])
+        self.assertIn("view locate finds the switch port it is learned on", out["notes"][-1])
 
     def test_a_lookup_librenms_ignores_is_set_aside(self):
         # an older LibreNMS reads an unknown devices type as no filter and answers with every device, for any query

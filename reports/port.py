@@ -32,7 +32,9 @@ from .context import (
     Request,
     Scope,
     View,
+    abbreviates,
     brief,
+    folded,
     port_candidate,
     rows_of,
     sensor_status,
@@ -106,12 +108,12 @@ def _port_id(ctx: ReportContext, ref: Any, device_id: int | None) -> int:
         return _search(ctx, text)
     ports = rows_of(ctx.get("devices", device_id, "ports", params={"columns": LOOKUP_COLUMNS}))
     device = ctx.devices()[device_id]
-    folded = text.casefold()
+    wanted = text.casefold()
     for found in (
-        [port for port in ports if folded in (_folded(port, "ifName"), _folded(port, "ifDescr"))],
+        [port for port in ports if wanted in (folded(port, "ifName"), folded(port, "ifDescr"))],
         [port for port in ports if is_digits(text) and str(port.get("port_id")) == text],
-        [port for port in ports if _abbreviates(folded, _folded(port, "ifName"), _folded(port, "ifDescr"))],
-        [port for port in ports if _folded(port, "ifAlias") == folded],
+        [port for port in ports if abbreviates(wanted, folded(port, "ifName"), folded(port, "ifDescr"))],
+        [port for port in ports if folded(port, "ifAlias") == wanted],
     ):
         if len(found) == 1:
             return int(found[0]["port_id"])
@@ -143,8 +145,8 @@ def _search(ctx: ReportContext, text: str) -> int:
             "scope.device (its ports are matched by name and description as given) or give the port_id"
         )
     rows = rows_of(ctx.get("ports", "search", _SEARCH_FIELDS, *pieces, params={"columns": LOOKUP_COLUMNS}))
-    folded = text.casefold()
-    exact = [port for port in rows if folded in (_folded(port, key) for key in ("ifName", "ifDescr", "ifAlias"))]
+    wanted = text.casefold()
+    exact = [port for port in rows if wanted in (folded(port, key) for key in ("ifName", "ifDescr", "ifAlias"))]
     if len(exact) == 1:
         return int(exact[0]["port_id"])
     if not rows:
@@ -172,23 +174,6 @@ def _read(ctx: ReportContext, port_id: int) -> Dict[str, Any]:
     if not rows:
         raise ReportError(f"scope.port: no LibreNMS port has id {port_id} (or this token cannot see it)")
     return rows[0]
-
-
-def _folded(port: Dict[str, Any], key: str) -> str:
-    return str(port.get(key) or "").strip().casefold()
-
-
-def _abbreviates(text: str, *names: str) -> bool:
-    """Whether *text* is a short form of one of *names*: the same numbers after a prefix of its letters
-    (``gi1/0/5`` for ``gigabitethernet1/0/5``, ``te1/1/1`` for ``tengigabitethernet1/1/1``)."""
-    letters = text.rstrip("0123456789/.:-")
-    if not letters or not letters.isalpha() or letters == text:
-        return False
-    for name in names:
-        long = name.rstrip("0123456789/.:-")
-        if long.isalpha() and long.startswith(letters) and name[len(long) :] == text[len(letters) :]:
-            return True
-    return False
 
 
 def _scored(term: fuzzy.Term, port: Dict[str, Any], device: Dict[str, Any] | None) -> fuzzy.Match | None:

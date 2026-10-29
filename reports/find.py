@@ -78,8 +78,8 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
         )
     if term.mac is not None and "device" in kinds:
         ctx.notes.append(
-            "a MAC address names no device in LibreNMS: these devices see it in their ARP tables; the switch port it "
-            "is learned on is in librenms_query resources/fdb/<mac>/detail"
+            "a MAC address names no device in LibreNMS: these devices see it in their ARP tables; view locate finds "
+            "the switch port it is learned on"
         )
     by_kind: Dict[str, int] = {}
     for row in rows:

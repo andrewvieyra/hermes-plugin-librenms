@@ -685,6 +685,26 @@ class ReportRoutes(_FakeCase):
             (404, {"status": "error", "message": "VLANs do not exist"}),
         )
 
+    def test_port_vlans(self):
+        ports = self.call("GET", "devices/1/ports", {"columns": "ifName", "with": "vlans"})[1]["ports"]
+        self.assertEqual(list(ports[0]), ["ifName", "port_id", "vlans"])  # port_id added for the relation
+        trunk = next(port for port in ports if port["port_id"] == 2)
+        self.assertEqual([(v["vlan"], v["untagged"]) for v in trunk["vlans"]], [(1, 1), (10, 0), (20, 0)])
+        columns = ["port_vlan_id", "device_id", "port_id", "vlan", "baseport", "priority", "state", "cost", "untagged"]
+        # the port PortVlan's accessor loads for a row that stores 0 is hidden here
+        self.assertEqual([list(vlan) for vlan in trunk["vlans"]], [columns] * 3)
+        self.assertEqual(next(port for port in ports if port["port_id"] == 1)["vlans"], [])
+        # the access side stores 0 for VLAN 1, which PortVlan reads as untagged: it is the port's ifVlan ("1")
+        [port] = self.call("GET", "ports/9", {"with": "vlans"})[1]["port"]
+        self.assertEqual([(v["vlan"], v["untagged"]) for v in port["vlans"]], [(1, 1), (10, 0)])
+        self.assertEqual(self.fake.tables["ports_vlans"][4]["untagged"], 0)
+        # one port's rows that store 0 carry the whole port the accessor loaded, which get_port_info does not hide
+        self.assertEqual([list(vlan) for vlan in port["vlans"]], [[*columns, "port"]] * 2)
+        self.assertEqual((port["vlans"][0]["port"]["port_id"], port["vlans"][0]["port"]["ifVlan"]), (9, "1"))
+        [trunk] = self.call("GET", "ports/2", {"with": "vlans"})[1]["port"]
+        self.assertEqual([(v["vlan"], "port" in v) for v in trunk["vlans"]], [(1, False), (10, True), (20, True)])
+        self.assertNotIn("vlans", self.call("GET", "devices/1/ports", {"columns": "port_id"})[1]["ports"][0])
+
     def test_links(self):
         self.assertEqual(self.call("GET", "devices/3/links")[1]["links"][0]["remote_port"], "Gi1/0/2")
         self.assertEqual(len(self.call("GET", "devices/nope.example.net/links")[1]["links"]), 4)  # no filter

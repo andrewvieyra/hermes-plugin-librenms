@@ -26,8 +26,8 @@ route) is refused, so :func:`facts` derives what the questions need from a port 
 Reads (:func:`read_ports`): ``devices/{id}/ports`` for each device of a scope of at most :data:`DEVICE_READS`
 devices, ``ports/{id}`` for each port of a port group of at most :data:`PORT_READS` ports, else one ``ports``
 listing of every port, filtered here; each with an explicit column list, never every column. A listing too large to
-read falls back to one device at a time within the request budget; the answer is partial only when the budget does
-not reach every device in scope.
+read falls back to one device at a time within the request budget, the scope's devices before any a view joins (the
+far ends of links); the answer is partial only when the budget does not reach every device.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Set, Tuple
 
 from ..client import LibreNMSError, is_digits
 from ..listing import natural_key
@@ -68,6 +68,7 @@ _SUBINTERFACE_RE = re.compile(r"\.\d+$")
 TEXT_KEYS = ("hostname", "display", "port", "description")
 CAPACITY_TEXT = ("hostname", "display", "location")
 IDLE_DAYS = 30
+IDS_SHOWN = 10  # device ids a partial reason names
 
 
 @dataclass
@@ -89,64 +90,91 @@ class Port:
 
 
 # -- reads -----------------------------------------------------------------------------------------------------------
-def read_ports(ctx: ReportContext, scope: Scope) -> List[Dict[str, Any]]:
+def read_ports(
+    ctx: ReportContext, scope: Scope, *, required: bool = True, joined: Set[int] = frozenset()
+) -> List[Dict[str, Any]]:
     """The port rows *scope* covers (never a deleted one), in LibreNMS's order per device: read per device, per port
-    of a port group, or in one listing (see the module's docstring)."""
+    of a port group, or in one listing (see the module's docstring). The ports of a scope of one device are what the
+    report is about, so a failure to read them fails it, unless they are not *required* (a view that reports
+    something else and only joins the ports to it is then partial). *joined* are devices outside the scope whose
+    ports the view joins to its rows too (the far end of a link): read with the scope's, after them whenever the
+    ports are read one device at a time."""
     devices = ctx.devices()
+    ids = None if scope.ids is None else scope.ids | set(joined)
     if scope.port_ids is not None and len(scope.port_ids) <= PORT_READS:
         rows = []
         for port_id in sorted(scope.port_ids):
             rows += rows_of(ctx.optional(f"port {port_id}", "ports", port_id))
-    elif scope.ids is not None and len(scope.ids) <= DEVICE_READS:
-        targets = sorted(scope.ids, key=lambda i: hostname_order(devices[i]))
+    elif scope.ids is not None and ids is not None and len(ids) <= DEVICE_READS:
+        targets = _in_order(devices, scope.ids) + _in_order(devices, ids - scope.ids)
         rows = []
         for device_id in targets:
             segments = ("devices", device_id, "ports")
-            if len(targets) == 1:  # the one read this report is about: a failure fails it
+            if len(targets) == 1 and required:  # the one read this report is about: a failure fails it
                 rows += rows_of(ctx.get(*segments, params={"columns": COLUMNS}))
             else:
                 rows += rows_of(ctx.optional(f"ports of device {device_id}", *segments, params={"columns": COLUMNS}))
     else:
-        rows = _every_port(ctx, scope)
+        rows = _every_port(ctx, scope, required=required, joined=joined)
     rows = [row for row in rows if is_digits(row.get("port_id")) and not truthy(row.get("deleted"))]
-    if scope.ids is not None:
-        rows = [row for row in rows if is_digits(row.get("device_id")) and int(row["device_id"]) in scope.ids]
+    if ids is not None:
+        rows = [row for row in rows if is_digits(row.get("device_id")) and int(row["device_id"]) in ids]
     if scope.port_ids is not None:
         rows = [row for row in rows if int(row["port_id"]) in scope.port_ids]
     return rows
 
 
-def _every_port(ctx: ReportContext, scope: Scope) -> List[Dict[str, Any]]:
-    """One ``ports`` listing. When LibreNMS's answer is too large to read, the ports of the scope's devices one at a
-    time, in hostname order, as far as the request budget goes: the answer is partial when that leaves a device out
-    (a read that fails is partial on its own, :meth:`ReportContext.optional`), and else says how it was read."""
+def _every_port(
+    ctx: ReportContext, scope: Scope, *, required: bool = True, joined: Set[int] = frozenset()
+) -> List[Dict[str, Any]]:
+    """One ``ports`` listing (whose failure fails the report only when the ports are *required*). When LibreNMS's
+    answer is too large to read, the ports of the scope's devices one at a time, in hostname order, then those of
+    the *joined* devices, as far as the request budget goes: the answer is partial when that leaves a device out (a
+    read that fails is partial on its own, :meth:`ReportContext.optional`), and else says how it was read."""
     try:
-        return rows_of(ctx.get("ports", params={"columns": COLUMNS}))
+        if required:
+            return rows_of(ctx.get("ports", params={"columns": COLUMNS}))
+        return rows_of(ctx.optional("ports", "ports", params={"columns": COLUMNS}, raising=("too_large",)))
     except LibreNMSError as exc:
         if exc.kind != "too_large":
             raise
     devices = ctx.devices()
-    targets = sorted(scope.ids if scope.ids is not None else devices, key=lambda i: hostname_order(devices[i]))
+    targets = _in_order(devices, scope.ids if scope.ids is not None else set(devices))
+    others = _in_order(devices, set(joined) - set(targets)) if scope.ids is not None else []
     rows: List[Dict[str, Any]] = []
     tried = read = 0
-    for device_id in targets:
+    for device_id in targets + others:
         if ctx.calls >= ctx.call_budget:
             break
         found = ctx.optional(f"ports of device {device_id}", "devices", device_id, "ports", params={"columns": COLUMNS})
         rows += rows_of(found)
         tried += 1
-        if found is not None:
+        if found is not None and tried <= len(targets):
             read += 1
+    left = others[max(tried - len(targets), 0) :]  # read in order, so those the budget did not reach are the last
     if tried < len(targets):
         ctx.partial(
             f"the listing of every port is too large to read, so the ports of {read} of the {len(targets)} devices "
             "in scope were read one device at a time; narrow the scope (a device, a location, a group) for the rest"
+        )
+    elif left:
+        shown = ", ".join(str(device_id) for device_id in left[:IDS_SHOWN]) + (", ..." if len(left) > IDS_SHOWN else "")
+        ctx.partial(
+            "the listing of every port is too large to read, so the ports were read one device at a time, the "
+            f"scope's first: those of {len(left)} of the {len(others)} devices outside the scope that the rows join "
+            f"(device ids {shown}) were not, so their end of those rows is not known; a report scoped to one of them "
+            "reads them"
         )
     else:
         ctx.notes.append(
             "LibreNMS's listing of every port is too large to read, so the ports were read one device at a time"
         )
     return rows
+
+
+def _in_order(devices: Dict[int, Dict[str, Any]], ids: Set[int]) -> List[int]:
+    """*ids* in hostname order."""
+    return sorted(ids, key=lambda i: hostname_order(devices[i]))
 
 
 # -- what a port row means -------------------------------------------------------------------------------------------
@@ -203,13 +231,21 @@ def speeds(port: Dict[str, Any]) -> Tuple[int | None, int | None, str | None]:
     circuit = units.circuit_speeds(port.get("port_descr_speed"))
     if circuit is not None:
         return circuit[0], circuit[1], "circuit"
+    speed, source = interface_speed(port)
+    return speed, speed, source
+
+
+def interface_speed(port: Dict[str, Any]) -> Tuple[int | None, str | None]:
+    """The bit/s the interface itself runs at, never a circuit speed from its description, and where it came from:
+    ``ifSpeed``, else ``ifHighSpeed`` Mbit/s, which older releases kept beside an ``ifSpeed`` stuck at 4294967295;
+    ``(None, None)`` when neither is known (0)."""
     speed = units.number(port.get("ifSpeed"))
     if speed and speed > 0 and speed != UNKNOWN_SPEED:
-        return int(speed), int(speed), "ifSpeed"
+        return int(speed), "ifSpeed"
     high = units.number(port.get("ifHighSpeed"))  # only an older LibreNMS's full row has it
     if high and high > 0:
-        return int(high * 1e6), int(high * 1e6), "ifHighSpeed"
-    return None, None, None
+        return int(high * 1e6), "ifHighSpeed"
+    return None, None
 
 
 def last_change(port: Dict[str, Any], device: Dict[str, Any], now: datetime) -> Tuple[int | None, bool]:

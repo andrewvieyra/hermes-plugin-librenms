@@ -6,6 +6,83 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-29
+
+### Added
+- View `neighbours` of `librenms_report`: the LLDP/CDP links of the devices in scope, each joined to the port rows
+  at both ends. LibreNMS's `links` rows name the local port by id and the far end as the neighbour advertised it
+  (`remote_hostname`, `remote_port`, `remote_platform`), plus its device and port ids when LibreNMS monitors the
+  neighbour and matched its port (`remote_device_id`, `remote_port_id`; 0 or null otherwise), so a model had to
+  read the links, then both ends' ports, and compare them in its head. Each row now carries the local port (label,
+  description, state, the speed its interface runs at, duplex, MTU), the protocol, what the neighbour advertised,
+  `remote_monitored` and `remote_device`, and, when LibreNMS matched the far port, its label, state, speed, duplex
+  and MTU, with the checks `speed_mismatch` and `duplex_mismatch` (both ends up and different; the interface speed,
+  never a circuit speed from a description, so a `[100M]` customer port on a 1G link is no mismatch),
+  `mtu_mismatch` (with a note when the two differ by 14, 18 or 22 bytes: some systems count the ethernet header)
+  and `description_mismatch` (the local port has a description of its own and it names neither the neighbour, by
+  the first label of its advertised name or of the monitored device's hostname, sysName or display name, nor its
+  port, compared as whole words: `to core_sw1` names `core-sw1`, `to core-sw10` does not). A check that cannot be
+  made is null, never false, and `summary.remote_port_unknown` counts the links whose far end is not known. Filters
+  `mismatch` (`speed`, `duplex`, `mtu`, `description`, or a list: any of them), `remote_unmonitored`, `port` (the
+  local port by name, long or short form, or port_id), `remote` (part of the neighbour's name) and `protocol`;
+  sorts `name` and `remote`. `summary` counts links, devices, protocols, unmonitored neighbours (and names them,
+  each once), each mismatch and the ports without a description. The links of up to 10 devices are read one device
+  at a time (`devices/{id}/links`), more with `resources/links`; then the ports of every local device and of each
+  monitored neighbour whose port LibreNMS matched, as view `ports` reads them, the local devices first whenever
+  they are read one device at a time: when LibreNMS's listing of every port is too large to read, a core switch
+  with 35 neighbours still has its own ports, and the partial reason gives the ids of the neighbours the request
+  budget left out. A failed ports read leaves those links without their figures and the answer partial; the links
+  of the one device asked about fail it.
+- View `locate`: where an IPv4 or MAC address is. A MAC (`00:11:22:33:44:55`, `00-11-...`, `0011.2233.4455` or
+  twelve hex digits) is looked up with `ports/mac/{mac}` (the ports that learned it and how many MACs each
+  learned), `resources/fdb/{mac}` (each entry's VLAN and when LibreNMS last updated it; the MAC sent as the 12 hex
+  digits that exact-match route compares, conv-mac-lookup-false-negative) and `resources/ip/arp/{mac}` (its IPv4
+  addresses and the routers holding them); an IPv4 address through the ARP tables, then each MAC found (at most
+  3; more is partial). Rows: the switch ports (`macs_learned`, `likely_edge`, `neighbour`, `uplink`, `trunk`,
+  `vlans` numbered from `resources/vlans`, `last_seen` and its age), the likely edge port first, then the ARP
+  entries (IP, MAC, router and its interface). `likely_edge` is LibreNMS's own guess, the ports that learned the
+  fewest MACs, but never an uplink: a port whose LLDP/CDP neighbour, a device LibreNMS monitors (`neighbour`),
+  learned the MAC too, so the MAC is behind it and the port learns every MAC behind it. A port to a monitored device
+  that did not learn the MAC (a hypervisor, an access point, a server, a switch whose forwarding table LibreNMS does
+  not read), or to the device at the IP looked up, is where the MAC meets the switches LibreNMS reads, so a VM on a
+  monitored hypervisor or a monitored server is found on the port facing it, and a note says the MAC is that
+  device's own or behind it. When every port is an uplink, none is marked and a note says the forwarding entries
+  disagree (one not aged out, or a MAC that moved) or the device is on an unmanaged switch between them. `summary`
+  names the likely edge ports (with their `neighbour`), the MACs and IPs found and, for an IP, the device LibreNMS
+  monitors at that address. An IPv6 address is an argument error that points to view `find`: the API has no IPv6
+  neighbour table.
+- View `vlans`: each VLAN of each device in scope (tag, name, type), from `devices/{id}/vlans` for up to 10
+  devices, else `resources/vlans`. With `filter.vlan` (a tag, or part of a name) and on at most 10 devices, each row
+  lists the ports in that VLAN from `devices/{id}/ports?with=vlans`, `untagged` (LibreNMS's ports_vlans row says
+  so, or the VLAN is the port's own `ifVlan`, as LibreNMS's PortVlan reads it) or `tagged`, with their state and
+  counts. Sorts `vlan` (by tag, then device) and `name` (by device, then tag, as every view's `name` order; a row's
+  own `name` is its VLAN's); `summary` counts VLANs and devices and names the tags called differently on different
+  devices.
+- The operator questions of the conversational audit about neighbours, link speeds, mismatches, descriptions,
+  location and VLANs, each answered in one or two calls and tested as such (tests/test_report_neighbours.py):
+  speed or duplex mismatches between neighbours (17), the speed of the link between two devices (18), MTU
+  mismatches (19), descriptions that do not match their neighbour (23), neighbours LibreNMS does not monitor (27),
+  what is connected to a port (43), where a MAC is (44), where an IP is (45), a device's neighbours (46), the VLANs
+  on a switch (47), the ports in a VLAN on a switch (48) and where a VLAN is defined (49).
+- Shared pieces: `reports/context` gains `names_port` (a port by name, long or short form, or port_id; the short-
+  form match moved here from view `port`), a term hint per view and an `optional` read that lets a caller handle a
+  failure kind itself; `reports/ports` gains `interface_speed` (the speed an interface runs at, which `speeds`
+  falls back to) and lets a view that only joins ports read them without failing on them (`read_ports(...,
+  required=False)`, also for the listing of every port) and read the ports of devices outside its scope after the
+  scope's (`joined`, the far ends of links); `reports/neighbours.read_links` reads links for any view.
+- The fake LibreNMS: `ports_vlans`, `with=vlans` on a device's ports (adding `port_id`) and on one port, with
+  PortVlan's `untagged` accessor and, on one port, the port that accessor loads for a row that stores 0 (which
+  `get_device_ports` hides and `get_port_info` does not), and the trunk between core-sw1 and access-sw2 with its
+  VLAN memberships.
+
+### Changed
+- View `find` answers a MAC with a note pointing to view `locate` for the switch port it is learned on, and the
+  skill sends "where is MAC X / IP Y" there. The skill has the neighbour, location and VLAN questions and the views
+  that answer them, how to read a null check and `likely_edge`, and two more things the API cannot tell: which
+  ports could run faster than they do, and IPv6 neighbours. A term given to a view that takes none says it is for
+  views find and locate. The report description was tightened to carry the three views within the schema budget:
+  the six schemas take 16,381 of its 16,384 bytes.
+
 ## [0.5.0] - 2026-10-29
 
 ### Added

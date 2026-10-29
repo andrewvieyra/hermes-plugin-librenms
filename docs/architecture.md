@@ -99,7 +99,23 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   description of its own; `summary` counts states and finds the busiest. `port` adds, for one
   port, its discards, neighbours, transceivers, dBm sensors with their limits and open faults
   (never their details). `capacity` counts each device's physical ethernet ports by state and
-  those free (not up and unchanged for `idle_days`).
+  those free (not up and unchanged for `idle_days`). `neighbours` reads the LLDP/CDP links of the
+  scope (per device up to 10, else every link) and joins both ends to their port rows through the
+  same `read_ports` (the scope's devices first, then the neighbours, when it reads one device at a
+  time) and `facts`, so a link's ends carry the state, speed, duplex and MTU the `ports` view
+  gives them; it compares the speed the interfaces run at (never a circuit speed), duplex and MTU,
+  and whether the local description names the neighbour as a whole word, and leaves a check null
+  rather than false when it cannot be made (the neighbour is not monitored, LibreNMS did not match
+  its port, an end is not up). What the neighbour advertised (`remote_hostname`, `remote_port`,
+  `remote_platform`) is marked untrusted: any device on the wire writes it. `locate` takes an IPv4
+  or MAC address: the ports that learned the MAC (`ports/mac`, with LibreNMS's count of the MACs
+  each learned), its forwarding entries (VLAN and last update, the MAC sent as the 12 hex digits
+  the exact-match route compares), the ARP entries, and the links of the devices that learned it,
+  so that an uplink (a port whose monitored neighbour learned the MAC too) is never named the edge
+  port, while a port to a monitored hypervisor, access point or server that did not learn it, or
+  to the device at the IP looked up, can be. `vlans` lists each device's VLANs and, for one VLAN
+  on up to 10 devices, the ports in it from `with=vlans`, untagged when LibreNMS's PortVlan says
+  so or the VLAN is the port's own `ifVlan`.
 
 ## The plan document
 

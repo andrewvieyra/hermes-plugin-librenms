@@ -40,6 +40,7 @@ AMBIGUITY_GAP = 10  # the top two candidates closer than this are both plausible
 SCOPE_SHOWN = 10  # devices a scope lists by name
 SCOPE_LIST = 50  # most entries scope.devices takes
 TIMEZONE_UNKNOWN = "unknown — set librenms_timezone"
+TERM_VIEWS = "find and locate"  # the views that take a term
 # The keys of a candidate row that hold text from LibreNMS.
 CANDIDATE_TEXT = ("hostname", "display", "sysName", "location", "purpose", "hardware", "name", "desc", "port", "why")
 # LibreNMS's device states, as its Device scopes decide them (isDisabled, isIgnored, isDown, isUp), first wins.
@@ -100,7 +101,7 @@ class Request:
 class View:
     """A report view: its builder and the arguments it takes. ``filters`` maps each filter name to its kind
     (``bool``, ``duration``, ``number``, ``text``, or a tuple of the values a ``choice`` takes); ``sorts`` lists the
-    orders, the default first."""
+    orders, the default first; ``term`` says whether it takes a term (:data:`TERM_VIEWS`)."""
 
     name: str
     build: Callable[[ReportContext, Request], Dict[str, Any]]
@@ -109,6 +110,7 @@ class View:
     sorts: Tuple[str, ...] = ("name",)
     term: bool = False
     max_limit: int | None = None
+    term_hint: str = "a hostname, sysName, IP, interface or a few words"  # what the view's term is, when it takes one
 
 
 @dataclass
@@ -220,10 +222,10 @@ def request(view: View, args: Dict[str, Any], settings: Any) -> Request:
     term = args.get("term")
     if view.term:
         if term is None:
-            raise ArgumentError(f"view {view.name} needs a term: a hostname, sysName, IP, interface or a few words")
+            raise ArgumentError(f"view {view.name} needs a term: {view.term_hint}")
         term = term_arg("term", term)
     elif term not in (None, ""):
-        raise ArgumentError(f"term is for view find; view {view.name} is narrowed with scope and filter")
+        raise ArgumentError(f"term is for views {TERM_VIEWS}; view {view.name} is narrowed with scope and filter")
     sort = args.get("sort")
     if sort is None:
         sort = view.sorts[0]
@@ -300,6 +302,33 @@ def port_label(port: Dict[str, Any]) -> str | None:
     return str(name)
 
 
+def folded(port: Dict[str, Any], key: str) -> str:
+    """A port's *key* (``ifName``, ``ifDescr``, ``ifAlias``) as compared with a name the model gave: trimmed, any
+    case."""
+    return str(port.get(key) or "").strip().casefold()
+
+
+def abbreviates(text: str, *names: str) -> bool:
+    """Whether *text* is a short form of one of *names* (all folded): the same numbers after a prefix of its letters
+    (``gi1/0/5`` for ``gigabitethernet1/0/5``, ``te1/1/1`` for ``tengigabitethernet1/1/1``)."""
+    letters = text.rstrip("0123456789/.:-")
+    if not letters or not letters.isalpha() or letters == text:
+        return False
+    for name in names:
+        long = name.rstrip("0123456789/.:-")
+        if long.isalpha() and long.startswith(letters) and name[len(long) :] == text[len(letters) :]:
+            return True
+    return False
+
+
+def names_port(text: str, port: Dict[str, Any]) -> bool:
+    """Whether *text* names *port* (a ports row) by its ifName or ifDescr in any case, a short form of one
+    (:func:`abbreviates`), or its port_id."""
+    wanted = text.strip().casefold()
+    name, descr = folded(port, "ifName"), folded(port, "ifDescr")
+    return wanted in (name, descr) or abbreviates(wanted, name, descr) or wanted == str(port.get("port_id"))
+
+
 class ReportContext:
     """One report: its client and settings, the requests it sent (``calls``, and ``read``, the route names in order),
     its memo of listings, why its data is incomplete (``partial_reasons``) and what it tells the model (``notes``).
@@ -350,15 +379,18 @@ class ReportContext:
         value = LibreNMSClient.result(body, route.list_key) if body is not None else None
         return [] if value is None else value
 
-    def optional(self, what: str, *segments: Any, params: Dict[str, Any] | None = None) -> Any:
+    def optional(
+        self, what: str, *segments: Any, params: Dict[str, Any] | None = None, raising: Tuple[str, ...] = ()
+    ) -> Any:
         """:meth:`get`, or None when the read failed or the budget is spent, which makes the report ``partial``
-        (*what* names the data left out). A rejected token still fails the report."""
+        (*what* names the data left out). A rejected token still fails the report, and so does a failure of a kind
+        in *raising*, which the caller handles (``too_large``, to read the same rows another way)."""
         try:
             return self.get(*segments, params=params)
         except CallBudget:
             self.partial(f"{what} not read: the report used its {self.call_budget} requests")
         except LibreNMSError as exc:
-            if exc.kind == "auth":
+            if exc.kind == "auth" or exc.kind in raising:
                 raise
             self.partial(f"{what} not read: LibreNMS answered {_failure(exc)}")
         return None

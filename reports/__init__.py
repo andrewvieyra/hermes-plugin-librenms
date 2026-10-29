@@ -8,20 +8,27 @@ requests; it never writes.
 
 Views: :mod:`.find` (what a name or phrase could mean, ranked), :mod:`.devices` (state, outages, uptime, polls and
 naming checks), :mod:`.ports` (``ports``: state, speed, utilisation, errors and age of each port; ``capacity``: ports
-in use and free per device) and :mod:`.port` (one port in depth). Shared pieces: :mod:`.context` (reads, budgets,
-scope, envelope), :mod:`.fuzzy` (ranking) and :mod:`.units` (units and times).
+in use and free per device), :mod:`.port` (one port in depth), :mod:`.neighbours` (LLDP/CDP links with both ends'
+ports and mismatch checks), :mod:`.locate` (where an IP or MAC address is: the switch port and the ARP entries) and
+:mod:`.vlans` (VLANs per device, and the ports in one). Shared pieces: :mod:`.context` (reads, budgets, scope,
+envelope), :mod:`.fuzzy` (ranking) and :mod:`.units` (units and times).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from . import devices, find, port, ports
+from . import devices, find, locate, neighbours, port, ports, vlans
 from .context import Ambiguous, ArgumentError, CallBudget, ReportContext, ReportError, View, request
 
 __all__ = ["VIEWS", "ArgumentError", "ReportError", "run"]
 
-VIEWS: Dict[str, View] = {view.name: view for view in (find.VIEW, devices.VIEW, ports.VIEW, port.VIEW, ports.CAPACITY)}
+VIEWS: Dict[str, View] = {
+    view.name: view
+    for view in (
+        find.VIEW, devices.VIEW, ports.VIEW, port.VIEW, ports.CAPACITY, neighbours.VIEW, locate.VIEW, vlans.VIEW,
+    )
+}  # fmt: skip
 
 
 def run(client: Any, settings: Any, args: Dict[str, Any], *, call_budget: int | None = None) -> Dict[str, Any]:

@@ -11,12 +11,13 @@ a location edit not sent as JSON); alert-rule writes that return no id and rebui
 ack and unmute that change every open sibling when the rule does not notify per entity (or has more open faults than
 its limit); ids that are never reused; a device added with poller group 0 put in the default group; eventlog paging
 with an exact ``DESC`` and an id-valued numeric ``from``; the eventlog rows DeviceObserver writes; and SNMP secrets
-in clear for an admin token. The read-only routes the report views read answer as their handlers do too: the result
-key, ``count`` only for a PHP array, 404s for empty lists where the handler sends one, an unknown hostname in a
-filter read as no filter (and an unknown ``devices`` ``type`` as none), the ``ipv4``, ``ipv6`` and ``mac`` device
-filters, column lists checked trimmed but selected as sent, ``resources/fdb/{mac}`` compared exactly, the alert
-log's details decoded, and components as an object keyed by id. Bills are modelled for CDR bills in the current
-period only.
+in clear for an admin token. The read-only routes the report views read answer as their handlers do too: the result key,
+``count`` only for a PHP array, 404s for empty lists where the handler sends one, an unknown hostname in a filter read
+as no filter (and an unknown ``devices`` ``type`` as none), the ``ipv4``, ``ipv6`` and ``mac`` device filters, column
+lists checked trimmed but selected as sent, ``with=vlans`` on a device's ports and on one port (each port's ports_vlans
+rows, ``untagged`` as PortVlan reads it, and on one port the port it lazy-loads to do so), ``resources/fdb/{mac}``
+compared exactly, the alert log's details decoded, and components as an object keyed by id. Bills are modelled for CDR
+bills in the current period only.
 
 Test hooks: :meth:`FakeLibreNMS.fail_on` (a forced answer or exception, optionally after the write took effect),
 :meth:`~FakeLibreNMS.touch` (an edit made outside the plugin), :meth:`~FakeLibreNMS.after` (another client's write
@@ -48,13 +49,14 @@ _TABLES = (
     "devices", "locations", "device_groups", "services", "rules", "faults", "ports", "eventlog", "poller_groups",
     "port_groups", "links", "sensors", "transceivers", "components", "bgp_peers", "ospf_nbrs", "alert_log", "syslog",
     "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills", "ipv4_addresses",
-    "ipv6_addresses", "ports_statistics",
+    "ipv6_addresses", "ports_statistics", "ports_vlans",
 )  # fmt: skip
 _ID_KEYS = {
     "devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id",
     "sensors": "sensor_id", "bgp_peers": "bgpPeer_id", "syslog": "seq", "vlans": "vlan_id",
     "ports_fdb": "ports_fdb_id", "ports_nac": "ports_nac_id", "availability": "availability_id", "bills": "bill_id",
     "ipv4_addresses": "ipv4_address_id", "ipv6_addresses": "ipv6_address_id", "ports_statistics": "port_id",
+    "ports_vlans": "port_vlan_id",
 }  # fmt: skip
 
 # App\Http\Resources\Device, in its key order (dependency_parent_* only where list_devices loads parents).
@@ -149,6 +151,10 @@ _OSPF_COLUMNS = (
 _ALERT_LOG_COLUMNS = ("id", "rule_id", "device_id", "fault_id", "state", "details", "time_logged")
 _SYSLOG_COLUMNS = ("device_id", "facility", "priority", "level", "tag", "timestamp", "program", "msg", "seq")
 _VLAN_COLUMNS = ("vlan_id", "device_id", "vlan_vlan", "vlan_domain", "vlan_name", "vlan_type", "vlan_state")
+# ports_vlans (PortVlan): a port's membership of a VLAN, tagged or not, as with=vlans returns it.
+_PORT_VLAN_COLUMNS = (
+    "port_vlan_id", "device_id", "port_id", "vlan", "baseport", "priority", "state", "cost", "untagged",
+)  # fmt: skip
 _FDB_COLUMNS = ("ports_fdb_id", "port_id", "mac_address", "vlan_id", "device_id", "created_at", "updated_at")
 _NAC_COLUMNS = (
     "ports_nac_id", "auth_id", "device_id", "port_id", "domain", "username", "mac_address", "ip_address",
@@ -202,6 +208,7 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
     "alert_log": {"fault_id": None, "details": None},
     "syslog": {"facility": "local7", "priority": "info", "level": "info", "tag": "", "program": ""},
     "vlans": {"vlan_domain": 1, "vlan_type": "ethernet", "vlan_state": 0},
+    "ports_vlans": {"baseport": 0, "priority": 0, "state": "unknown", "cost": 0, "untagged": 0},
     "ports_fdb": {"vlan_id": 0},
     "ports_nac": {**dict.fromkeys(_NAC_COLUMNS), "historical": 0},
     "ipv4_mac": {"context_name": ""},
@@ -943,16 +950,41 @@ class FakeLibreNMS:
         return _api_success({"status": changed, "message": "Device will be rediscovered"}, "result", array=True)
 
     def _get_device_ports(self, r: _Req) -> FakeResponse:
+        """``get_device_ports``: the columns asked for (``ifName`` alone by default) by ifIndex; ``with=vlans`` adds
+        ``port_id`` to them and each port's ports_vlans rows as ``vlans`` (:meth:`_port_vlans`)."""
         d = self._device(r.args["hostname"])
         columns = _columns(r.params.get("columns"), ("ifName",))
         if isinstance(columns, FakeResponse):
             return columns
+        with_vlans = r.params.get("with") == "vlans"
+        if with_vlans and "port_id" not in columns:
+            columns = [*columns, "port_id"]
         device_id = d["device_id"] if d else None
         ports = [p for p in self.tables["ports"].values() if p["device_id"] == device_id and not p["deleted"]]
         if not ports:
             return _api_error(404, "No ports found")
         ports.sort(key=lambda p: p["ifIndex"])
-        return _api_success([{c: p[c] for c in columns} for p in ports], "ports")
+        rows = []
+        for p in ports:
+            rows.append({c: p[c] for c in columns})
+            if with_vlans:
+                rows[-1]["vlans"] = self._port_vlans(p)
+        return _api_success(rows, "ports")
+
+    def _port_vlans(self, port: Dict[str, Any], *, with_port: bool = False) -> List[Dict[str, Any]]:
+        """A port's ports_vlans rows, ``untagged`` read through ``PortVlan::getUntaggedAttribute``: 1 also when the row
+        says 0 but the VLAN is the port's own ``ifVlan`` (PHP's loose ``==``, so ``"10"`` is 10). That accessor
+        lazy-loads the row's port whenever it says 0, and the relation is then serialised under ``port``
+        (*with_port*): ``get_port_info`` does so, ``get_device_ports`` hides it."""
+        rows = self._rows("ports_vlans", _PORT_VLAN_COLUMNS, port_id=port["port_id"])
+        for row in rows:
+            if row["untagged"]:
+                continue
+            if port["ifVlan"] not in (None, "") and str(row["vlan"]) == str(port["ifVlan"]):
+                row["untagged"] = 1
+            if with_port:
+                row["port"] = {k: port[k] for k in _PORT_COLUMNS}
+        return rows
 
     def _get_poller_group(self, r: _Req) -> FakeResponse:
         ref = r.args["poller_group_id_or_name"]
@@ -1453,13 +1485,17 @@ class FakeLibreNMS:
 
     def _get_port_info(self, r: _Req) -> FakeResponse:
         """``get_port_info``: the port as a one-row list (none for an unknown id), deleted or not; ``with=statistics``
-        adds its ports_statistics rows (``vlans`` and ``device``, which LibreNMS also allows, are not modelled)."""
+        adds its ports_statistics rows, ``with=vlans`` its ports_vlans rows, each that stores ``untagged`` 0 with the
+        whole port under ``port``, which PortVlan's accessor loaded and nothing hides (``device``, which LibreNMS also
+        allows, is not modelled)."""
         port = self._port(r.args["portid"])
         if port is None:
             return _api_success([], "port")
         row = {k: port[k] for k in _PORT_COLUMNS}
         if r.params.get("with") == "statistics":
             row["statistics"] = self._rows("ports_statistics", _PORT_STATISTICS_COLUMNS, port_id=port["port_id"])
+        elif r.params.get("with") == "vlans":
+            row["vlans"] = self._port_vlans(port, with_port=True)
         return _api_success([row], "port")
 
     def _get_port_transceiver(self, r: _Req) -> FakeResponse:
@@ -2229,8 +2265,9 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
     """What the read-only report routes show: interface addresses (IPv4 and IPv6, for ``devices?type=ipv4|ipv6``), a
     port group, the uplink's discards (ports_statistics), LLDP/CDP links (one to an unmonitored neighbour), sensors
     (one past its limit, an optic), a transceiver, NTP components, BGP sessions (one idle, one without a state), OSPF
-    neighbours, alert-log rows whose details carry contacts, syslog, VLANs, a MAC learned on an access port and on the
-    uplink, a NAC session, ARP entries, outages and availability, and two CDR bills (one over its commit)."""
+    neighbours, alert-log rows whose details carry contacts, syslog, VLANs and the trunk that carries them, a MAC
+    learned on an access port and on the uplink, a NAC session, ARP entries, outages and availability, and two CDR
+    bills (one over its commit)."""
     seed = fake.seed
     seed("port_groups", {"id": 1, "name": "uplinks", "desc": "Core and WAN uplinks", "ports": [1, 5, 6]})
     seed("ports_statistics", {"port_id": 1, "ifInDiscards": 120, "ifInDiscards_prev": 120, "ifInDiscards_delta": 0,
@@ -2337,6 +2374,18 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
         {"vlan_id": 4, "device_id": 3, "vlan_vlan": 10, "vlan_name": "users"},
     ):
         seed("vlans", row)
+    # the trunk between core-sw1 Gi1/0/2 and access-sw2 Gi1/0/48: VLAN 1 native, 10 (and 20 on core-sw1) tagged; the
+    # access side's VLAN 1 row says 0, which PortVlan reads as untagged because it is the port's ifVlan
+    for port_id in (2, 9):
+        fake.touch("ports", port_id, ifVlan="1", ifTrunk="dot1Q")
+    for row in (
+        {"port_vlan_id": 1, "device_id": 1, "port_id": 2, "vlan": 1, "baseport": 2, "untagged": 1},
+        {"port_vlan_id": 2, "device_id": 1, "port_id": 2, "vlan": 10, "baseport": 2},
+        {"port_vlan_id": 3, "device_id": 1, "port_id": 2, "vlan": 20, "baseport": 2},
+        {"port_vlan_id": 4, "device_id": 3, "port_id": 9, "vlan": 1, "baseport": 48},
+        {"port_vlan_id": 5, "device_id": 3, "port_id": 9, "vlan": 10, "baseport": 48},
+    ):
+        seed("ports_vlans", row)
     for row in (
         {"ports_fdb_id": 1, "device_id": 3, "port_id": 9, "mac_address": "001122334455", "vlan_id": 4,
          "created_at": "2026-10-27T08:00:00.000000Z", "updated_at": "2026-10-28T11:00:00.000000Z"},
