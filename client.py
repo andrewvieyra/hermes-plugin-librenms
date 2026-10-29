@@ -7,7 +7,8 @@ object-model knowledge lives here.
 The transport is hardened like the GitLab plugin's: redirects are never followed (``requests`` would carry the
 ``X-Auth-Token`` header to whatever host ``Location`` names), ``~/.netrc`` and cookies are ignored, bodies are read
 to a byte cap, only GETs are retried, and errors carry neither the token nor, for a transport failure, anything
-but its kind and an id (the detail goes to the log under that id).
+but its kind and an id (the detail goes to the log under that id), or the variable that holds a proxy URL no parser
+reads as written.
 """
 
 from __future__ import annotations
@@ -75,6 +76,28 @@ _PROXY_USERINFO = (
     "LIBRENMS_PROXY's user name or password holds a character that must be percent-encoded (such as @ / ? # % or "
     "a space: %40 for @, %2F for /, %3F for ?, %23 for #, %25 for %, %20 for a space)"
 )
+# What ends a URL's authority for urllib3 (a backslash too) or breaks urlsplit's reading of it (a bracket outside an
+# IPv6 address). Unencoded in a proxy's user info, the parser takes part of the password for the host or port.
+_AUTHORITY_ENDS = re.compile(r"[/?#\\\[\]]")
+# Where a parser may split a user info or stop reading it (the delimiters above, ":", "@" and blanks): it quotes the
+# piece it read, as urllib3 2.8 quotes "svc:Pr0xy" of "svc:Pr0xy#Pass", and each such piece of a proxy URL no parser
+# reads as written is scrubbed too
+_USERINFO_SPLITS = re.compile(r"[:@/?#\\\[\]\s]")
+_BLANK = re.compile(r"\s")
+# Said, to the model and to the log, instead of the parser's error about a proxy URL no parser reads as written
+# (that error quotes the piece it could not read, part of the password among it), with what to fix in the part of
+# the URL it could not read (:func:`unreadable_part`)
+_PROXY_UNREADABLE = "the proxy URL in {name} could not be parsed; {advice}"
+_PROXY_ADVICE = {
+    "user info": (
+        "percent-encode reserved characters in its user name and password (%23 for #, %2F for /, %3F for ?, %5C for "
+        "\\, %5B and %5D for [ and ], %40 for @, %25 for %)"
+    ),
+    "host or port": (
+        "its host or port could not be read: give a host (an IPv6 address within [ and ]) and a port that is a number "
+        "up to 65535, with no blanks"
+    ),
+}
 
 Timeout = Tuple[float, float]
 
@@ -130,7 +153,9 @@ class ConfigError(LibreNMSError):
 class TransportError(LibreNMSError):
     """LibreNMS could not be reached, or the request could not be made at all. The message names the kind of
     failure and ``error_id`` only: the URL, the exception text, proxy details and CA paths (which name the OS
-    account) go to the log under that id, never to the model."""
+    account) go to the log under that id, never to the model. ``failure`` is ``timeout``, ``tls``, ``dns``,
+    ``refused``, ``connection``, ``internal`` (a request that could not be made) or ``proxy``: a proxy URL no parser
+    reads as written, whose message names the variable that holds it and what to fix, never its value."""
 
     KIND = "transport"
 
@@ -247,7 +272,12 @@ def proxy_from_env(value: str | None) -> str | None:
 def proxy_secrets(proxy: str | None) -> List[str]:
     """What of a proxy URL (``LIBRENMS_PROXY``, or one from the environment, which may have no scheme) must never
     reach a log line or an error: its user info, and the password (or a user name standing alone, which may be a
-    token) as written and percent-decoded."""
+    token) as written and percent-decoded. Also, for a proxy URL no parser reads as written (:func:`proxy_unreadable`),
+    as a parser that stops at an unencoded delimiter in the password quotes what it read up to there or after it, the
+    user info up to each delimiter in the password and each piece of the password between delimiters (``svc:Pr0xy``,
+    ``Pr0xy`` and ``Pass`` of ``svc:Pr0xy#Pass``). A proxy URL that reads is never split: no parser stops inside its
+    user info, and the pieces of a password such as ``Spring:2026`` would mask every ``2026`` in an error LibreNMS
+    sends. The user name beside a password is no secret."""
     if not proxy or proxy == "none":
         return []
     _scheme, sep, rest = proxy.partition("://")
@@ -256,7 +286,72 @@ def proxy_secrets(proxy: str | None) -> List[str]:
         return []
     user, colon, password = userinfo.partition(":")
     credential = password if colon else user
-    return [value for value in {userinfo, credential, unquote(credential)} if value]
+    values = {userinfo, credential, unquote(credential)}
+    if proxy_unreadable(proxy):  # every request through it fails, so masking more there hides no answer
+        start = len(userinfo) - len(credential)
+        values.update(userinfo[: start + found.start()] for found in _USERINFO_SPLITS.finditer(credential))
+        values.update(_USERINFO_SPLITS.split(credential))
+    return [value for value in values if value]
+
+
+def unreadable_part(proxy: str) -> str | None:
+    """Which part of *proxy* (``LIBRENMS_PROXY``, or one from the environment, which may have no scheme) a URL parser
+    reads otherwise than written: ``user info`` when an unencoded ``/``, ``?``, ``#``, backslash or bracket in it ends
+    the authority early, so part of the password is read as the host or port (``http://svc:12#34@proxy:3128`` is
+    host ``svc``, port 12); ``host or port`` when the authority names no host, holds a blank, or has a port that is
+    no number up to 65535. ``None`` when it reads as written."""
+    _scheme, sep, rest = proxy.partition("://")
+    userinfo, at, hostport = (rest if sep else proxy).rpartition("@")
+    if at and _AUTHORITY_ENDS.search(userinfo):
+        return "user info"
+    authority = re.split(r"[/?#\\]", hostport, maxsplit=1)[0]
+    try:
+        parts = urlsplit(f"http://{authority}")
+        host, _port = parts.hostname, parts.port  # .port raises for a port that is not a number up to 65535
+    except ValueError:
+        return "host or port"
+    # urlsplit drops a tab or a line break and keeps a space in the host; urllib3 refuses all three
+    return None if host and not _BLANK.search(authority) else "host or port"
+
+
+def proxy_unreadable(proxy: str) -> bool:
+    """Whether a URL parser reads *proxy* otherwise than written (:func:`unreadable_part`)."""
+    return unreadable_part(proxy) is not None
+
+
+def proxy_bypassed(url: str) -> bool:
+    """Whether ``requests`` reaches *url* directly, past the environment's (or the system's) proxy: by ``requests``'
+    own reading of ``NO_PROXY``, which also takes a CIDR range (``10.0.0.0/8``) and a ``host:port``, when it can be
+    imported (always, once a request has been sent); by ``urllib``'s, which takes neither, otherwise. On macOS it may
+    look *url*'s host up."""
+    try:
+        from requests.utils import should_bypass_proxies
+    except ImportError:
+        return bool(urllib.request.proxy_bypass(urlsplit(url).hostname or ""))
+    return bool(should_bypass_proxies(url, no_proxy=None))
+
+
+def unreadable_proxy(proxy: str | None, url: str) -> Tuple[str, str] | None:
+    """Where the proxy for a request to *url* is set, and that proxy, when no URL parser reads it as written
+    (:func:`proxy_unreadable`): ``LIBRENMS_PROXY`` when *proxy* (the client's) is a URL, else the environment's
+    variable for the URL's scheme or ``ALL_PROXY``, as ``requests`` picks one (the system proxy settings when no
+    variable holds it). ``None`` when the proxy reads, or ``requests`` takes none for *url* (:func:`proxy_bypassed`)."""
+    if proxy == "none":
+        return None
+    if proxy:
+        return ("LIBRENMS_PROXY", proxy) if proxy_unreadable(proxy) else None
+    try:
+        found = urllib.request.getproxies()
+        key = next((key for key in (urlsplit(url).scheme, "all") if found.get(key)), None)
+        # the bypass check last: on macOS it may look LibreNMS's host up
+        if key is None or not proxy_unreadable(found[key]) or proxy_bypassed(url):
+            return None
+    except Exception:  # pragma: no cover - the system's proxy settings could not be read
+        return None
+    value = found[key]
+    # urllib reads https_proxy over HTTPS_PROXY, and the lower-case name sorts last
+    names = sorted(name for name in os.environ if name.lower() == f"{key}_proxy" and os.environ[name] == value)
+    return (names[-1] if names else "the system proxy settings"), value
 
 
 def environment_proxy_secrets(url: str) -> List[str]:
@@ -668,7 +763,7 @@ class LibreNMSClient:
         else:
             found = urllib.request.getproxies()
             applies = target.scheme in found or "all" in found
-            via = "environment" if applies and not urllib.request.proxy_bypass(target.hostname or "") else "none"
+            via = "environment" if applies and not proxy_bypassed(self.base_url) else "none"
         return {"scheme": target.scheme, "verify": verify, "proxy": via}
 
     def scrub(self, text: Any) -> str:
@@ -733,11 +828,16 @@ class LibreNMSClient:
                 resp = self._send(method, path, params, data, timeout)
             except Exception as exc:  # transport failure (DNS, TLS, refused, timeout), or a request not made
                 self._record(method, path, 0, started)
-                if method == "GET" and retries < GET_RETRIES and _retryable(exc):
+                # a proxy URL no parser reads as written fails every try alike (on parsing it, or on a host read
+                # from its password); an exception of another class is a bug, not the proxy
+                bad_proxy = None
+                if isinstance(exc, (OSError, ValueError)):
+                    bad_proxy = unreadable_proxy(self.proxy, self.base_url)
+                if method == "GET" and retries < GET_RETRIES and not bad_proxy and _retryable(exc):
                     self.retry_sleep(_backoff(retries))
                     retries += 1
                     continue
-                raise self._transport_error(method, path, exc) from exc
+                raise self._transport_error(method, path, exc, bad_proxy=bad_proxy) from exc
             try:
                 status = int(getattr(resp, "status_code", 0) or 0)
                 headers = _headers(resp)
@@ -790,23 +890,31 @@ class LibreNMSClient:
         if len(self.calls) > MAX_CALLS:
             del self.calls[: len(self.calls) - MAX_CALLS]
 
-    def _transport_error(self, method: str, path_: str, exc: BaseException) -> TransportError:
+    def _transport_error(
+        self, method: str, path_: str, exc: BaseException, *, bad_proxy: Tuple[str, str] | None = None
+    ) -> TransportError:
         """The error for a request that failed on its way (or while its body was read); the detail is logged under
-        its id, never returned."""
-        failure = transport_kind(exc) if _unreachable(exc) else "internal"
+        its id, never returned. *bad_proxy* is where a proxy URL no parser reads as written is set, and that URL
+        (:func:`unreadable_proxy`): then the error and the log say so in fixed words, with what to fix in the part the
+        parser could not read. The exception's text quotes that part: for a URL with a user name or password, which
+        may be among it, it goes nowhere; for one without, it is logged too, as it says what is wrong."""
         error_id = new_error_id()
-        if failure == "internal":
-            message = f"the request to LibreNMS could not be made (internal error) {error_id}"
+        if bad_proxy:
+            name, proxy = bad_proxy
+            advice = _PROXY_ADVICE[unreadable_part(proxy) or "user info"]
+            failure, said = "proxy", _PROXY_UNREADABLE.format(name=name, advice=advice)
+            message = f"the request to LibreNMS could not be made: {said} {error_id}"
+            detail = f"{type(exc).__name__}: {said}"
+            if not proxy_secrets(proxy):
+                detail += f" ({self.scrub(str(exc))})"
         else:
-            message = f"could not reach LibreNMS ({_KIND_LABELS[failure]}) {error_id}"
-        logger.warning(
-            "librenms %s: %s %s failed (%s): %s",
-            error_id,
-            method,
-            self._url(path_),
-            failure,
-            self.scrub(f"{type(exc).__name__}: {exc}"),
-        )
+            failure = transport_kind(exc) if _unreachable(exc) else "internal"
+            if failure == "internal":
+                message = f"the request to LibreNMS could not be made (internal error) {error_id}"
+            else:
+                message = f"could not reach LibreNMS ({_KIND_LABELS[failure]}) {error_id}"
+            detail = self.scrub(f"{type(exc).__name__}: {exc}")
+        logger.warning("librenms %s: %s %s failed (%s): %s", error_id, method, self._url(path_), failure, detail)
         return TransportError(message, method=method, path=path_, error_id=error_id, failure=failure)
 
     def _answer(self, resp: Any, status: int, headers: Dict[str, str], method: str, path_: str, max_bytes: int) -> Any:

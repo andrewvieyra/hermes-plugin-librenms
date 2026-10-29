@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, neighbours, VLANs, where a MAC or IP address is, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.6.0
+version: 0.6.1
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]

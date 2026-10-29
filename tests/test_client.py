@@ -299,23 +299,57 @@ class Config(unittest.TestCase):
             client.get("devices")
         self.assertNotIn("Pr0xy", json.dumps(caught.exception.to_dict()))
 
+    def test_a_proxy_password_that_reads_is_scrubbed_whole_never_in_pieces(self):
+        # ":" is valid in a password, and no parser stops inside the user info of a proxy URL that reads: its pieces
+        # ("3", "2026") are no secret, and masking them would garble every id and date in LibreNMS's errors
+        for proxies, kwargs, password in (
+            ({}, {"proxy": "http://svc:Tr0ub4dor:3@proxy.example.com:3128"}, "Tr0ub4dor:3"),
+            ({"HTTPS_PROXY": "http://svc:Spring:2026@proxy.example.com:3128"}, {}, "Spring:2026"),
+        ):
+            with env_proxies(**proxies):
+                client, _, _ = make(
+                    Resp(404, {"status": "error", "message": "Device 3 does not exist"}),
+                    Resp(404, {"status": "error", "message": "No ports since 2026-10-01 on device 3"}),
+                    **kwargs,
+                )
+                self.assertEqual(sorted(client._proxy_secrets), [password, f"svc:{password}"])
+                for path, said in (
+                    ("devices/3", "Device 3 does not exist"),
+                    ("devices/3/ports", "No ports since 2026-10-01 on device 3"),
+                ):
+                    with self.assertRaises(client_mod.LibreNMSError) as caught:
+                        client.get(path)
+                    self.assertEqual(str(caught.exception), f"GET /api/v0/{path} -> HTTP 404: {said}")
+                    self.assertEqual(caught.exception.to_dict()["body"], {"status": "error", "message": said})
+                self.assertEqual(client.scrub(f"proxy said {password}"), "proxy said <redacted>")
+        self.assertEqual(
+            client_mod.proxy_from_env("http://svc:Tr0ub4dor:3@proxy.example.com:3128"),
+            "http://svc:Tr0ub4dor:3@proxy.example.com:3128",
+        )
+
     def test_the_environments_proxy_credentials_never_reach_a_log_line_either(self):
         # with LIBRENMS_PROXY unset requests takes HTTPS_PROXY, which nothing validates (Hermes' model traffic reads
-        # it too): an unencoded "#" in its password fails every request with an error quoting the whole URL
+        # it too): an unencoded "#" in its password fails every request with an error that quotes the whole URL
+        # (urllib3 2.7) or the piece of it up to the "#" (urllib3 2.8)
         proxy = "http://svc:Pr0xy#Pass@127.0.0.1:9"
         with env_proxies(HTTPS_PROXY=proxy, http_proxy="http://web:W3bPass@127.0.0.1:9", NO_PROXY="localhost"):
-            self.assertEqual(sorted(client_mod.environment_proxy_secrets(BASE)), ["Pr0xy#Pass", "svc:Pr0xy#Pass"])
+            self.assertEqual(
+                sorted(client_mod.environment_proxy_secrets(BASE)),
+                ["Pass", "Pr0xy", "Pr0xy#Pass", "svc:Pr0xy", "svc:Pr0xy#Pass"],
+            )
             self.assertEqual(
                 sorted(client_mod.environment_proxy_secrets("http://nms.example.com")), ["W3bPass", "web:W3bPass"]
             )
-            client, _, _ = make(OSError(f"Failed to parse: {proxy}"))
-            with (
-                self.assertRaises(client_mod.TransportError) as caught,
-                self.assertLogs(client_mod.logger, "WARNING") as logs,
+            client = make()[0]
+            for quoted, scrubbed in (
+                (f"Failed to parse: {proxy}", "Failed to parse: http://<redacted>@127.0.0.1:9"),
+                (
+                    "Failed to parse: 'svc:Pr0xy' is not a valid host or port",
+                    "Failed to parse: '<redacted>' is not a valid host or port",
+                ),
+                ("'Pass@127.0.0.1:9' is not a valid host", "'<redacted>@127.0.0.1:9' is not a valid host"),
             ):
-                client.get("devices")
-            self.assertNotIn("Pr0xy", logs.output[0] + str(caught.exception))
-            self.assertIn("Failed to parse: http://<redacted>@127.0.0.1:9", logs.output[0])
+                self.assertEqual(client.scrub(quoted), scrubbed)
             # LIBRENMS_PROXY replaces the environment's proxy, and none ignores it: then requests never reads it
             self.assertEqual(make(proxy="none")[0]._proxy_secrets, [])
             self.assertEqual(make(proxy="http://proxy:3128")[0]._proxy_secrets, [])
@@ -323,21 +357,260 @@ class Config(unittest.TestCase):
             self.assertEqual(
                 sorted(client_mod.environment_proxy_secrets(BASE)), ["Pr0xy#Pass", "Pr0xy%23Pass", "svc:Pr0xy%23Pass"]
             )
+        with env_proxies(HTTPS_PROXY="http://tok#en-as-user@proxy:3128"):  # a user name alone may be a token
+            self.assertEqual(
+                sorted(client_mod.environment_proxy_secrets(BASE)), ["en-as-user", "tok", "tok#en-as-user"]
+            )
         with env_proxies(HTTPS_PROXY="http://proxy:3128"):
             self.assertEqual(client_mod.environment_proxy_secrets(BASE), [])
 
+    def test_a_proxy_url_is_unreadable_when_a_parser_takes_its_password_for_the_host_or_port(self):
+        for readable in (
+            "http://u:pw@proxy:3128",
+            "https://proxy.example.com",
+            "proxy.example.com:3128",  # the environment's may have no scheme: requests assumes http://
+            "svc:Pr0xy%23Pass@127.0.0.1:9",
+            "http://svc:top@secret@127.0.0.1:9",  # the last "@" ends the user info for urllib3 and urlsplit alike
+            "http://svc:top secret!$&'()*+,;=%zz@127.0.0.1:9",
+            "http://[::1]:3128/",
+            "socks5h://u:pw@proxy:1080",
+            "http://svc-proxy:Pr0xy%23Pa%2Fss%3F!$&'()*+,;=:x@127.0.0.1:3128/",
+        ):
+            self.assertFalse(client_mod.proxy_unreadable(readable), readable)
+            self.assertIsNone(client_mod.unreadable_part(readable), readable)
+        for unreadable, part in (
+            ("http://svc:Pr0xy#Pass@127.0.0.1:9", "user info"),
+            ("http://svc:Pr0xy/Pass@127.0.0.1:9", "user info"),
+            ("http://svc:Pr0xy?Pass@127.0.0.1:9", "user info"),
+            ("http://svc:Pr0xy\\Pass@127.0.0.1:9", "user info"),  # urllib3 ends the authority at a backslash too
+            ("http://svc:Pr0xy[Pass@127.0.0.1:9", "user info"),
+            ("http://svc:Pr0xy]Pass@127.0.0.1:9", "user info"),
+            ("http://svc:12#34@proxy:3128", "user info"),  # host svc, port 12: a connection to the wrong host
+            ("http://svc#x:pw@proxy:3128", "user info"),
+            ("svc:Pr0xy#Pass@127.0.0.1:9", "user info"),
+            ("http://svc:Pr0xy#Pass@proxy:port", "user info"),  # what to percent-encode comes first
+            ("http://svc:pw@proxy:99999", "host or port"),
+            ("http://svc:pw@proxy:port", "host or port"),
+            ("http://svc:pw@", "host or port"),
+            ("http://[::1:3128", "host or port"),
+            ("http://proxy.example.com:3128 ", "host or port"),
+            ("http://pro xy:3128", "host or port"),  # urlsplit keeps the blank in the host, urllib3 refuses it
+            ("http://proxy:3128\n", "host or port"),  # urlsplit drops a line break, urllib3 refuses it
+        ):
+            self.assertTrue(client_mod.proxy_unreadable(unreadable), unreadable)
+            self.assertEqual(client_mod.unreadable_part(unreadable), part, unreadable)
+
+    def test_the_proxy_blamed_is_the_one_requests_takes(self):
+        bad, fine = "http://svc:Pr0xy#Pass@127.0.0.1:9", "http://proxy:3128"
+        for proxies, url, named in (
+            ({"HTTPS_PROXY": bad}, BASE, "HTTPS_PROXY"),
+            ({"https_proxy": bad}, BASE, "https_proxy"),
+            ({"HTTPS_PROXY": bad, "https_proxy": bad}, BASE, "https_proxy"),  # urllib reads the lower-case one
+            ({"ALL_PROXY": bad}, BASE, "ALL_PROXY"),
+            ({"HTTPS_PROXY": fine, "ALL_PROXY": bad}, BASE, None),  # the scheme's proxy comes first
+            ({"HTTP_PROXY": bad}, BASE, None),
+            ({"HTTP_PROXY": bad}, "http://nms.example.com", "HTTP_PROXY"),
+            ({"HTTPS_PROXY": bad, "NO_PROXY": "example.com"}, BASE, None),  # LibreNMS is reached directly
+            ({"HTTPS_PROXY": fine}, BASE, None),
+        ):
+            with env_proxies(**proxies):
+                expected = (named, bad) if named else None
+                self.assertEqual(client_mod.unreadable_proxy(None, url), expected, (proxies, url))
+        with env_proxies(HTTPS_PROXY=bad):  # LIBRENMS_PROXY replaces it, and none ignores it
+            self.assertIsNone(client_mod.unreadable_proxy("none", BASE))
+            self.assertIsNone(client_mod.unreadable_proxy(fine, BASE))
+            self.assertEqual(client_mod.unreadable_proxy(bad, BASE), ("LIBRENMS_PROXY", bad))
+        # macOS and Windows read the system's proxy settings when no variable is set
+        with (
+            env_proxies(),
+            mock.patch.object(client_mod.urllib.request, "getproxies", return_value={"https": bad}),
+            mock.patch.object(client_mod, "proxy_bypassed", return_value=False),
+        ):
+            self.assertEqual(client_mod.unreadable_proxy(None, BASE), ("the system proxy settings", bad))
+        # without requests (a client handed another session), urllib's reading of NO_PROXY decides
+        saved = sys.modules.get("requests.utils")
+        sys.modules["requests.utils"] = None  # importing it raises ImportError
+        try:
+            for no_proxy, bypassed in (("example.com", True), ("nms.example.com:443", False), ("other.com", False)):
+                with env_proxies(HTTPS_PROXY=bad, NO_PROXY=no_proxy):
+                    self.assertEqual(client_mod.proxy_bypassed(BASE), bypassed, no_proxy)
+        finally:
+            restore_module("requests.utils", saved)
+
     @unittest.skipUnless(HAVE_REQUESTS, "requests is not installed")
-    def test_requests_failing_on_the_environments_proxy_logs_no_password(self):
-        with env_proxies(HTTPS_PROXY="http://svc:Pr0xy#Pass@127.0.0.1:9"):
-            client = client_mod.LibreNMSClient("https://librenms.invalid", TOKEN)
-            client.retry_sleep = lambda seconds: None
+    def test_no_proxy_is_read_as_requests_reads_it(self):
+        # requests also takes a CIDR range and a host:port in NO_PROXY, which urllib does not: then it reaches
+        # LibreNMS directly, the proxy is not blamed, status says no proxy is used, and a GET is retried
+        bad = "http://svc:Pr0xy#Pass@127.0.0.1:9"
+        for no_proxy, url, bypassed in (
+            ("10.0.0.0/8", "https://10.1.2.3", True),
+            ("10.0.0.0/8", "https://192.0.2.10", False),
+            ("nms.example.com:8443", "https://nms.example.com:8443", True),
+            ("nms.example.com:8443", BASE, False),
+            ("example.com", BASE, True),
+        ):
+            case = (no_proxy, url)
+            with env_proxies(HTTPS_PROXY=bad, NO_PROXY=no_proxy):
+                self.assertEqual(client_mod.proxy_bypassed(url), bypassed, case)
+                self.assertEqual(client_mod.unreadable_proxy(None, url), None if bypassed else ("HTTPS_PROXY", bad))
+                client, session, _ = make(ConnectionRefusedError(61, "refused"), url=url)
+                self.assertEqual(client.posture()["proxy"], "none" if bypassed else "environment", case)
+                with (
+                    self.assertRaises(client_mod.TransportError) as caught,
+                    self.assertLogs(client_mod.logger, "WARNING"),
+                ):
+                    client.get("devices")
+            tried = (caught.exception.failure, len(session.sent))
+            self.assertEqual(tried, ("refused", 3) if bypassed else ("proxy", 1), case)
+
+    def test_a_proxy_url_no_parser_reads_is_named_never_quoted(self):
+        # the class of failure, not the parser's words for it (urllib3 2.7 quotes the whole URL, 2.8 the piece up to
+        # the "#", urlsplit raises a ValueError, a host read from the password fails to resolve): the error and the
+        # log name the variable and say what to fix, and a GET is not tried again, as every try fails alike
+        proxy = "http://svc:Pr0xy#Pass@127.0.0.1:9"
+        said = (
+            "the proxy URL in {} could not be parsed; percent-encode reserved characters in its user name and "
+            "password (%23 for #, %2F for /, %3F for ?, %5C for \\, %5B and %5D for [ and ], %40 for @, %25 for %)"
+        )
+        for failure in (
+            OSError(f"Failed to parse: {proxy}"),
+            OSError("Failed to parse: 'svc:Pr0xy' is not a valid host or port"),
+            ValueError("Invalid IPv6 URL"),
+            socket.gaierror(8, "Failed to resolve 'svc'"),
+        ):
+            with env_proxies(HTTPS_PROXY=proxy):
+                client, session, slept = make(failure, Resp(200, OK))
+                with (
+                    self.assertRaises(client_mod.TransportError) as caught,
+                    self.assertLogs(client_mod.logger, "WARNING") as logs,
+                ):
+                    client.get("devices")
+            exc = caught.exception
+            self.assertEqual((exc.failure, len(session.sent), slept), ("proxy", 1, []), failure)
+            self.assertEqual(
+                str(exc),
+                f"the request to LibreNMS could not be made: {said.format('HTTPS_PROXY')} {exc.error_id}",
+            )
+            self.assertIn(f"failed (proxy): {type(failure).__name__}: {said.format('HTTPS_PROXY')}", logs.output[0])
+            for quoted in ("Pr0xy", "Pass", "svc", "Failed", "Invalid", "resolve"):
+                self.assertNotIn(quoted, logs.output[0] + str(exc), failure)
+        # LIBRENMS_PROXY as a caller hands it to the client, past proxy_from_env, which refuses this one
+        client, _, _ = make(OSError("Failed to parse: 'svc:Pr0xy' is not a valid host or port"), proxy=proxy)
+        with self.assertRaises(client_mod.TransportError) as caught, self.assertLogs(client_mod.logger, "WARNING"):
+            client.get("devices")
+        self.assertEqual(
+            str(caught.exception),
+            f"the request to LibreNMS could not be made: {said.format('LIBRENMS_PROXY')} {caught.exception.error_id}",
+        )
+
+    def test_a_proxy_host_or_port_no_parser_reads_gets_its_own_advice(self):
+        # nothing to percent-encode there; and with no user name or password in the URL, the parser's own words
+        # hold no secret and say what is wrong, so the log keeps them (scrubbed, as any)
+        said = (
+            "the proxy URL in HTTPS_PROXY could not be parsed; its host or port could not be read: give a host (an "
+            "IPv6 address within [ and ]) and a port that is a number up to 65535, with no blanks"
+        )
+        for proxy, failure in (
+            ("http://proxy:3128 ", OSError("Failed to parse: Host 'proxy:3128 ' contains invalid character ' '")),
+            ("http://proxy:port", OSError("Failed to parse: 'proxy:port' is not a valid host or port")),
+            ("http://[::1:3128", ValueError("Invalid IPv6 URL")),
+        ):
+            with env_proxies(HTTPS_PROXY=proxy):
+                client, session, slept = make(failure, Resp(200, OK))
+                with (
+                    self.assertRaises(client_mod.TransportError) as caught,
+                    self.assertLogs(client_mod.logger, "WARNING") as logs,
+                ):
+                    client.get("devices")
+            exc = caught.exception
+            self.assertEqual((exc.failure, len(session.sent), slept), ("proxy", 1, []), proxy)
+            self.assertEqual(str(exc), f"the request to LibreNMS could not be made: {said} {exc.error_id}")
+            self.assertTrue(
+                logs.output[0].endswith(f"failed (proxy): {type(failure).__name__}: {said} ({failure})"), logs.output
+            )
+        # a user name or password in it: the same advice, and the parser's words, which may quote them, go nowhere
+        with env_proxies(HTTPS_PROXY="http://svc:Pr0xy@proxy:port"):
+            client, _, _ = make(OSError("Failed to parse: http://svc:Pr0xy@proxy:port"))
             with (
-                self.assertRaises(client_mod.TransportError),
+                self.assertRaises(client_mod.TransportError) as caught,
                 self.assertLogs(client_mod.logger, "WARNING") as logs,
             ):
-                client.get("system")
-        self.assertIn("http://<redacted>@127.0.0.1:9", logs.output[0])  # requests did quote the proxy URL
-        self.assertNotIn("Pr0xy", logs.output[0])
+                client.get("devices")
+        self.assertEqual(
+            str(caught.exception), f"the request to LibreNMS could not be made: {said} {caught.exception.error_id}"
+        )
+        self.assertTrue(logs.output[0].endswith(f"failed (proxy): OSError: {said}"), logs.output)
+
+    def test_only_a_failure_through_a_proxy_no_parser_reads_is_blamed_on_it(self):
+        bad = "http://svc:Pr0xy#Pass@127.0.0.1:9"
+        # an exception of another class is a bug, not the proxy: its text is logged, scrubbed piece by piece
+        with env_proxies(HTTPS_PROXY=bad):
+            client, _, _ = make(RuntimeError("bug near 'svc:Pr0xy'"))
+            with (
+                self.assertRaises(client_mod.TransportError) as caught,
+                self.assertLogs(client_mod.logger, "WARNING") as logs,
+            ):
+                client.get("devices")
+        self.assertEqual(caught.exception.failure, "internal")
+        self.assertIn("failed (internal): RuntimeError: bug near '<redacted>'", logs.output[0])
+        # no proxy, LibreNMS reached directly, or a proxy that reads: the failure is what it is, and a GET is retried
+        for proxies, kwargs in (
+            ({"HTTPS_PROXY": bad, "NO_PROXY": "nms.example.com"}, {}),
+            ({"HTTPS_PROXY": bad}, {"proxy": "none"}),
+            ({"HTTPS_PROXY": bad}, {"proxy": "http://proxy:3128"}),
+            ({"HTTP_PROXY": bad}, {}),
+            ({"HTTPS_PROXY": "http://svc:top@secret@127.0.0.1:9"}, {}),
+        ):
+            with env_proxies(**proxies):
+                client, session, slept = make(ConnectionRefusedError(61, "refused"), **kwargs)
+                with (
+                    self.assertRaises(client_mod.TransportError) as caught,
+                    self.assertLogs(client_mod.logger, "WARNING"),
+                ):
+                    client.get("devices")
+            self.assertEqual((caught.exception.failure, len(session.sent)), ("refused", 3), proxies)
+
+    @unittest.skipUnless(HAVE_REQUESTS, "requests is not installed")
+    def test_requests_failing_on_the_environments_proxy_logs_no_password(self):
+        # whichever urllib3 is installed, and whatever it says (2.7 quotes the whole URL, 2.8 the piece it could not
+        # read, "svc:Pr0xy"; urlsplit raises "Invalid IPv6 URL"), none of it is logged
+        for proxy in (
+            "http://svc:Pr0xy#Pass@127.0.0.1:9",
+            "http://svc:Pr0xy/Pass@127.0.0.1:9",
+            "http://svc:Pr0xy?Pass@127.0.0.1:9",
+            "http://svc:Pr0xy\\Pass@127.0.0.1:9",
+            "http://svc:Pr0xy[Pass@127.0.0.1:9",
+            "http://svc:Pr0xy@127.0.0.1:99999",
+        ):
+            with env_proxies(HTTPS_PROXY=proxy):
+                client = client_mod.LibreNMSClient("https://librenms.invalid", TOKEN)
+                slept = []
+                client.retry_sleep = slept.append
+                with (
+                    self.assertRaises(client_mod.TransportError) as caught,
+                    self.assertLogs(client_mod.logger, "WARNING") as logs,
+                ):
+                    client.get("system")
+            self.assertEqual((caught.exception.failure, slept), ("proxy", []), proxy)
+            self.assertIn("the proxy URL in HTTPS_PROXY could not be parsed", logs.output[0])
+            for quoted in ("Pr0xy", "Pass", "svc", "Failed to parse", "Invalid IPv6"):
+                self.assertNotIn(quoted, logs.output[0] + str(caught.exception), proxy)
+        # with no user name or password in it, the parser's words reach the log (never the error), saying what it
+        # could not read; the advice is about the host or port
+        for proxy in ("http://proxy.example.com:3128 ", "http://proxy.example.com:port"):
+            with env_proxies(HTTPS_PROXY=proxy):
+                client = client_mod.LibreNMSClient("https://librenms.invalid", TOKEN)
+                slept = []
+                client.retry_sleep = slept.append
+                with (
+                    self.assertRaises(client_mod.TransportError) as caught,
+                    self.assertLogs(client_mod.logger, "WARNING") as logs,
+                ):
+                    client.get("system")
+            self.assertEqual((caught.exception.failure, slept), ("proxy", []), proxy)
+            self.assertIn("could not be parsed; its host or port could not be read", str(caught.exception))
+            self.assertIn("Failed to parse", logs.output[0])
+            self.assertNotIn("Failed to parse", str(caught.exception))
 
     def test_is_configured_needs_url_and_token_only(self):
         self.assertFalse(client_mod.is_configured({}))

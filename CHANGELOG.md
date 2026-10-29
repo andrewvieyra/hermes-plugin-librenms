@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-29
+
+### Security
+- A proxy URL from `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (with `LIBRENMS_PROXY` unset; nothing validates
+  them, as Hermes' model traffic reads them too) with an unencoded `#`, `/`, `?`, `\` or bracket in its password no
+  longer puts part of that password in Hermes' log. With requests 2.34 / urllib3 2.8 such a URL fails with
+  `Failed to parse: 'svc:Pr0xy' is not a valid host or port`: the user name and the password up to the `#`, which
+  the scrubber, knowing only the whole password, missed (urllib3 2.7 quoted the whole URL, which it caught). The
+  class of failure is now handled, not the string: when a request fails while the proxy in use is one no URL parser
+  reads as written (such a character in the user info ends the authority early and makes part of the password the
+  host or port, as `svc:12#34@proxy:3128` is host `svc`, port 12, a connection to the wrong host rather than a
+  parse error; or its host or port cannot be read: no host, a blank, an unclosed `[`, a port that is no number up
+  to 65535), the parser's error is not passed on. The error the model reads and the log line say instead `the
+  request to LibreNMS could not be made: the proxy URL in HTTPS_PROXY could not be parsed;` and what to fix in the
+  part that could not be read, `percent-encode reserved characters in its user name and password (...)` or `its
+  host or port could not be read: give a host (...) and a port that is a number up to 65535, with no blanks`. They
+  name the variable requests took the proxy from (`https_proxy` over `HTTPS_PROXY`, the scheme's over `ALL_PROXY`,
+  none when `NO_PROXY` exempts LibreNMS as requests reads it, a CIDR range or a `host:port` included) and never its
+  value, with the transport failure kind `proxy`; a GET is not tried again, since every try fails alike. For a
+  proxy URL with no user name or password the log line still carries the parser's own words, scrubbed: they hold
+  no secret and say what it could not read. `LIBRENMS_PROXY` reaches the same path only when a caller hands the
+  client a URL `proxy_from_env` would refuse; it is named the same way.
+- Defence in depth: for a proxy URL no parser reads as written, besides its user info and password, each piece of
+  the password between `:`, `@`, `/`, `?`, `#`, `\`, brackets or blanks, and the user info up to each of them, is
+  scrubbed from every log line and error the client writes, as a parser that stops at one quotes what it read
+  (`svc:Pr0xy` and `Pass` of `svc:Pr0xy#Pass`); every request through it fails, so masking more hides no answer. A
+  proxy URL that reads is never split: no parser stops inside its user info, and the pieces of a valid password
+  such as `Spring:2026` would mask the ids and dates in LibreNMS's errors. A user name standing beside a password is
+  still no secret on its own.
+
+### Fixed
+- Status (`transport.proxy`) reads `NO_PROXY` as requests does: with `NO_PROXY=10.0.0.0/8` or
+  `nms.example.com:8443`, which urllib's reading misses, a LibreNMS that requests reaches directly is `none`, no
+  longer `environment`.
+
 ## [0.6.0] - 2026-10-29
 
 ### Added
