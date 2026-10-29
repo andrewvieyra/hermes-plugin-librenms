@@ -34,7 +34,7 @@ from .redact import clip, for_model, mask, one_line
 from .resources import get_resource
 from .routes import QueryError, Route, prepare, too_large_hint
 from .settings import Settings, get_settings
-from .store import PlanStore, get_store, profile_key
+from .store import PlanStore, get_store, plan_status, profile_key
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -291,17 +291,27 @@ def maybe_prune(actor: Dict[str, Any] | Callable[[], Dict[str, Any]]) -> None:
 def status_report(settings: Settings | None = None) -> Dict[str, Any]:
     """What ``librenms_query`` action status and ``/librenms status`` show: the LibreNMS version, how the plugin
     reaches it (no host, path or proxy address), the plugin's version and public settings, and what an operator
-    should know about them. Raises the client's error when LibreNMS cannot be configured or reached."""
+    should know about them. When LibreNMS cannot be configured or reached, ``connection`` says why (``ok`` false,
+    the client's scrubbed ``error`` and its ``kind``) and ``librenms`` is None; everything else is still there,
+    because that is when the operator needs it: a mistyped ``write_mode`` read as ``read_only`` explains a refused
+    apply only if status shows it."""
     settings = settings if settings is not None else get_settings()
-    client = make_client(settings)
-    system = client.system()
+    client: LibreNMSClient | None = None
+    system: Dict[str, Any] | None = None
+    connection: Dict[str, Any] = {"ok": True}
+    try:
+        client = make_client(settings)
+        system = client.system()
+    except LibreNMSError as exc:
+        connection = {"ok": False, "error": str(exc), "kind": exc.kind}
     warnings = []
     if settings.allow_insecure_transport:
-        problems = insecure_transport(client.base_url, client.verify)
-        warnings.append(
-            "allow_insecure_transport is on: "
-            + ("; ".join(problems) if problems else "LibreNMS is reached over verified https, audit sinks may not be")
-        )
+        if client is None:
+            posture = "LibreNMS and audit sinks may be reached over plain or unverified transports"
+        else:
+            problems = insecure_transport(client.base_url, client.verify)
+            posture = "; ".join(problems) or "LibreNMS is reached over verified https, audit sinks may not be"
+        warnings.append(f"allow_insecure_transport is on: {posture}")
     if settings.write_mode == "full" and not settings.require_approval:
         warnings.append(
             "write_mode is full and require_approval is false: the model can apply and roll back plans without "
@@ -309,9 +319,10 @@ def status_report(settings: Settings | None = None) -> Dict[str, Any]:
         )
     warnings += sinks.literal_credential_warnings()
     return {
-        "librenms_url": client.base_url,
-        "librenms": for_model(system),
-        "transport": client.posture(),
+        "librenms_url": client.base_url if client is not None else None,
+        "librenms": for_model(system) if system is not None else None,
+        "connection": connection,
+        "transport": client.posture() if client is not None else None,
         "plugin_version": __version__,
         "write_mode": settings.write_mode,
         "apply_available": settings.write_mode == "full",  # whether the model's librenms_apply may write
@@ -381,12 +392,17 @@ def _actor_from(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _plan_summary(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """A plan's identity, status and counts. A hand-edited or damaged file may lack any key or hold another type:
+    its status reads ``unknown`` (:func:`plan_status`, which the ``status`` filter goes by too) and its counts as
+    none, so one such file cannot break the listing an operator uses to find a plan to roll back
+    (:meth:`PlanStore.list` gives each plan the id its file is named by)."""
+    summary = plan.get("summary")
     return {
-        "plan_id": plan["id"],
-        "status": plan["status"],
+        "plan_id": plan.get("id"),
+        "status": plan_status(plan),
         "description": plan.get("description", ""),
         "created_at": plan.get("created_at"),
-        "summary": plan.get("summary", {}),
+        "summary": summary if isinstance(summary, dict) else {},
         "librenms_url": plan.get("librenms_url"),
     }
 
@@ -667,7 +683,10 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
     action = str(args.get("action") or "get").strip().lower()
     if action == "status":
         maybe_prune(lambda: _actor_from(kwargs))
-        return _ok(**status_report(settings))
+        report = status_report(settings)
+        if not report["connection"]["ok"]:  # still a failure, with the settings that may explain it
+            return _fail(report["connection"]["error"], **report)
+        return _ok(**report)
     if action != "get":
         return _fail(f"action must be get or status (got {action[:40]!r})")
     fields = args.get("fields")

@@ -269,9 +269,44 @@ class Documentation(unittest.TestCase):
         frontmatter = self.skill.split("---\n")[1]
         self.assertRegex(frontmatter, r"(?m)^name: librenms-workflow$")
         self.assertRegex(frontmatter, r"(?m)^description: \S.{40,}$")
+        # Hermes checks these against the tools the model sees directly; under its tool search the librenms tools
+        # are deferred, and the skill would be hidden where it is needed
+        self.assertNotRegex(frontmatter, r"requires_tool|fallback_for")
+
+    def test_the_skill_says_how_to_reach_deferred_tools(self):
+        self.assertIn("`tool_describe`", self.skill)
+        self.assertIn('`{"calls": [{"name": "librenms_query", "arguments": {"action": "status"}}]}`', self.skill)
+
+    def test_the_skill_names_both_reasons_the_tools_can_be_missing(self):
+        # offered whenever the plugin is enabled, the skill also reaches sessions where the librenms toolset is off
+        # for the platform or task: there, telling the user to set variables that are already set sends them wrong
+        paragraph = re.search(r"(?ms)^If no `librenms_\*` tool is in your tool list.*?(?=\n\n)", self.skill).group(0)
+        paragraph = " ".join(paragraph.split())  # line breaks fall anywhere
+        missing = paragraph[paragraph.index("Treat them as missing only") :]
+        self.assertIn("`tool_search`", missing)  # a catalog listed in groups, or not at all, names no tool
+        for cause in ("`LIBRENMS_URL`", "`LIBRENMS_TOKEN`", "`librenms` toolset", "`hermes tools`"):
+            self.assertIn(cause, missing)
+        self.assertIn("Tell the user both", missing)
+
+
+# Hermes' rule for a deferred tool's catalog line (tools/tool_search_catalog.py, _short_desc): the description's
+# first sentence (., ! or ? before whitespace or the end; not e.g., i.e. or etc.), clipped past 60 characters
+_SENTENCE_END = re.compile(r"(?<!\be\.g)(?<!\bi\.e)(?<!\betc)[.!?](?=\s|$)")
 
 
 class Schemas(unittest.TestCase):
+    def test_each_description_opens_with_a_whole_catalog_line(self):
+        schemas = submodule("schemas")
+        for schema in schemas.ALL:
+            text = " ".join(schema["description"].split())
+            first = text[: _SENTENCE_END.search(text).end()]
+            self.assertLessEqual(len(first), schemas.CATALOG_CHARS, first)
+            self.assertTrue(first.endswith(".") and "LibreNMS" in first, first)
+            self.assertTrue(schema["description"].endswith(f" {schemas.DEFERRED}"), schema["name"])
+        query = schemas.LIBRENMS_QUERY["description"].split(". ")[0]
+        for subject in ("devices", "ports", "alerts", "logs"):  # what people ask about
+            self.assertIn(subject, query)
+
     def test_schemas_stay_inside_their_budget(self):
         schemas = submodule("schemas").ALL
         size = len(json.dumps(schemas).encode("utf-8"))

@@ -218,7 +218,39 @@ class Query(HandlerCase):
         out = self.call("librenms_query", action="status")
         self.assertFalse(out["success"])
         self.assertIn("LIBRENMS_URL and LIBRENMS_TOKEN", out["error"])
-        self.assertEqual(out["librenms"]["kind"], "config")
+        self.assertEqual(out["connection"], {"ok": False, "error": out["error"], "kind": "config"})
+        self.assertEqual((out["librenms"], out["librenms_url"], out["transport"]), (None, None, None))
+
+    def test_status_shows_the_settings_while_librenms_cannot_be_configured_or_reached(self):
+        # a mistyped write_mode falls back to read_only, and status is where the operator learns why apply refuses
+        self.settings_mod.set_settings(
+            self.settings_mod.Settings.from_mapping(
+                {"write_mode": "fulll", "max_query_results": "lots", "allow_insecure_transport": True}
+            )
+        )
+
+        def unconfigured(*_args, **_kwargs):
+            raise self.client_mod.ConfigError("http:// LIBRENMS_URL needs allow_insecure_transport")
+
+        for factory, kind in ((unconfigured, "config"), (None, "server")):
+            if factory is None:
+                self.handlers.set_client_factory(lambda *_args, **_kwargs: self.client)
+                self.fake.fail_on("GET", "system", 503, times=10)
+            else:
+                self.handlers.set_client_factory(factory)
+            out = self.call("librenms_query", action="status")
+            self.assertFalse(out["success"], kind)
+            self.assertEqual((out["connection"]["ok"], out["connection"]["kind"]), (False, kind))
+            self.assertEqual(out["error"], out["connection"]["error"])
+            self.assertIsNone(out["librenms"])
+            self.assertEqual((out["write_mode"], out["apply_available"]), ("read_only", False))
+            self.assertEqual(out["plugin_version"], submodule("version").__version__)
+            self.assertEqual(out["settings"]["max_query_results"], 500)
+            self.assertEqual(len(out["settings_errors"]), 2)
+            self.assertIn("write_mode: expected one of full, operator_only, read_only", out["settings_errors"][0])
+            self.assertTrue(any(w.startswith("allow_insecure_transport is on: ") for w in out["warnings"]), kind)
+        self.assertEqual(out["transport"]["scheme"], "https")  # the client was built; LibreNMS did not answer
+        self.assertNotIn(TOKEN, json.dumps(out))
 
     def test_handlers_never_raise_and_hide_unexpected_detail(self):
         self.handlers.set_client_factory(lambda: (_ for _ in ()).throw(RuntimeError("kaboom at /home/x")))
@@ -380,6 +412,26 @@ class PlanApplyRollback(HandlerCase):
         self.assertEqual(shown["apply"]["outcome"], "applied")
         self.assertEqual(self.call("librenms_plans", status="planned")["count"], 0)
         self.assertEqual(self.call("librenms_plans", status="applied", limit="junk")["count"], 1)
+
+    def test_one_damaged_plan_file_does_not_break_the_listing(self):
+        pid = self.plan([self.update_purpose()], description="good")["id"]
+        directory = self.store.directory
+        (directory / "lnp-20261001T000000Z-dead.json").write_text('{"description": "hand-edited"}', encoding="utf-8")
+        odd = {"id": "lnp-elsewhere", "status": 7, "summary": [1], "created_at": 5, "description": "odd"}
+        (directory / "lnp-20261001T000001Z-0dd0.json").write_text(json.dumps(odd), encoding="utf-8")
+        out = self.call("librenms_plans")
+        self.assertTrue(out["success"], out)
+        rows = {row["plan_id"]: row for row in out["plans"]}
+        self.assertEqual(set(rows), {pid, "lnp-20261001T000000Z-dead", "lnp-20261001T000001Z-0dd0"})
+        self.assertEqual((rows[pid]["status"], rows[pid]["summary"]["update"]), ("planned", 1))
+        dead = rows["lnp-20261001T000000Z-dead"]
+        self.assertEqual((dead["status"], dead["summary"], dead["description"]), ("unknown", {}, "hand-edited"))
+        self.assertEqual(rows["lnp-20261001T000001Z-0dd0"]["status"], "unknown")  # the file name is the id
+        self.assertEqual(self.call("librenms_plans", status="planned")["count"], 1)
+        unknown = self.call("librenms_plans", status="unknown")["plans"]  # the status the listing shows them under
+        self.assertEqual(
+            sorted(row["plan_id"] for row in unknown), ["lnp-20261001T000000Z-dead", "lnp-20261001T000001Z-0dd0"]
+        )
 
     def test_secrets_never_reach_a_tool_result_or_an_audit_line(self):
         op = {"op": "update", "resource": "service", "id": 2, "data": {"desc": "Intranet SSO"}}

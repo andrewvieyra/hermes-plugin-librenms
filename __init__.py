@@ -28,8 +28,6 @@ _EMOJI = {
     "librenms_plans": "🗂️",
 }
 _REQUIRES_ENV = ["LIBRENMS_URL", "LIBRENMS_TOKEN"]
-# Hermes lists plugin skills in the system prompt; this keeps the workflow out of it while the tools are not there.
-_SKILL_FRONTMATTER = {"metadata": {"hermes": {"requires_toolsets": [_TOOLSET]}}}
 
 
 def register(ctx) -> None:
@@ -80,14 +78,18 @@ def register(ctx) -> None:
     except Exception as exc:  # host isolation, or an older Hermes without CLI registration
         logger.debug("librenms plugin: CLI command not registered: %s", exc)
 
+    # No requires_toolsets / requires_tools: Hermes checks them against the tools the model sees directly, and under
+    # its tool search (on by default) every plugin tool is deferred behind tool_search / tool_call, so a gate kept
+    # the skill out of the system prompt exactly where the model needs it to find the tools. The skill says what to
+    # do when they are deferred, and when they are missing.
     skill = _PLUGIN_DIR / "SKILL.md"
     if skill.exists():
         try:
             ctx.register_skill(
                 "workflow",
                 skill,
-                description="Query LibreNMS and plan, review, apply and roll back changes safely",
-                frontmatter=_SKILL_FRONTMATTER,
+                description="Look up LibreNMS devices, ports, alerts and logs, and plan, review, apply and roll back "
+                "changes safely",
             )
         except Exception as exc:
             logger.debug("librenms plugin: skill not registered: %s", exc)

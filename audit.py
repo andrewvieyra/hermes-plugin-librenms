@@ -127,7 +127,7 @@ def _from_ctx(name: str) -> Any:
 
 
 def _session_env(name: str) -> str:
-    try:
+    try:  # a private Hermes module: nothing public gives the user and chat fields (see CONTRIBUTING.md)
         from gateway.session_context import get_session_env  # type: ignore
 
         return get_session_env(name, "") or ""
@@ -148,7 +148,7 @@ def _truthy(value: str) -> bool:
 
 
 def _hermes_version() -> str | None:
-    try:
+    try:  # private, but the package metadata's version is stale on a git install (see CONTRIBUTING.md)
         from hermes_cli import __version__ as hv  # type: ignore
 
         return str(hv)

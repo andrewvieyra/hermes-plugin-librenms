@@ -6,6 +6,54 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-29
+
+### Fixed
+- `hermes librenms` exits with a status a script can test: 0 when the command did what it says, 1 when it failed,
+  was refused or named no single plan, 2 on a usage error, and anything but 0 is printed on stderr. It exited 0
+  every time, so `hermes librenms apply <id> && ...` went on after an apply that failed and was rolled back, an
+  unknown plan id, a refusal under `read_only` or from an agent's shell, or `LIBRENMS_*` unset. Apply and rollback
+  take the handler's `success` (an apply rolled back after a failure, or a rollback that left conflicts, is 1);
+  `check` fails when the plan is no longer applicable, `status` when LibreNMS cannot be reached, and
+  `hermes librenms` alone prints the help as a usage error. `hermes librenms --help` lists the statuses.
+- Status (`librenms_query {"action": "status"}`, `/librenms status`, `hermes librenms status`) shows the plugin
+  version, write mode, settings, settings errors and warnings also when LibreNMS cannot be configured or reached,
+  with the reason under `connection` (`ok`, `error`, `kind`) and `librenms` null; the tool result still fails. The
+  whole report was that one error, so a mistyped `write_mode: fulll`, read as `read_only`, stayed out of sight
+  until the connection was fixed, and then apply was refused.
+- One plan file without an `id` or a `status` (hand-edited, or damaged) no longer fails `librenms_plans` and
+  `/librenms plans` with a `KeyError`, which hid every plan from the listing used to find one to roll back. Each
+  plan is listed under the name of its file, which `show`, `apply` and `rollback` go by; a missing or malformed
+  status reads `unknown`, which is also the status the filter finds it by (`hermes librenms plans unknown`,
+  `librenms_plans` with `"status": "unknown"`), and a creation stamp that is not text is shown as it is.
+- Under Hermes' default tool search (`tools.tool_search.enabled: auto`), which defers every plugin tool behind
+  `tool_search`, `tool_describe` and `tool_call`, the `librenms:workflow` skill was left out of the system prompt:
+  its `requires_toolsets: [librenms]` gate is checked against the tools the model sees directly. The skill is now
+  registered without a gate (and `SKILL.md` without `requires_tools`), so it is offered whenever the plugin is
+  enabled; it says how to reach deferred tools through `tool_call`. Since that includes sessions where the
+  `librenms` toolset is turned off for the platform or task, it counts the tools missing only when
+  `tool_describe` and `tool_search` cannot find them, and then has the model tell the user both causes:
+  `LIBRENMS_URL` and `LIBRENMS_TOKEN` unset for the profile, or the toolset turned off (`hermes tools`).
+
+### Changed
+- Every tool description opens with a sentence of at most 60 characters that says what the tool answers or does,
+  because that sentence, cut at 60 characters, is all Hermes' deferred catalog shows the model: `librenms_query`
+  read "Read from LibreNMS through its v0 API (GET only, an…", which names no device, port or alert. It now reads
+  "Look up LibreNMS devices, ports, alerts, sensors and logs." Each description ends saying to invoke the tools
+  through `tool_call` when Hermes has deferred them.
+- Report times find the display zone as Hermes does (`HERMES_TIMEZONE`, except in a process serving several
+  profiles, else the profile's `timezone` setting) through Hermes' public `agent.secret_scope` and
+  `hermes_cli.config` instead of the private `hermes_time`. The two private imports left,
+  `gateway.session_context.get_session_env` and `hermes_cli.__version__`, have no public equivalent;
+  CONTRIBUTING.md says why they stay.
+
+### Added
+- Tests: the CLI's exit status and output stream for every subcommand; status with LibreNMS unconfigured and
+  unreachable; a damaged plan file among good ones, and found by the `unknown` status; the display zone with and
+  without Hermes, and against `hermes_time` itself; the skill naming both reasons the tools can be missing; and
+  through Hermes' real loader under the default tool search, that the tools are deferred, their catalog lines are
+  whole, the skill is offered, and an apply sent through `tool_call` still meets the approval hook.
+
 ## [0.1.3] - 2026-10-29
 
 ### Security

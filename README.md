@@ -85,7 +85,10 @@ hermes plugins enable librenms
 ```
 
 Start a new session. The tools show up in the `librenms` toolset and `/librenms status` confirms
-connectivity, the LibreNMS version, the write mode, and any setting it could not read.
+connectivity, the LibreNMS version, the write mode, and any setting it could not read; when LibreNMS
+cannot be configured or reached, it says why under `connection` and still shows the settings.
+If the model finds no LibreNMS tools, the variables are not set for the profile, or the `librenms`
+toolset is turned off for that platform: `hermes tools` turns it on.
 
 Manual install works too: clone this repository to `~/.hermes/plugins/librenms`, add the two
 variables to `<HERMES_HOME>/.env` (`~/.hermes/.env` for the default profile), and enable the plugin.
@@ -148,10 +151,11 @@ set it to about half the window's token count (`32000` for 64K tokens).
 A value that cannot be read as its setting's type fails closed: a flag takes the value that lets the
 model do least, a number its default (or its upper limit when it is too large), and an unknown
 `write_mode` becomes `read_only`, and a relative `audit_log_path` is the default path.
-`/librenms status` lists every such fallback. Settings are re-read on each call, so a change in
-`config.yaml` or the Desktop settings form applies without a restart. Retention is applied at most
-hourly per profile, when a plan is made or listed, on status and on every `/librenms` or `hermes
-librenms` command; for a strict policy, run `hermes librenms prune` from cron.
+`/librenms status` lists every such fallback, also while LibreNMS is unreachable. Settings are
+re-read on each call, so a change in `config.yaml` or the Desktop settings form applies without a
+restart. Retention is applied at most hourly per profile, when a plan is made or listed, on status
+and on every `/librenms` or `hermes librenms` command; for a strict policy, run `hermes librenms
+prune` from cron.
 
 Environment variables (connection only; nothing that relaxes a safeguard is read from the
 environment):
@@ -170,7 +174,7 @@ environment):
 
 | Tool | Writes | Purpose |
 |---|---|---|
-| `librenms_query` | no | Read any allowed API v0 GET path, or `{"action": "status"}` for connectivity, version and settings |
+| `librenms_query` | no | Look up devices, ports, alerts, sensors and logs through any allowed API v0 GET path, or `{"action": "status"}` for connectivity, version and settings |
 | `librenms_plan` | no | Validate and diff a list of operations; save a plan |
 | `librenms_apply` | yes | Apply a plan with preconditions, verified writes, a journal and auto-rollback; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or partially applied plan |
@@ -179,6 +183,13 @@ environment):
 The bundled skill `librenms:workflow` (see [SKILL.md](SKILL.md)) tells the model to query first,
 show the diff, ask, and apply only on an explicit yes, never in unattended contexts. The tool
 descriptions repeat that rule.
+
+Hermes' tool search (`tools.tool_search.enabled`, on by default) defers plugin tools: the model is
+given `tool_search`, `tool_describe` and `tool_call` and one catalog line per tool, the first sentence
+of its description. Each of those sentences says in 60 characters or fewer what the tool answers
+or does ("Look up LibreNMS devices, ports, alerts, sensors and logs."), and the skill, which is offered
+whenever the plugin is enabled, tells the model to reach deferred tools through `tool_call`. The
+approval prompt is unaffected: Hermes unwraps `tool_call` before its `pre_tool_call` hooks run.
 
 `librenms_query` takes a `path` relative to `/api/v0` (`devices`, `devices/core-sw1.example.net/ports`,
 `faults`, `rules`, `logs/syslog/edge-rtr1.example.net`), optional `params`, `fields` and `limit`. Only
@@ -272,6 +283,12 @@ full id remains the canonical form in files and tool output, and the only one th
 rollback accept. Text that
 came from LibreNMS is printed with control and bidirectional characters escaped, so a crafted
 `ifAlias` cannot rewrite your terminal.
+
+`hermes librenms` exits 0 when the command did what it says, 1 when it failed, was refused or named
+no single plan (an apply that failed, even once rolled back; a rollback that left conflicts; a `check`
+whose plan is no longer applicable; `status` while LibreNMS cannot be reached), and 2 on a usage
+error; anything but 0 is printed on stderr. So `hermes librenms check 7dde && hermes librenms apply
+7dde` stops at a conflict, and a script can tell an apply that went through from one that did not.
 
 ## Safety model
 

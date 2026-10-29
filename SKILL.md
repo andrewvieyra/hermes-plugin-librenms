@@ -1,11 +1,10 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.1.3
+version: 0.1.4
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
-    requires_tools: [librenms_query, librenms_plan]
 ---
 
 # LibreNMS change workflow
@@ -19,6 +18,18 @@ Five tools, one rule: **nothing is written to LibreNMS without a plan the user h
 | `librenms_apply` | yes | Execute a reviewed plan step by step; automatic rollback on failure; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or failed plan from its journal, newest step first |
 | `librenms_plans` | no | List plans, or show one plan's diff, journal and rollback outcome |
+
+If no `librenms_*` tool is in your tool list, Hermes has most likely deferred them behind its tool catalog,
+which need not list them by name: call `tool_describe` once with the names you need (or `tool_search` for
+`librenms`), then invoke each through `tool_call`
+(`{"calls": [{"name": "librenms_query", "arguments": {"action": "status"}}]}`). Everything below applies as
+written. Treat them as missing only when `tool_describe` reports them `not_found` and `tool_search` finds
+none, or when you have no `tool_search` at all. The LibreNMS tools are then not available in this session,
+for one of two reasons: `LIBRENMS_URL` and `LIBRENMS_TOKEN` are not set in this profile's `.env`, or the
+`librenms` toolset is turned off for this platform or task (`hermes tools` turns it on). Tell the user both,
+so they can fix the one that applies and start a new session, and stop: do not reach LibreNMS another way
+(a terminal, code, a browser). When only `librenms_apply` and `librenms_rollback` are missing, `write_mode`
+is `read_only` (see Write modes).
 
 ## Procedure
 
@@ -188,7 +199,9 @@ window early, so keep it as short as the work.
 
 ## Operator settings
 
-`librenms_query {"action": "status"}` shows them. What they mean for you:
+`librenms_query {"action": "status"}` shows them, also when LibreNMS cannot be reached: the result then fails,
+`connection` says why, and `write_mode`, `settings` and `settings_errors` still tell you what the operator set
+(a setting it could not read has fallen back, so tell them). What they mean for you:
 
 - Gates: `allow_delete`, `allow_device_add`, `allow_services`. A refused plan names the setting; tell the
   user, do not work around it. `allow_insecure_transport` concerns the connection, not you.

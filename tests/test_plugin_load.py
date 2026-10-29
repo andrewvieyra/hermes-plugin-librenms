@@ -8,10 +8,12 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 from .base import PluginTestCase, _restore_env
+from .fake_librenms import TOKEN, seeded
 from .helpers import load_plugin, submodule
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +117,9 @@ class RegisterWithAFakeContext(PluginTestCase):
         self.assertIs(cli["handler_fn"], self.commands.cli_handler)
         [(name, path, options)] = ctx.skills
         self.assertEqual((name, path), ("workflow", REPO_ROOT / "SKILL.md"))
-        self.assertEqual(options["frontmatter"], {"metadata": {"hermes": {"requires_toolsets": ["librenms"]}}})
+        # no requires_toolsets: under Hermes' tool search the tools are deferred and such a gate hid the skill
+        self.assertEqual(options.get("frontmatter") or {}, {})
+        self.assertIn("ports", options["description"])
         self.assertEqual((self.clients, self.fake.calls), ([], []))  # registration makes no client, so no I/O
 
     def test_schemas_fit_the_budget(self):
@@ -237,10 +241,15 @@ class LoadThroughPluginManager(unittest.TestCase):
         for name in ("HERMES_SESSION_ID", "HERMES_SESSION_KEY"):
             os.environ.pop(name, None)
         self.mgr = None
+        self.discovered = False
 
     def tearDown(self):
         if self.mgr is not None:
             self.mgr.unload("librenms")  # the tool registry is process-wide
+        if self.discovered:  # the profile's own manager loaded every enabled and bundled plugin: unload them all
+            from hermes_cli import plugins
+
+            plugins._reset_plugin_managers_for_tests()
         os.environ.clear()
         os.environ.update(self._env)
         for name in [k for k in sys.modules if k.split(".")[0] == "hermes_plugins"]:
@@ -271,7 +280,7 @@ class LoadThroughPluginManager(unittest.TestCase):
             self.assertEqual(registry.get_toolset_for_tool(name), "librenms")
         self.assertIsNotNone(mgr.find_plugin_skill("librenms:workflow"))
         [skill] = [s for s in mgr.list_plugin_skill_metadata() if s["name"] == "librenms:workflow"]
-        self.assertEqual(skill["frontmatter"]["metadata"]["hermes"]["requires_toolsets"], ["librenms"])
+        self.assertEqual(skill["frontmatter"], {})
 
         # settings flowed from config.yaml into the plugin, and the bad one fell back
         mod = sys.modules["hermes_plugins.librenms"]
@@ -293,6 +302,71 @@ class LoadThroughPluginManager(unittest.TestCase):
         )
         self.assertEqual(directive, {"action": "block", "message": "unknown plan_id 'lnp-nope'"})
         self.assertEqual(mgr.invoke_hook("pre_tool_call", tool_name="web_search", args={"query": "x"}), [])
+
+    def test_under_the_default_tool_search_the_tools_are_deferred_yet_found_and_approved(self):
+        # tools.tool_search.enabled is "auto" by default: the model is given tool_search / tool_describe / tool_call
+        # and a catalog line per plugin tool, the first sentence of its description cut at 60 characters
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()  # the profile's own manager, which the skill index reads (not a private one)
+        self.discovered = True
+        self.mgr = get_plugin_manager()
+        import model_tools
+        from agent import prompt_builder
+        from agent.tool_executor import _unwrap_tool_search_call
+        from tools.registry import registry
+        from tools.tool_search_catalog import _short_desc
+
+        defs = model_tools.get_tool_definitions(enabled_toolsets=["librenms", "skills"], quiet_mode=True)
+        names = {d["function"]["name"] for d in defs}
+        self.assertTrue(names.isdisjoint(TOOLS), names)
+        self.assertIn("tool_call", names)
+        [catalog] = [d["function"]["description"] for d in defs if d["function"]["name"] == "tool_search"]
+        # the profile's manager may load it as hermes_plugins.librenms__home_<digest>: find it by its handler
+        plugin = sys.modules[registry.get_entry("librenms_plan").handler.__module__.rpartition(".")[0]]
+        for schema in plugin.schemas.ALL:  # each line says what the tool answers or does, uncut
+            first = schema["description"].split(". ")[0] + "."
+            self.assertEqual(_short_desc(schema["description"]), first)
+            self.assertIn(f"- {schema['name']}: {first}", catalog)
+
+        # the workflow skill is still offered, and tells the model how to reach the deferred tools
+        toolsets = {model_tools.get_toolset_for_tool(name) for name in names} - {None, ""}
+        index = prompt_builder.build_skills_system_prompt(available_tools=names, available_toolsets=toolsets)
+        self.assertIn("librenms:workflow", index)
+
+        # Hermes unwraps tool_call before pre_tool_call, so an apply through the bridge meets the approval prompt
+        fake = seeded()
+        client = plugin.client.LibreNMSClient(fake.base_url, TOKEN, session=fake)
+        plugin.handlers.set_client_factory(lambda: client)
+        operation = {"op": "update", "resource": "device", "id": 1, "data": {"purpose": "spine"}}
+        planned = json.loads(registry.dispatch("librenms_plan", {"description": "t", "operations": [operation]}))
+        plan_id = planned["plan_id"]
+        agent = types.SimpleNamespace(enabled_toolsets=["librenms"], disabled_toolsets=None)
+        call = {"calls": [{"name": "librenms_apply", "arguments": {"plan_id": plan_id}}]}
+        unwrapped = _unwrap_tool_search_call(agent, "tool_call", call)
+        self.assertEqual(unwrapped, ("librenms_apply", {"plan_id": plan_id}, None))
+        [directive] = self.mgr.invoke_hook(
+            "pre_tool_call", tool_name=unwrapped[0], args=unwrapped[1], task_id="t", session_id="s"
+        )
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn(f"librenms:librenms_apply:{plan_id}:", directive["rule_key"])
+        self.assertEqual(fake.writes(), [])
+
+    def test_report_times_use_the_zone_hermes_uses(self):
+        # timefmt rebuilds hermes_time.get_timezone from public modules; both must name the same zone
+        import hermes_time
+
+        timefmt = submodule("timefmt")
+        config = self.home / "config.yaml"
+        config.write_text(config.read_text() + "timezone: Asia/Kolkata\n")
+        os.environ.pop("HERMES_TIMEZONE", None)
+        hermes_time.reset_cache()
+        self.assertEqual((str(timefmt.get_zone()), timefmt.get_zone()), ("Asia/Kolkata", hermes_time.get_timezone()))
+        os.environ["HERMES_TIMEZONE"] = "Pacific/Auckland"
+        hermes_time.reset_cache()
+        self.assertEqual(
+            (str(timefmt.get_zone()), timefmt.get_zone()), ("Pacific/Auckland", hermes_time.get_timezone())
+        )
 
 
 def _restore_module(name, module):

@@ -31,11 +31,11 @@ v0 route to what the plugin does with it.
 | `store` | Atomic `0600` JSON persistence of plans in `0700` directories, the cross-process claim lock, per-plan run locks, retention, the active profile's key | Hermes `plugin_storage`, `hermes_constants` (optional) |
 | `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl` | Hermes `gateway.session_context` (optional) |
 | `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread per Hermes profile; the warning about a credential written into `config.yaml` | `settings`, `store`, Hermes `hermes_cli.config` (optional) |
-| `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only | Hermes `hermes_time` (optional) |
+| `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
 | `settings` | Operator settings with fail-closed coercion | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |
 | `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam; result shaping (alert rows, envelope extras, keyed objects) and the result budget, with plans shown a range of steps at a time | everything above |
-| `commands` | `/librenms` and `hermes librenms` built on the handlers | `handlers` |
+| `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
 | `__init__` | `register(ctx)` | all |
 
 Dependencies point downward only. The engine (`client`, `redact`, `routes`, `diff`, `resources`,
@@ -469,6 +469,22 @@ for the re-read to settle, not a second request.
 - Tools are registered with `requires_env` and a `check_fn`, so they are hidden from the model when
   `LIBRENMS_URL` / `LIBRENMS_TOKEN` are missing; `librenms_apply` and `librenms_rollback` are also
   hidden while `write_mode` is `read_only`.
+- Under Hermes' tool search (`tools.tool_search.enabled`, `auto` by default) every plugin tool is
+  deferred: the model's tool list holds `tool_search`, `tool_describe` and `tool_call`, and a catalog
+  line per deferred tool, the first sentence of its description cut at 60 characters. Each
+  description therefore opens with a sentence of at most 60 characters ending in a period that says
+  what the tool answers or does, and ends saying to invoke the tools through `tool_call` when they
+  are deferred. Hermes unwraps `tool_call` before `pre_tool_call`, so the approval hook sees
+  `librenms_apply` either way.
+- The `librenms:workflow` skill is registered without `requires_toolsets` or `requires_tools`: Hermes
+  checks those against the tools the model sees directly, so under tool search such a gate left the
+  skill out of the system prompt. It is offered whenever the plugin is enabled, so also in a session
+  where the `librenms` toolset is turned off for the platform (`hermes tools`) or the task, and says
+  what to do when the tools are deferred or missing. A catalog listing in groups, or no listing at
+  all, does not name each tool, so the skill counts the tools missing only when `tool_describe` and
+  `tool_search` do not find them (or there is no `tool_search`). It then names both causes for the
+  user, `LIBRENMS_URL` / `LIBRENMS_TOKEN` unset for the profile or the toolset turned off, and tells
+  the model not to reach LibreNMS another way.
 - Handlers follow the contract `handler(args, **kwargs) -> str` and never raise; an unexpected
   exception becomes an error id, with the detail in the log.
 - A result for the model stays within `max_result_chars` (default 60,000 characters). Hermes saves
@@ -495,6 +511,20 @@ for the re-read to settle, not a second request.
   reading another profile's value.
 - With `plugins.isolation: host`, Hermes skips CLI command registration inside the host, so
   `hermes librenms` is unavailable there; `/librenms` and the tools still work.
+- Hermes exits with the int a CLI handler returns. `hermes librenms` returns 0 when the command did
+  what it says, 1 when it failed, was refused, found its plan no longer applicable, could not reach
+  LibreNMS (`status`) or named no single plan, and 2 on a usage error, printing anything but 0 on
+  stderr. Apply and rollback take the handler's `success`, so an apply that failed and was rolled
+  back, or a rollback that left conflicts, is 1.
+- Status never fails as a whole: when LibreNMS cannot be configured or reached, `connection` says why
+  (`ok: false`, the scrubbed error and its kind), `librenms` is null, and the plugin version, write
+  mode, settings, settings errors and warnings are still there (the tool result keeps `success:
+  false`).
+- Private Hermes imports: `hermes plugins validate` names two, both lazy and guarded, which have no
+  public equivalent: `gateway.session_context.get_session_env` (the actor's user and chat fields)
+  and `hermes_cli.__version__` (the Hermes version each plan records; the package metadata version
+  is stale on a git install). The display zone is resolved from public modules (`agent.secret_scope`,
+  `hermes_cli.config`), as `hermes_time` resolves it.
 
 ## Audit
 

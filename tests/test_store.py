@@ -429,6 +429,24 @@ class Listing(StoreTestCase):
         self.assertEqual(len(self.store.list(limit=2)), 2)
         self.assertEqual(len(self.store.list(limit=0)), 1)
 
+    def test_list_names_each_plan_by_its_file(self):
+        # load, resolve and prune go by the file name; an edited file's own id, or none, must not hide the plan
+        self.write_raw({"description": "hand-edited"}, name="lnp-20261028T190000Z-dead")
+        self.write_raw(_plan("lnp-somewhere-else"), name="lnp-20261028T190001Z-0001")
+        listed = self.store.list(limit=50)
+        self.assertEqual(
+            [(p["id"], p.get("status")) for p in listed],
+            [("lnp-20261028T190001Z-0001", "planned"), ("lnp-20261028T190000Z-dead", None)],
+        )
+        self.assertEqual(self.store.load(listed[0]["id"])["id"], "lnp-somewhere-else")  # the file is left as it is
+        # a status left out, or not text, is listed as unknown, and that is what the filter finds it by
+        self.write_raw({"status": ["x"]}, name="lnp-20261028T185959Z-0dd0")
+        self.assertEqual(
+            sorted(p["id"] for p in self.store.list(status="unknown", limit=50)),
+            ["lnp-20261028T185959Z-0dd0", "lnp-20261028T190000Z-dead"],
+        )
+        self.assertEqual([p["id"] for p in self.store.list(status="planned")], ["lnp-20261028T190001Z-0001"])
+
     def test_resolve_exact_suffix_and_case(self):
         for plan_id in ("lnp-20261028T190000Z-4f1a", "lnp-20261028T190100Z-9c2e", "lnp-20261028T190200Z-19c2e"):
             self.store.create(_plan(plan_id))

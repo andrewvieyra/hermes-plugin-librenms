@@ -23,12 +23,20 @@ from typing import Any, Dict, Iterator, List, Tuple
 PLUGIN_NAME = "librenms"
 PREFIX = "lnp"
 IN_FLIGHT = ("applying", "rolling_back")
+UNKNOWN_STATUS = "unknown"  # what a plan file without a usable status (hand-edited, damaged) is listed and found as
 MIN_FRAGMENT = 4  # hex digits in a plan id's random suffix
 # A plan can carry a lone surrogate (a JSON tool argument may hold "\ud800"), which UTF-8 cannot encode.
 # json.dumps only leaves one inside a JSON string, where backslashreplace writes it as that escape again, so the
 # plan is saved whole and reads back the same.
 _ENCODE_ERRORS = "backslashreplace"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def plan_status(plan: Dict[str, Any]) -> str:
+    """A plan's status as the listings show it and ``status`` filters it: :data:`UNKNOWN_STATUS` when the file
+    leaves it out or holds something other than text, so the label an operator reads is one they can filter on."""
+    status = plan.get("status")
+    return status if isinstance(status, str) and status else UNKNOWN_STATUS
 
 
 class RunLockBusy(RuntimeError):
@@ -274,8 +282,15 @@ class PlanStore:
         return found
 
     def list(self, status: str | None = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """The newest *limit* plans, those whose :func:`plan_status` is *status* only when it is given. Each carries
+        as ``id`` the name of its file, which :meth:`load` and :meth:`resolve` go by, whatever an edited file says or
+        leaves out."""
         with self._lock:
-            plans = [plan for _path, plan in self._documents() if not status or plan.get("status") == status]
+            plans = [
+                {**plan, "id": path.stem}
+                for path, plan in self._documents()
+                if not status or plan_status(plan) == status
+            ]
         plans.sort(key=lambda p: str(p.get("created_at") or ""), reverse=True)  # an edited stamp never crashes
         return plans[: max(1, limit)]
 

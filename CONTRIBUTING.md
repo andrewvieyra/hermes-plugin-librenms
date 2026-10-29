@@ -8,6 +8,14 @@ third-party product integrations into its core tree, so this is the place for Li
 - Keep the engine (`client`, `redact`, `routes`, `diff`, `resources/*`, `planner`, `executor`,
   `store`) free of Hermes imports at module load. Hermes imports are lazy and guarded with
   `try/except Exception`. That is what keeps the engine testable without a Hermes checkout.
+- Import only what Hermes documents for plugins (`hermes plugins validate` lists the rest). Two
+  private imports remain, because Hermes offers no public way to the same data:
+  `gateway.session_context.get_session_env` in `audit.py` (the user and chat fields of the actor
+  record; the context already gives the surface, profile and cron execution) and
+  `hermes_cli.__version__` in `audit.py` (`importlib.metadata.version("hermes-agent")` reports a
+  stale version on a git install). Both stay lazy and guarded, so a Hermes that moves them costs
+  those fields, not the call. Rebuild anything else from public modules, as `timefmt` does
+  `hermes_time.get_timezone`.
 - Every write goes through a plan: `planner.build_plan` to build it, `executor.apply_plan` and
   `executor.rollback_plan` to run it. Do not send a non-GET request from anywhere else, and never
   from `librenms_query`, whose routes are GETs only (a GET that changes state, like
