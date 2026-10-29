@@ -867,6 +867,15 @@ class Errors(unittest.TestCase):
         self.assertTrue(exc.to_dict()["body"]["message"].endswith("… [truncated 500 chars]"))
         self.assertEqual(client_mod.ConfigError("x").to_dict()["kind"], "config")
 
+    def test_error_text_is_cut_by_what_it_takes_escaped_and_kept_raw(self):
+        # 400 and 500 characters as the model reads them; raw still, so a step's secrets can be scrubbed from it
+        tag = chr(0xE0078)  # ten characters escaped
+        exc = self.error(Resp(400, {"status": "error", "message": tag * 1000}))
+        self.assertEqual(str(exc), "GET /api/v0/devices/sw1 -> HTTP 400: " + tag * 40)
+        self.assertEqual(exc.to_dict()["body"]["message"], tag * 50 + "… [truncated 9500 chars]")
+        exc = self.error(Resp(400, raw=("\u200b" * 2000).encode(), headers={}))
+        self.assertEqual(exc.to_dict()["body"], "\u200b" * 83)  # 498: an 84th would take 504
+
 
 class Bodies(unittest.TestCase):
     def test_a_read_stops_at_the_byte_cap(self):

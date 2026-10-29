@@ -26,7 +26,7 @@ from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Callable, Dict, List, Tuple
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
-from .redact import clip, scrub_token, scrub_values
+from .redact import clip, cut, scrub_token, scrub_values
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -103,12 +103,14 @@ class LibreNMSError(Exception):
         self.kind = kind or self.KIND
 
     def to_dict(self) -> Dict[str, Any]:
-        """Structured form for tool results and journals; the body was scrubbed when the error was made."""
+        """Structured form for tool results and journals; the body was scrubbed when the error was made. Its text is
+        kept as LibreNMS wrote it, cut to 500 characters as escaped (:func:`redact.clip`, :func:`redact.cut`), which
+        bounds what the model reads of it."""
         body = self.body
         if isinstance(body, (dict, list)):
             body = clip(body, 500)
         elif body is not None:
-            body = str(body)[:500] or None
+            body = cut(str(body), 500) or None
         return {
             "message": str(self),
             "status": self.status,
@@ -569,7 +571,9 @@ def _location(raw: str | None, url: str) -> str:
 
 
 def _summary(body: Any) -> str:
-    """One line from LibreNMS's error shapes: ``{"message": "..."}``, a 422 ``{"message": {field: [...]}}``, or text."""
+    """One line from LibreNMS's error shapes: ``{"message": "..."}``, a 422 ``{"message": {field: [...]}}``, or text;
+    at most 400 characters as escaped (:func:`redact.cut`), and raw still, so a step's secrets can be scrubbed from
+    it."""
     if isinstance(body, dict):
         message = body.get("message")
         if isinstance(message, dict):
@@ -585,7 +589,7 @@ def _summary(body: Any) -> str:
         text = "; ".join(map(str, body))
     else:
         text = " ".join(str(body or "").split())
-    return text[:400]
+    return cut(text, 400)
 
 
 def _withheld(body: Any) -> bool:

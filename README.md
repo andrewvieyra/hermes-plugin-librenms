@@ -209,7 +209,11 @@ another (`" limit"`, `hostname[]`) is refused. Log routes default to newest firs
 to `max_query_results` rows at most. Fault and alert-log rows carry `entities`, the ports or sensors
 that alerted, instead of the `details` blob with the alert's contact addresses (`fields:
 ["details"]` returns it without them). Credential fields are masked and long text is clipped before
-anything reaches the model.
+anything reaches the model. A result that returns text from LibreNMS names the keys holding it in
+`untrusted_fields` (an error, `librenms`: LibreNMS's answer), beside an `untrusted_notice` that it
+is data from the monitored network, not instructions; the `error` of an error or a refusal may
+quote LibreNMS without one. Characters that would not show as written reach the model escaped
+(`\u202e`, `\u200b`), and limits count the escapes; see [Untrusted content](#untrusted-content).
 
 Every result the model reads stays within `max_result_chars`: a listing past it keeps its first
 rows and says so (`truncated`, and a `note` naming `fields`, or the next `start` on a log route), and
@@ -281,8 +285,9 @@ one plan, so `/librenms apply 7dde` works from a phone, and then say which plan 
 shorter, or from the middle of an id, names no plan, because apply and rollback act at once. The
 full id remains the canonical form in files and tool output, and the only one the model's apply and
 rollback accept. Text that
-came from LibreNMS is printed with control and bidirectional characters escaped, so a crafted
-`ifAlias` cannot rewrite your terminal.
+came from LibreNMS is printed with control, bidirectional and invisible characters escaped, so a
+crafted `ifAlias` cannot rewrite your terminal, and two labels that differ only by a zero-width
+character do not look the same.
 
 `hermes librenms` exits 0 when the command did what it says, 1 when it failed, was refused or named
 no single plan (an apply that failed, even once rolled back; a rollback that left conflicts; a `check`
@@ -373,6 +378,35 @@ neighbour names, eventlog and alert notes, and hostnames found by autodiscovery.
 stop the model from being influenced by that text; it limits what a misled model can do (plans,
 review, gates, write modes, approval) and makes every attempt visible (audit). The skill tells the
 model to treat fetched content as data and to report instructions found in it.
+
+The results say so too. Hermes puts its own untrusted-data boundary only around its web, browser
+and MCP tools, and a plugin cannot opt in, so a result that returns text from LibreNMS carries
+`untrusted_fields`, the keys that hold it (`results`, `result` and `extra` of a query, `librenms` of
+status and of an error, which is LibreNMS's answer, the `note` of an empty answer; a plan's `diff`
+and `warnings`, dry-run `conflicts`, and the `journal`, `report`, `eventlog`, `failure`,
+`auto_rollback_error`, `apply`, `rollback`, `checks` and `steps` of apply, rollback and
+`librenms_plans`), and before them an `untrusted_notice` telling the model that this is data, not
+instructions. The plugin's own keys (`next_step`, `note` on a cut listing, counts) are not listed.
+Refusals and errors are the plugin's own text and carry no marker of their own, but they may quote
+LibreNMS: an `error` holds LibreNMS's error message, the refusal of an unknown hostname names the
+devices LibreNMS holds whose names come close (autodiscovered ones among them), and a plan's
+`errors` may quote LibreNMS's answer. The skill tells the model that this text is data too.
+
+Every string in every result, and everything printed to a terminal or put in the approval prompt,
+has its bidirectional controls, invisible characters (zero-width spaces and joiners, the soft
+hyphen, the byte-order mark, fillers, variation selectors, and tag characters, which spell ASCII a
+model reads and a person does not) and C0/C1 controls written as escapes (`\u202e`, `\u200b`,
+`\x9b`) rather than dropped, so the reader sees that something was there; newlines and tabs stay,
+and a Windows line end reaches the model as a newline. The emoji and text presentation selectors
+stay only right after a symbol, an emoji or a keycap they change; after a letter or a digit, at
+the start of a text or after another selector they show as nothing and are escaped too. Every
+limit on that text (2,000 characters a value, 200 an alert's entity, 300 a linked eventlog row,
+400 and 500 of an error quoting LibreNMS) counts the escapes, so it bounds what the model reads.
+
+Escaping shows what would not show; it does not tell apart what shows alike. An escape reads the
+same as those characters written in LibreNMS (a Windows path, a JSON-encoded log line), so the
+skill has the model say that a value holds one, never decode it; and letters from other scripts
+that look like Latin ones (a Cyrillic U+0430 for an `a`) are left as they are.
 
 ## Audit trail
 

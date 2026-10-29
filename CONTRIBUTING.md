@@ -36,6 +36,13 @@ third-party product integrations into its core tree, so this is the place for Li
   credentials travel as `{"env": "LIBRENMS_SNMP_<NAME>"}` references resolved inside `execute`;
   error text passes through `redact.scrub_text` with the step's sensitive values; tool results go
   through `redact.mask`. The token appears only in the `X-Auth-Token` header.
+- Text from LibreNMS reaches the model as data. Handlers serialise through `_json`, which escapes
+  every string with `redact.visible`; text from LibreNMS goes through `redact.for_model` (masked,
+  escaped, then clipped), and a result that returns it names the keys holding it with
+  `redact.mark_untrusted`. A new key that carries LibreNMS text joins that list; the plugin's own
+  guidance (`next_step`, a `note` on how to read on) stays out of it. Bound LibreNMS text with
+  `redact.clip` or `redact.cut`, which count a character as long as its escape, never with a slice.
+  Terminals and the approval prompt get `redact.printable` / `redact.one_line`.
 - Handlers return JSON strings and never raise. Hook callbacks never raise and accept `**kwargs`.
 - Settings fail closed: a value that cannot be read becomes the one that lets the model do least,
   and the fallback is recorded in `Settings.errors`.

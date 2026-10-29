@@ -2,8 +2,9 @@
 callbacks.
 
 Handlers are thin. They parse arguments, obtain a client and the plan store, call the planner or executor, and shape
-the result; every result passes through :func:`redact.mask` on its way out. Everything here is also reachable from
-the ``/librenms`` slash command and the ``hermes librenms`` CLI through :mod:`commands`.
+the result; every result passes through :func:`redact.mask` and :func:`redact.visible` on its way out, and one that
+returns text from LibreNMS names the keys holding it (:func:`redact.mark_untrusted`). Everything here is also
+reachable from the ``/librenms`` slash command and the ``hermes librenms`` CLI through :mod:`commands`.
 
 The hooks put ``librenms_apply`` and ``librenms_rollback`` in front of Hermes' approval prompt with a summary of the
 plan they would run (``pre_tool_call``, audited as ``approval_requested``; a plan id that names no saved plan is
@@ -28,9 +29,16 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from . import audit, sinks
 from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
-from .executor import ExecutionRefused, apply_plan, pending_entries, render_journal, rollback_plan
+from .executor import (
+    EVENTLOG_MESSAGE_CHARS,
+    ExecutionRefused,
+    apply_plan,
+    pending_entries,
+    render_journal,
+    rollback_plan,
+)
 from .planner import DESCRIPTION_CHARS, PlanError, build_plan, render_plan
-from .redact import clip, for_model, mask, one_line
+from .redact import clip, for_model, mark_untrusted, mask, one_line, visible
 from .resources import get_resource
 from .routes import QueryError, Route, prepare, too_large_hint
 from .settings import Settings, get_settings
@@ -86,7 +94,8 @@ _COUNTED = ("create", "update", "delete", "action")
 # Envelope keys that carry no data of their own: LibreNMS's api_success puts them around every result.
 _ENVELOPE_KEYS = frozenset({"status", "message", "count", "total"})
 # What a fault or alert-log row shows of the rows its rule matched (``details.rule``): the keys that name the port,
-# sensor, processor, storage, service or BGP peer it is about, at most ENTITY_ROWS rows of ENTITY_CHARS each.
+# sensor, processor, storage, service or BGP peer it is about, at most ENTITY_ROWS rows of ENTITY_CHARS each as
+# escaped (redact.clip), so a label of characters that show as nothing cannot take a listing's room.
 # ``details`` itself holds every column of every table the rule joins and the alert's contacts (e-mail addresses),
 # for every matched row, so it is returned only when ``fields`` names it, and never with its contacts.
 ENTITY_KEYS = (
@@ -106,6 +115,23 @@ ENTITY_KEYS = (
 )
 ENTITY_ROWS = 10
 ENTITY_CHARS = 200
+# The keys of a plan, apply, rollback or plan-detail result that hold text from LibreNMS: labels and the values the
+# diff compares, the notes in warnings and dry-run conflicts, LibreNMS's errors in the journal, the failure and the
+# report, the linked eventlog rows, and the objects' states in the steps. A result names those it holds
+# (redact.mark_untrusted); the rest (plan id, status, counts, next_step) is the plugin's own.
+_PLAN_TEXT = (
+    "diff",
+    "warnings",
+    "checks",
+    "failure",
+    "eventlog",
+    "apply",
+    "rollback",
+    "journal",
+    "report",
+    "auto_rollback_error",
+    "steps",
+)
 # "[12] note" in a plan's warnings: the step the warning is about
 _STEP_WARNING_RE = re.compile(r"^\[(\d+)\] ")
 _PRUNE_INTERVAL = 3600.0
@@ -335,18 +361,24 @@ def status_report(settings: Settings | None = None) -> Dict[str, Any]:
 # -- plumbing -------------------------------------------------------------------------------------
 
 
-def _json(payload: Dict[str, Any]) -> str:
+def _json(payload: Any) -> str:
     """Serialise a tool result. Credential-bearing keys are masked at any depth: steps and journals carry what
-    LibreNMS returned (the plan file on disk stays unmasked, rollback needs it)."""
-    return json.dumps(mask(payload), ensure_ascii=False, default=str)
-
-
-def _ok(**payload: Any) -> str:
-    return _json({"success": True, **payload})
+    LibreNMS returned (the plan file on disk stays unmasked, rollback needs it). Every string, the plugin's own
+    included, is escaped as the model should read it (:func:`redact.visible`), whatever way it took into the result
+    (a row, a plan's diff, a journal error, an error quoting LibreNMS's answer): no bidirectional override, invisible
+    character or control from LibreNMS reaches the model, or a terminal it is quoted to, as it is."""
+    return json.dumps(visible(mask(payload)), ensure_ascii=False, default=lambda obj: visible(str(obj)))
 
 
 def _fail(message: str, **extra: Any) -> str:
     return _json({"success": False, "error": message, **extra})
+
+
+def _librenms_failed(message: str, exc: LibreNMSError) -> str:
+    """An error result with LibreNMS's answer (:meth:`LibreNMSError.to_dict`) under ``librenms``, named as text from
+    LibreNMS (:func:`redact.mark_untrusted`): its message and body are what LibreNMS said, which a device or another
+    person may have written. *message* stays the plugin's ``error``."""
+    return _json(mark_untrusted({"success": False, "error": message, "librenms": exc.to_dict()}, "librenms"))
 
 
 def guarded(fn: Callable[..., str]) -> Callable[..., str]:
@@ -364,7 +396,7 @@ def guarded(fn: Callable[..., str]) -> Callable[..., str]:
         except ExecutionRefused as exc:
             return _fail(str(exc), refused=True)
         except LibreNMSError as exc:
-            return _fail(str(exc), librenms=exc.to_dict())
+            return _librenms_failed(str(exc), exc)
         except Exception as exc:  # never let a handler raise into the agent loop
             error_id = new_error_id()
             logger.error("librenms %s: unexpected %s (%s)", fn.__name__, type(exc).__name__, error_id, exc_info=exc)
@@ -451,10 +483,8 @@ def _budget(settings: Settings, kwargs: Dict[str, Any]) -> int | None:
 
 
 def _size(value: Any) -> int:
-    """Characters *value* takes in a tool result (:func:`_json`)."""
-    return (
-        len(_json(value)) if isinstance(value, dict) else len(json.dumps(mask(value), ensure_ascii=False, default=str))
-    )
+    """Characters *value* takes in a tool result (:func:`_json`), escapes included."""
+    return len(_json(value))
 
 
 def _fit_rows(payload: Dict[str, Any], key: str, budget: int | None, note: Callable[[int, int], str]) -> Dict[str, Any]:
@@ -659,10 +689,18 @@ def _eventlog(eventlog: Any, entries: List[Dict[str, Any]], key: str, compact: b
     every = {row.get("event_id") for rows in eventlog["devices"].values() for row in rows if isinstance(row, dict)}
     devices = {}
     for device, rows in eventlog["devices"].items():
-        kept = [row for row in rows if isinstance(row, dict) and row.get("event_id") in wanted]
+        kept = [_event_row(row) for row in rows if isinstance(row, dict) and row.get("event_id") in wanted]
         if kept or every <= wanted:  # the whole journal is shown: every device, also one without new rows
             devices[device] = len(kept) if compact else kept
     return {**eventlog, "devices": devices}
+
+
+def _event_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A linked eventlog row with its message within :data:`EVENTLOG_MESSAGE_CHARS` as escaped. The executor stores
+    it cut so, and clipping it again changes nothing; a plan linked by 0.1.x holds it cut by its raw length, which
+    characters that show as nothing make ten times longer escaped."""
+    message = row.get("message")
+    return {**row, "message": clip(message, EVENTLOG_MESSAGE_CHARS)} if isinstance(message, str) else row
 
 
 def _phase(record: Any, entries: List[Dict[str, Any]], key: str, compact: bool) -> Any:
@@ -686,7 +724,7 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
         report = status_report(settings)
         if not report["connection"]["ok"]:  # still a failure, with the settings that may explain it
             return _fail(report["connection"]["error"], **report)
-        return _ok(**report)
+        return _json(mark_untrusted({"success": True, **report}, "librenms"))
     if action != "get":
         return _fail(f"action must be get or status (got {action[:40]!r})")
     fields = args.get("fields")
@@ -714,22 +752,23 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
         body = client.get(prepared.request_path, prepared.params or None)
     except LibreNMSError as exc:
         if exc.kind == "too_large":  # the client's advice is generic; on most routes limit would fail alike
-            return _fail(f"{exc}: {too_large_hint(route, prepared.path)}", librenms=exc.to_dict())
+            return _librenms_failed(f"{exc}: {too_large_hint(route, prepared.path)}", exc)
         if exc.kind != "not_found":
             raise
         # LibreNMS answers an empty list with a 404 and a message ("No ports found")
         note = exc.body.get("message") if isinstance(exc.body, dict) else None
-        return _ok(**where, count=0, returned=0, truncated=False, results=[], note=for_model(note or str(exc)))
+        empty = {"success": True, **where, "count": 0, "returned": 0, "truncated": False, "results": []}
+        return _json(mark_untrusted({**empty, "note": for_model(note or str(exc))}, "note"))
     budget = _budget(settings, kwargs)
     value = LibreNMSClient.result(body, route.list_key) if route.list_key else body
     rows = value if isinstance(value, list) else _keyed_rows(value)
     if rows is not None:
         start = int(prepared.params["start"]) if route.paginated else 0
         listing = {"success": True, **where, **_listing(rows, body, fields, prepared.limit, start, route)}
-        return _json(
-            _fit_rows({**listing, **_extra(body, route)}, "results", budget, _query_note(route, budget, start))
-        )
+        listing = mark_untrusted({**listing, **_extra(body, route)}, "results", "extra")
+        return _json(_fit_rows(listing, "results", budget, _query_note(route, budget, start)))
     payload = {"success": True, **where, "result": for_model(_project(value, fields)), **_extra(body, route)}
+    payload = mark_untrusted(payload, "result", "extra")
     if budget is not None and _size(payload) > budget:
         return _fail(
             f"the result is {_size(payload)} characters, more than max_result_chars allows ({budget}); name only the "
@@ -804,7 +843,7 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
             **irreversible,
             "next_step": next_step,
         }
-        return _paging(payload, start, end, total)
+        return _paging(mark_untrusted(payload, *_PLAN_TEXT), start, end, total)
 
     return _json(_window(build, 0, total, _budget(settings, kwargs)))
 
@@ -853,7 +892,8 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
             return _fail(f"plan {plan['id']} is {plan.get('status')}; the check was not recorded", refused=True)
         conflicts = checks[-1]["conflicts"]
         checked = {"success": True, **_plan_summary(plan), "dry_run": True, "applicable": not conflicts}
-        return _json(_fit_rows({**checked, "conflicts": conflicts}, "conflicts", budget, _conflicts_note))
+        checked = mark_untrusted({**checked, "conflicts": conflicts}, "conflicts")
+        return _json(_fit_rows(checked, "conflicts", budget, _conflicts_note))
     apply = plan.get("apply") or {}
 
     def build(start: int, end: int, compact: bool) -> Dict[str, Any]:
@@ -870,7 +910,7 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
         }
         if apply.get("auto_rollback_error"):
             payload["auto_rollback_error"] = apply["auto_rollback_error"]
-        return _paging(payload, start, end, len(plan["steps"]))
+        return _paging(mark_untrusted(payload, *_PLAN_TEXT), start, end, len(plan["steps"]))
 
     return _json(_window(build, 0, len(plan["steps"]), budget))
 
@@ -921,7 +961,7 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
             "journal": journal_summary(page["journal"]),
             "report": render_journal(page),
         }
-        return _paging(payload, start, end, len(plan["steps"]))
+        return _paging(mark_untrusted(payload, *_PLAN_TEXT), start, end, len(plan["steps"]))
 
     return _json(_window(build, 0, len(plan["steps"]), _budget(settings, kwargs)))
 
@@ -958,7 +998,7 @@ def librenms_plans(args: Dict[str, Any], **kwargs: Any) -> str:
                 payload["check_count"] = len(checks)
             if detail:
                 payload["steps"] = page["steps"]
-            return _paging(payload, start, end, total)
+            return _paging(mark_untrusted(payload, *_PLAN_TEXT), start, end, total)
 
         return _json(_window(build, _int(args.get("offset"), 0, minimum=0), total, budget))
     limit = _int(args.get("limit"), 20, maximum=200)

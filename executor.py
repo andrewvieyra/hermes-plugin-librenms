@@ -46,7 +46,7 @@ _ENTRY_KEYS = ("index", "action", "resource", "object_id", "label", "parent_id",
 _TARGET_KEYS = ("index", "action", "resource", "object_id", "label")
 EVENTLOG_BASELINE_ROWS = 50
 EVENTLOG_LINK_ROWS = 200
-EVENTLOG_MESSAGE_CHARS = 300
+EVENTLOG_MESSAGE_CHARS = 300  # as escaped (redact.clip): what the model reads of a linked row's message
 
 
 class ExecutionRefused(Exception):

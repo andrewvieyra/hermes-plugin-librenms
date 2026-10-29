@@ -22,7 +22,7 @@ v0 route to what the plugin does with it.
 | Module | Responsibility | Depends on |
 |---|---|---|
 | `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`) | `requests` (lazy), `redact` |
-| `redact` | Credential masking by key, error-text scrubbing, clipping, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals | none |
+| `redact` | Credential masking by key, error-text scrubbing, clipping that counts escapes, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals, `visible()` and `for_model()` for what the model reads, the untrusted-data marker (`untrusted()`, `mark_untrusted()`) | none |
 | `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
@@ -434,7 +434,8 @@ at each other:
    compares event ids, so no clock or time zone is involved; rows at or below the baseline are
    dropped even when a LibreNMS ignores `from`.
 3. **Record.** `apply.eventlog` (or `rollback.eventlog`) is `{"linked": true, "devices": {"<id>":
-   [{"event_id", "datetime", "type", "message"}]}}` with messages clipped to 300 characters, and each
+   [{"event_id", "datetime", "type", "message"}]}}` with messages clipped to 300 characters as
+   escaped (what the model reads of them; the text stays as LibreNMS wrote it), and each
    journal entry of that device gets `eventlog_ids` (rollback: `revert_eventlog_ids`). LibreNMS does
    not say which request wrote a row, so every entry about a device gets all of that device's rows
    for the run, which may include rows the poller or a person wrote in the same minutes.
@@ -487,6 +488,23 @@ for the re-read to settle, not a second request.
   the model not to reach LibreNMS another way.
 - Handlers follow the contract `handler(args, **kwargs) -> str` and never raise; an unexpected
   exception becomes an error id, with the detail in the log.
+- Hermes wraps the results of its web, browser and MCP tools in an `<untrusted_tool_result>` block
+  (`agent/tool_dispatch_helpers.py`, chosen by tool name) and offers a plugin no way into it, so the
+  results mark themselves, and stay JSON, which Hermes' error preview and the operator paths parse.
+  `redact.mark_untrusted` puts `untrusted_fields` (the keys holding text from LibreNMS) and
+  `untrusted_notice` (that it is data, not instructions) before the first of those keys: a query's
+  `results`, `result`, `extra` or empty-answer `note`, status's `librenms`, and the `diff`,
+  `warnings`, `checks`, `conflicts`, `failure`, `eventlog`, `apply`, `rollback`, `journal`,
+  `report`, `auto_rollback_error` and `steps` of the plan tools, and an error's `librenms`
+  (LibreNMS's answer). Refusals and the plan listing carry none, and the `error` of a refusal or an
+  error, like a plan's `errors`, may quote LibreNMS (its message, candidate hostnames) unmarked: the
+  skill tells the model that this is data too. The serialiser escapes every string of every result
+  with `redact.visible` (a CR LF read as a newline, then `printable()`), so no bidirectional
+  control, invisible character or C0/C1 control reaches the model raw whatever key it is under.
+  `redact.clip` and `redact.cut` count a character as long as its escape, so every limit on text
+  from LibreNMS (`for_model`'s, an alert entity's, a linked eventlog row's, the text of an error)
+  bounds what the model reads, though the text stays raw where it is kept. A report reuses all of
+  this: its `untrusted_fields` may name the label columns of its rows.
 - A result for the model stays within `max_result_chars` (default 60,000 characters). Hermes saves
   a larger one to a file and shows the model a 1,500-character preview of it (past 100,000
   characters, or 15% of the context window on a smaller model), and `register_tool` offers a plugin
