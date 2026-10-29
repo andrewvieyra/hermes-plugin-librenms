@@ -9,26 +9,45 @@ requests; it never writes.
 Views: :mod:`.find` (what a name or phrase could mean, ranked), :mod:`.devices` (state, outages, uptime, polls and
 naming checks), :mod:`.ports` (``ports``: state, speed, utilisation, errors and age of each port; ``capacity``: ports
 in use and free per device), :mod:`.port` (one port in depth), :mod:`.neighbours` (LLDP/CDP links with both ends'
-ports and mismatch checks), :mod:`.locate` (where an IP or MAC address is: the switch port and the ARP entries) and
-:mod:`.vlans` (VLANs per device, and the ports in one). Shared pieces: :mod:`.context` (reads, budgets, scope,
-envelope), :mod:`.fuzzy` (ranking) and :mod:`.units` (units and times).
+ports and mismatch checks), :mod:`.locate` (where an IP or MAC address is: the switch port and the ARP entries),
+:mod:`.vlans` (VLANs per device, and the ports in one) and :mod:`.alerts` (``alerts``: what is alerting now;
+``alert_history``: what alerted over a window). View ``help`` (:mod:`.help`) says what each view takes and returns,
+without a LibreNMS call. Shared pieces: :mod:`.context` (reads, budgets, scope, envelope), :mod:`.fuzzy` (ranking)
+and :mod:`.units` (units and times).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from . import devices, find, locate, neighbours, port, ports, vlans
+from . import alerts, devices, find, help, locate, neighbours, port, ports, vlans
 from .context import Ambiguous, ArgumentError, CallBudget, ReportContext, ReportError, View, request
 
-__all__ = ["VIEWS", "ArgumentError", "ReportError", "run"]
+__all__ = ["HELP", "VIEWS", "ArgumentError", "ReportError", "help_answer", "is_help", "run"]
 
+HELP = "help"  # the view the plugin answers itself
 VIEWS: Dict[str, View] = {
     view.name: view
     for view in (
         find.VIEW, devices.VIEW, ports.VIEW, port.VIEW, ports.CAPACITY, neighbours.VIEW, locate.VIEW, vlans.VIEW,
+        alerts.ALERTS, alerts.HISTORY,
     )
 }  # fmt: skip
+
+
+def is_help(args: Dict[str, Any]) -> bool:
+    """Whether *args* ask for view ``help``, which needs no client."""
+    name = args.get("view")
+    return isinstance(name, str) and name.strip().lower() == HELP
+
+
+def help_answer(args: Dict[str, Any]) -> Dict[str, Any]:
+    """View ``help`` (:func:`.help.answer`): the views, or one of them (``topic``). Raises :class:`ArgumentError`
+    for a topic that is no view, or an argument help does not take."""
+    extra = sorted(key for key, value in args.items() if key not in ("view", "topic") and value not in (None, "", {}))
+    if extra:
+        raise ArgumentError(f"view help takes topic (a view's name) alone, not {', '.join(extra)}")
+    return help.answer(VIEWS, args.get("topic"))
 
 
 def run(client: Any, settings: Any, args: Dict[str, Any], *, call_budget: int | None = None) -> Dict[str, Any]:
@@ -36,9 +55,11 @@ def run(client: Any, settings: Any, args: Dict[str, Any], *, call_budget: int | 
     :class:`ArgumentError` for malformed arguments, :class:`ReportError` for a refusal, and the LibreNMSError of a
     read the report cannot do without."""
     name = args.get("view")
+    if is_help(args):
+        return help_answer(args)
     view = VIEWS.get(name.strip().lower()) if isinstance(name, str) else None
     if view is None:
-        raise ArgumentError(f"view must be one of {', '.join(VIEWS)}")
+        raise ArgumentError(f"view must be one of {', '.join([*VIEWS, HELP])}")
     req = request(view, args, settings)
     ctx = ReportContext(client, settings, call_budget=call_budget)
     try:

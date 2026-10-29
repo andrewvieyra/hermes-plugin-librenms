@@ -191,7 +191,7 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
               "query": None, "invert_map": 0, "notify_per_entity": False, "max_entities": None,
               "alert_operation_id": None, "devices": [], "groups": [], "locations": []},
     "faults": {"entity_type": None, "entity_id": None, "entity_key": "", "alerted": 1, "open": 1, "severity": "ok",
-               "note": "", "info": None, "details": None},
+               "note": "", "info": None, "details": None, "first_seen": None, "last_seen": None},
     "ports": {**dict.fromkeys(_PORT_COLUMNS),
               **{"ignore": 0, "disabled": 0, "deleted": 0, "ifMtu": 1500, "ifLastChange": 0, "ifVrf": 0}},
     "ports_statistics": dict.fromkeys(_PORT_STATISTICS_COLUMNS),

@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, neighbours, VLANs, where a MAC or IP address is, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.6.1
+version: 0.7.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -14,7 +14,7 @@ Six tools, one rule: **nothing is written to LibreNMS without a plan the user ha
 | Tool | Writes? | Use it to |
 |---|---|---|
 | `librenms_query` | no | Read any allowed API v0 GET path (devices, ports, faults, rules, logs, ...); `{"action": "status"}` for connectivity, version and write mode |
-| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), `port` (one port in depth), `capacity` (free ports), `neighbours` (LLDP/CDP links and mismatches), `locate` (where an IP or MAC is), `vlans` (VLANs and their ports), with a summary and named rows |
+| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), `port` (one port in depth), `capacity` (free ports), `neighbours` (LLDP/CDP links and mismatches), `locate` (where an IP or MAC is), `vlans` (VLANs and their ports), `alerts` (what is alerting now), `alert_history` (what alerted over a window), with a summary and named rows; `help` (with `topic`, a view) says what a view takes and returns |
 | `librenms_plan` | no | Turn desired changes into a diff, preconditions and a `plan_id` |
 | `librenms_apply` | yes | Execute a reviewed plan step by step; automatic rollback on failure; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or failed plan from its journal, newest step first |
@@ -88,6 +88,25 @@ answer small.
   (`filter` `{"vlan": 20}`: one row per device that has it) and "which ports are in VLAN 20 on sw1"
   (both: each row lists its `ports`, `untagged` or `tagged`, for up to 10 devices).
   `summary.named_differently` names tags with different names on different devices.
+- View `alerts` answers "what is alerting right now" (`summary`: `by_severity`, `unacknowledged`,
+  `by_rule`; rows critical and unacknowledged first), "since when" (`first_seen` and its age; `sort`
+  `oldest` for the longest-standing), "unacknowledged critical alerts" (`filter`
+  `{"severity": "critical", "acked": false}`), "what was acknowledged, with what note" (`acked`: true;
+  `note`) and "which port or sensor is it about" (`entity`, with `port_id` or `sensor_id`: view `port`
+  with that `port_id` gives the port in depth). `alert_id` is the fault's id, for an `alert` `ack` plan.
+  Recovered faults appear only when `filter.state` names `recovered`.
+- View `alert_history` answers "the noisiest rules this week" (`window` `7d`; `summary.top_rules`, or
+  rows per rule with `sort` `fired` or `flaps`), "the alert history of sw1" (`scope` the device,
+  `filter` `{"by": "event"}`: each alert raised, recovered or acknowledged, newest first), "which
+  devices alert most" (`by`: `device`) and "which rules are disabled, or notify no one" (`filter`
+  `{"disabled": true}` or `{"notifies": false}`, for the whole fleet; every rule is listed there, also
+  those that logged nothing). `flaps` counts alerts raised again after they had cleared. `window` is
+  `1h`, `24h` (default), `7d`, `30d` or `today`; when `summary.exact` is false (no `librenms_timezone`)
+  the counts may include up to a day before the window: say so. A `partial` answer read only the newest
+  entries: narrow the window or the scope.
+- View `help` lists the views; with `topic` (a view's name) it gives that view's filters, sorts, row
+  keys and examples, without reading LibreNMS. Call it before a view whose filters you do not know: a
+  filter or sort a view does not take is refused, naming those it does.
 - Units are in the key names (`uptime_s` seconds, beside `uptime` "100d 0h"; `in_bps` bit/s beside
   `in` "812 Mbit/s"; `*_pct` percent); times ending `Z` are UTC. Say how current the data is
   (`data_as_of`). `truncated` means more rows (read on with `next_offset` as `offset`); `partial` means

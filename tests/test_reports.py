@@ -167,7 +167,10 @@ class Foundation(ReportCase):
 class Arguments(ReportCase):
     def test_malformed_arguments_say_what_to_send(self):
         cases = [
-            ({"view": "graphs"}, "view must be one of find, devices, ports, port, capacity, neighbours, locate, vlans"),
+            (
+                {"view": "graphs"},
+                "view must be one of find, devices, ports, port, capacity, neighbours, locate, vlans, alerts",
+            ),
             ({"view": "find"}, "view find needs a term: a hostname, sysName, IP, interface or a few words"),
             ({"view": "locate"}, "view locate needs a term: an IPv4 or MAC address"),
             ({"view": "devices", "term": "core"}, "term is for views find and locate; view devices is narrowed"),

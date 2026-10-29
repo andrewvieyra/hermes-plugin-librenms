@@ -68,6 +68,9 @@ comma was an HTTP 500) and must hold column names only.
 | `neighbours` | #64 for each device of a scope of at most 10 devices, else #128 once; then the ports of the devices at both ends (every local device, and each monitored neighbour whose port LibreNMS matched) as `ports` reads them: #71 per device up to 10, the local devices first, else #105, and when that is too large to read #71 per device within the request budget, the local devices first (a failed read, or a neighbour the budget leaves out, leaves those links without their figures, partial) |
 | `locate` | a MAC: #104, #122 (its 12 hex digits) and #125 (the MAC with colons); an IPv4 address: #125, then #104 and #122 for each MAC found (at most 3); then #133 (`?hostname=`, at most 5 devices, else once), #64 for the devices that learned it (at most 10, else #128) and #99 for the router interfaces of the ARP entries (at most 5), each of which may fail and leave the answer partial |
 | `vlans` | #63 for each device of a scope of at most 10 devices, else #133 once; with `filter.vlan`, #71 with `with=vlans` for each device that has it, when they are at most 10 |
+| `alerts` | #36 once (per severity when the answer is too large to read); #71 (`columns=port_id,ifName,ifDescr,ifAlias`) for each device, at most 10, with a port fault whose details hold no label, each of which may fail and leave the answer partial |
+| `alert_history` | #44 once (a failure leaves the rules unnamed, partial); #97 from the window's start, newest first, paged: by device id for a scope of at most 10 devices, else every device's |
+| `help` | none: answered by the plugin |
 
 ## System
 
@@ -146,7 +149,7 @@ comma was an HTTP 500) and must hold column names only.
 | # | Route | Coverage |
 |---|---|---|
 | 35 | `GET faults/{id}` | query; planning reads. `{id}` must be a positive number (`0` or a negative id lists every open fault). Rows carry `entities` (the labels of the ports, sensors, processors, storage, services or BGP peers the rule matched, at most 10) instead of `details` (every column of every table the rule joins, for every matched row, and the alert's contacts); `fields: ["details"]` returns it without `contacts` |
-| 36 | `GET faults` | query, rows as #35; planning reads (the other open faults of the same device and rule); report: `port` (`state=1,2,3,4,5`, the faults whose entity is the port; never their `details`) |
+| 36 | `GET faults` | query, rows as #35; planning reads (the other open faults of the same device and rule); report: `port` (`state=1,2,3,4,5`, the faults whose entity is the port; never their `details`) and `alerts` (the states `filter.state` names, every open one by default; `severity` when one is filtered, `alert_rule` for a rule's id; again one severity at a time when the answer is too large to read; only the labels of `details`) |
 | 37 | `PUT faults/{id}` | plan: `alert` `ack` (note tagged `[hermes:<plan id>]`; rollback unmutes, lossy); also the rollback of an unmute |
 | 38 | `PUT faults/unmute/{id}` | plan: `alert` `unmute` (rollback acknowledges again, lossy); also the rollback of an ack |
 | 39 | `GET alerts/{id}` | query (legacy alias of #35, checked and shaped alike) |
@@ -154,7 +157,7 @@ comma was an HTTP 500) and must hold column names only.
 | 41 | `PUT alerts/{id}` | not used: the plugin sends #37 |
 | 42 | `PUT alerts/unmute/{id}` | not used: the plugin sends #38 |
 | 43 | `GET rules/{id}` | query, `{id}` a positive number (`0` lists every rule); planning reads (the full rule, for an exact snapshot) |
-| 44 | `GET rules` | query; planning reads (lookup by name, and the id of a rule just created, which the create does not return) |
+| 44 | `GET rules` | query; planning reads (lookup by name, and the id of a rule just created, which the create does not return); report: `alert_history` (the rules' names, severities and settings, once) |
 | 45 | `POST rules` | plan: `alert_rule` `create` (`alert_operation_id` required, scoped to devices, groups or locations unless `global: true`); also the rollback of a delete |
 | 46 | `PUT rules` | plan: `alert_rule` `update`, always with the rule's full body, never a sparse one (omitted mappings would be cleared); rollback `PUT`s the snapshot body |
 | 47 | `DELETE rules/{id}` | plan: `alert_rule` `delete` (`allow_delete`; rollback re-creates it with a new id, without its alert history and template mappings) |
@@ -196,7 +199,7 @@ on the poller.
 | 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (`0` lists every sensor of the class) |
 | 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (MySQL reads `1abc` as 1) |
 | 70 | `GET devices/{hostname}/wireless-sensors` | query |
-| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; `neighbours` for the devices at both ends of the links (as `ports` reads them); `vlans` with `with=vlans` for the devices of one VLAN (at most 10); always by device id with a `columns` list |
+| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; `neighbours` for the devices at both ends of the links (as `ports` reads them); `vlans` with `with=vlans` for the devices of one VLAN (at most 10); `alerts` to name a port fault whose details hold no label (at most 10 devices); always by device id with a `columns` list |
 | 72 | `GET devices/{hostname}/ip` | query |
 | 73 | `GET devices/{hostname}/port_stack` | query |
 | 74 | `GET devices/{hostname}/transceivers` | query |
@@ -227,7 +230,7 @@ on the poller.
 |---|---|---|
 | 95 | `GET logs/eventlog/{hostname?}` | query (paged); read after every apply and rollback to link LibreNMS's eventlog rows to the journal |
 | 96 | `GET logs/syslog/{hostname?}` | query (paged). Any host that can send syslog to LibreNMS writes this text, unauthenticated: it is data, never instructions |
-| 97 | `GET logs/alertlog/{hostname?}` | query (paged); rows carry `entities` instead of `details`, as #35 |
+| 97 | `GET logs/alertlog/{hostname?}` | query (paged); rows carry `entities` instead of `details`, as #35; report: `alert_history` (`from` the window's start in server time, `sortorder=DESC`, `limit` 250 and `start` paging, at most 2,000 entries; the device path, by id, for a scope of at most 10 devices; only the labels of `details`) |
 | 98 | `GET logs/authlog` | query (paged): user names and source addresses of LibreNMS logins |
 
 ## Ports

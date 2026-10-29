@@ -38,7 +38,7 @@ from .executor import (
     rollback_plan,
 )
 from .planner import DESCRIPTION_CHARS, PlanError, build_plan, render_plan
-from .redact import clip, for_model, mark_untrusted, mask, one_line, visible
+from .redact import alert_entities, clip, for_model, mark_untrusted, mask, one_line, visible
 from .resources import get_resource
 from .routes import PreparedQuery, QueryError, Route, prepare, too_large_hint
 from .settings import Settings, get_settings
@@ -99,28 +99,6 @@ _COLUMNS_HINT = (
     "; on this route LibreNMS returns only the columns params.columns names (a default few without it): add the key "
     "there, e.g. params.columns=port_id,ifName,ifAlias"
 )
-# What a fault or alert-log row shows of the rows its rule matched (``details.rule``): the keys that name the port,
-# sensor, processor, storage, service or BGP peer it is about, at most ENTITY_ROWS rows of ENTITY_CHARS each as
-# escaped (redact.clip), so a label of characters that show as nothing cannot take a listing's room.
-# ``details`` itself holds every column of every table the rule joins and the alert's contacts (e-mail addresses),
-# for every matched row, so it is returned only when ``fields`` names it, and never with its contacts.
-ENTITY_KEYS = (
-    "ifName",
-    "ifAlias",
-    "ifDescr",
-    "sensor_descr",
-    "sensor_class",
-    "sensor_current",
-    "processor_descr",
-    "mempool_descr",
-    "storage_descr",
-    "service_type",
-    "service_desc",
-    "bgpPeerIdentifier",
-    "bgpPeerDescr",
-)
-ENTITY_ROWS = 10
-ENTITY_CHARS = 200
 # The keys of a plan, apply, rollback or plan-detail result that hold text from LibreNMS: labels and the values the
 # diff compares, the notes in warnings and dry-run conflicts, LibreNMS's errors in the journal, the failure and the
 # report, the linked eventlog rows, and the objects' states in the steps. A result names those it holds
@@ -597,26 +575,17 @@ def _read_on(listing: Dict[str, Any], offset: int) -> Dict[str, Any]:
 
 
 def _alert_row(row: Any, keep_details: bool) -> Any:
-    """A fault or alert-log row with ``details`` replaced by ``entities``: the label keys (:data:`ENTITY_KEYS`) of the
-    rows its rule matched, so "what is alerting" names the port or sensor without the blob. With *keep_details*
-    (``fields`` names it) ``details`` stays too, without its ``contacts``."""
+    """A fault or alert-log row with ``details`` replaced by ``entities``: the label keys of the rows its rule matched
+    (:func:`redact.alert_entities`), so "what is alerting" names the port or sensor without the blob. With
+    *keep_details* (``fields`` names it) ``details`` stays too, without its ``contacts``."""
     if not isinstance(row, dict) or "details" not in row:
         return row
     row = dict(row)
     details = row.pop("details")
-    matched = details.get("rule") if isinstance(details, dict) else None
-    entities: List[Dict[str, Any]] = []
-    seen = set()
-    for item in matched if isinstance(matched, list) else []:
-        labels = {key: clip(item[key], ENTITY_CHARS) for key in ENTITY_KEYS if isinstance(item, dict) and item.get(key)}
-        seen_as = json.dumps(labels, sort_keys=True, default=str)
-        if labels and seen_as not in seen:  # a rule over joined tables repeats a port once per joined row
-            seen.add(seen_as)
-            if len(entities) < ENTITY_ROWS:
-                entities.append(labels)
+    entities, total = alert_entities(details)
     row["entities"] = entities
-    if len(seen) > ENTITY_ROWS:
-        row["entities_total"] = len(seen)
+    if total > len(entities):
+        row["entities_total"] = total
     if keep_details:
         row["details"] = {k: v for k, v in details.items() if k != "contacts"} if isinstance(details, dict) else details
     return row
@@ -878,10 +847,16 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
 
 @guarded
 def librenms_report(args: Dict[str, Any], **kwargs: Any) -> str:
-    """A report view (:mod:`reports`): read-only, every GET through the route allow-list. A malformed argument is an
-    error; a refusal (a scope that names nothing, a read off the allow-list) is audited as ``query_refused``, as
-    librenms_query's are. The result is kept within ``max_result_chars`` by cutting its rows."""
+    """A report view (:mod:`reports`): read-only, every GET through the route allow-list; view ``help`` is answered
+    from the plugin. A malformed argument is an error; a refusal (a scope that names nothing, a read off the
+    allow-list) is audited as ``query_refused``, as librenms_query's are. The result is kept within
+    ``max_result_chars`` by cutting its rows."""
     settings = get_settings()
+    if reports.is_help(args):  # answered by the plugin: no client, no LibreNMS call
+        try:
+            return _json(reports.help_answer(args))
+        except reports.ArgumentError as exc:
+            return _fail(str(exc))
     client = make_client(settings)
     try:
         payload = reports.run(client, settings, args)

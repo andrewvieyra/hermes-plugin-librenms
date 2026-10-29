@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import email.utils
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 from zoneinfo import ZoneInfo
 
@@ -41,6 +41,12 @@ SCOPE_SHOWN = 10  # devices a scope lists by name
 SCOPE_LIST = 50  # most entries scope.devices takes
 TIMEZONE_UNKNOWN = "unknown — set librenms_timezone"
 TERM_VIEWS = "find and locate"  # the views that take a term
+WINDOW_VIEWS = "alert_history"  # the views that take a window
+TODAY = "today"
+# How far a server-local clock may be from UTC (UTC-12 to UTC+14): without librenms_timezone, a window's start in
+# LibreNMS's time is read this much earlier, so it holds the whole window whatever the server's zone.
+EARLIEST_OFFSET_S = 12 * 3600
+LATEST_OFFSET_S = 14 * 3600
 # The keys of a candidate row that hold text from LibreNMS.
 CANDIDATE_TEXT = ("hostname", "display", "sysName", "location", "purpose", "hardware", "name", "desc", "port", "why")
 # LibreNMS's device states, as its Device scopes decide them (isDisabled, isIgnored, isDown, isUp), first wins.
@@ -80,6 +86,11 @@ class Ambiguous(Exception):
         self.key, self.term, self.candidates = key, term, candidates
 
 
+class One(tuple):
+    """The values of a choice filter that takes one of them, never a list (``alert_history``'s ``by``: the shape of
+    its rows)."""
+
+
 class CallBudget(Exception):
     """The report has sent :data:`CALL_BUDGET` requests; the path it did not read is the message."""
 
@@ -87,7 +98,8 @@ class CallBudget(Exception):
 @dataclass(frozen=True)
 class Request:
     """A view's arguments, checked: ``term``, the raw ``scope`` (resolved by the view), ``filter`` parsed to its
-    typed values, ``sort``, ``limit`` and ``offset``."""
+    typed values, ``sort``, ``limit``, ``offset`` and ``window`` (``today`` or a duration as given, for a view that
+    takes one; :meth:`ReportContext.since` places it)."""
 
     term: str | None
     scope: Any
@@ -95,13 +107,27 @@ class Request:
     sort: str
     limit: int
     offset: int
+    window: str | None = None
+
+
+@dataclass(frozen=True)
+class Since:
+    """Where a window starts: ``bound``, the server-local ``Y-m-d H:i:s`` LibreNMS's ``from`` compares its log times
+    with, and ``exact``, whether that is the window's start (``librenms_timezone`` is set) or earlier by up to
+    :data:`EARLIEST_OFFSET_S` plus :data:`LATEST_OFFSET_S`, which holds the window in any zone."""
+
+    window: str
+    bound: str
+    exact: bool
 
 
 @dataclass(frozen=True)
 class View:
     """A report view: its builder and the arguments it takes. ``filters`` maps each filter name to its kind
-    (``bool``, ``duration``, ``number``, ``text``, or a tuple of the values a ``choice`` takes); ``sorts`` lists the
-    orders, the default first; ``term`` says whether it takes a term (:data:`TERM_VIEWS`)."""
+    (``bool``, ``duration``, ``number``, ``text``, or a tuple of the values a ``choice`` takes, one or a list of
+    them; :class:`One` for a choice of one alone); ``sorts`` lists the orders, the default first; ``term`` says
+    whether it takes a term (:data:`TERM_VIEWS`); ``window`` is the window a view that takes one reads by default
+    (:data:`WINDOW_VIEWS`). View ``help`` (:mod:`.help`) says what each filter and sort means."""
 
     name: str
     build: Callable[[ReportContext, Request], Dict[str, Any]]
@@ -111,6 +137,7 @@ class View:
     term: bool = False
     max_limit: int | None = None
     term_hint: str = "a hostname, sysName, IP, interface or a few words"  # what the view's term is, when it takes one
+    window: str | None = None
 
 
 @dataclass
@@ -215,10 +242,15 @@ def count_arg(what: str, value: Any, default: int, minimum: int) -> int:
     return number
 
 
+def help_hint(view: View) -> str:
+    """Where the model reads what *view*'s filters and sorts mean, said after refusing one."""
+    return f'view help with topic "{view.name}" says what each does'
+
+
 def request(view: View, args: Dict[str, Any], settings: Any) -> Request:
     """*args* checked against what *view* takes. ``limit`` defaults to :data:`DEFAULT_LIMIT` and is cut to
     ``max_query_results`` (and the view's own most); a filter or sort the view does not take is refused, naming
-    those it does."""
+    those it does and where they are explained."""
     term = args.get("term")
     if view.term:
         if term is None:
@@ -226,15 +258,46 @@ def request(view: View, args: Dict[str, Any], settings: Any) -> Request:
         term = term_arg("term", term)
     elif term not in (None, ""):
         raise ArgumentError(f"term is for views {TERM_VIEWS}; view {view.name} is narrowed with scope and filter")
+    if args.get("topic") not in (None, ""):
+        raise ArgumentError(
+            f'topic is for view help, which explains a view: {{"view": "help", "topic": "{view.name}"}}'
+        )
     sort = args.get("sort")
     if sort is None:
         sort = view.sorts[0]
     elif not isinstance(sort, str) or sort.strip().lower() not in view.sorts:
-        raise ArgumentError(f"view {view.name} sorts by {', '.join(view.sorts)} (got {_shown(sort)})")
+        raise ArgumentError(
+            f"view {view.name} sorts by {', '.join(view.sorts)} (got {_shown(sort)}); {help_hint(view)}"
+        )
     cap = min(settings.max_query_results, view.max_limit or settings.max_query_results)
     limit = min(count_arg("limit", args.get("limit"), min(DEFAULT_LIMIT, cap), 1), cap)
     offset = count_arg("offset", args.get("offset"), 0, 0)
-    return Request(term, args.get("scope"), filters(view, args.get("filter")), sort.strip().lower(), limit, offset)
+    window = window_arg(view, args.get("window"), settings)
+    return Request(
+        term, args.get("scope"), filters(view, args.get("filter")), sort.strip().lower(), limit, offset, window
+    )
+
+
+def window_arg(view: View, value: Any, settings: Any) -> str | None:
+    """``window``: ``today`` (since midnight in ``librenms_timezone``, which it needs) or a duration such as ``1h``,
+    ``24h``, ``7d`` or ``30d`` (at most a year), for a view that takes one; its default when absent."""
+    if view.window is None:
+        if value not in (None, ""):
+            raise ArgumentError(f"window is for view {WINDOW_VIEWS}; view {view.name} reads what LibreNMS holds now")
+        return None
+    if value is None or value == "":
+        return view.window
+    text = value.strip().lower() if isinstance(value, str) else None
+    if text == TODAY:
+        if zone_of(settings) is None:
+            raise ArgumentError(
+                "window today needs librenms_timezone (the zone LibreNMS writes its times in), which is not set; "
+                "give a duration such as 24h"
+            )
+        return TODAY
+    if text is None or units.parse_duration(text) is None:
+        raise ArgumentError(f"window takes today or a duration such as 1h, 24h, 7d or 30d (got {_shown(value)})")
+    return text
 
 
 def number_arg(what: str, value: Any) -> float:
@@ -256,8 +319,11 @@ def filters(view: View, raw: Any) -> Dict[str, Any]:
     for key, value in raw.items():
         kind = view.filters.get(key)
         if kind is None:
-            takes = f"takes filter keys {', '.join(view.filters)}" if view.filters else "takes no filter"
-            raise ArgumentError(f"view {view.name} {takes}, not {_shown(key)}")
+            if not view.filters:
+                raise ArgumentError(f"view {view.name} takes no filter, not {_shown(key)}")
+            raise ArgumentError(
+                f"view {view.name} takes filter keys {', '.join(view.filters)}, not {_shown(key)}; {help_hint(view)}"
+            )
         if kind == "bool":
             out[key] = flag(value)
             if out[key] is None:
@@ -273,8 +339,11 @@ def filters(view: View, raw: Any) -> Dict[str, Any]:
         else:
             spelled = {choice.casefold(): choice for choice in kind}
             items = value if isinstance(value, list) and value else [value]
+            if isinstance(kind, One) and len(items) != 1:
+                raise ArgumentError(f"filter.{key} takes one of {', '.join(kind)}")
             if not all(isinstance(item, str) and item.strip().casefold() in spelled for item in items):
-                raise ArgumentError(f"filter.{key} takes {', '.join(kind)}, or a list of them")
+                one = isinstance(kind, One)
+                raise ArgumentError(f"filter.{key} takes {', '.join(kind)}" + ("" if one else ", or a list of them"))
             out[key] = frozenset(spelled[item.strip().casefold()] for item in items)
     return out
 
@@ -352,6 +421,17 @@ class ReportContext:
         """``GET`` the path made of *segments* (fixed words, ids, names; one segment each) with *params*: the value
         under the route's result key, ``[]`` for LibreNMS's 404 for an empty list. Raises :class:`ReportError` for a
         path off the allow-list, :class:`CallBudget` past the budget, and the LibreNMSError of any other failure."""
+        return self._read(segments, params)[0]
+
+    def page(self, *segments: Any, params: Dict[str, Any] | None = None) -> Tuple[List[Dict[str, Any]], int | None]:
+        """:meth:`get` on a logs route, which LibreNMS pages: the rows, and ``total``, every row it holds for the
+        query (None when its answer says none: a 404 for no rows is 0)."""
+        value, body = self._read(segments, params)
+        total = body.get("total") if isinstance(body, dict) else 0 if body is None else None
+        return rows_of(value), int(total) if is_digits(total) else None
+
+    def _read(self, segments: Tuple[Any, ...], params: Dict[str, Any] | None) -> Tuple[Any, Any]:
+        """:meth:`get`'s value, and the whole answer it came in (None for a 404)."""
         pieces = [str(segment) for segment in segments]
         joined = "/".join(pieces)
         if any(not piece or "/" in piece for piece in pieces):
@@ -377,7 +457,7 @@ class ReportContext:
             if self._now is None:
                 self._now = _http_date(getattr(self.client, "last_date", None))
         value = LibreNMSClient.result(body, route.list_key) if body is not None else None
-        return [] if value is None else value
+        return ([] if value is None else value), body
 
     def optional(
         self, what: str, *segments: Any, params: Dict[str, Any] | None = None, raising: Tuple[str, ...] = ()
@@ -404,6 +484,26 @@ class ReportContext:
         if self._now is None:
             self._now = datetime.now(timezone.utc)
         return self._now
+
+    def since(self, window: str) -> Since:
+        """Where *window* (``today`` or a duration, :func:`window_arg`) starts in LibreNMS's server-local time, counted
+        back from :attr:`now`. Without ``librenms_timezone`` that time cannot be placed exactly: the bound is then
+        read as if LibreNMS's clock were as far behind UTC as any zone's, so it holds the whole window, and a note
+        says how much more it may hold."""
+        if window == TODAY:
+            local = self.now.astimezone(self.zone)  # window_arg has checked there is one
+            return Since(window, local.strftime("%Y-%m-%d 00:00:00"), True)
+        start = self.now - timedelta(seconds=units.parse_duration(window) or 0)
+        if self.zone is not None:
+            return Since(window, start.astimezone(self.zone).strftime("%Y-%m-%d %H:%M:%S"), True)
+        bound = (start - timedelta(seconds=EARLIEST_OFFSET_S)).strftime("%Y-%m-%d %H:%M:%S")
+        spare = units.duration(EARLIEST_OFFSET_S + LATEST_OFFSET_S)
+        self.notes.append(
+            f"librenms_timezone is not set, so the window cannot be placed exactly in LibreNMS's server time: entries "
+            f"from {bound} (server time) on were read, which holds the last {window} in any zone and up to {spare} "
+            "before it; set librenms_timezone for an exact window"
+        )
+        return Since(window, bound, False)
 
     def devices(self) -> Dict[int, Dict[str, Any]]:
         """Every device the token can see, by id, in LibreNMS's order (hostname): one ``devices`` listing."""

@@ -6,6 +6,77 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+
+### Added
+- View `alerts` of `librenms_report`: what is alerting now. One `faults` read in every open state (`1,2,3,4,5`;
+  recovered faults only when `filter.state` names `recovered`), narrowed at LibreNMS where it can be (`severity`
+  when one is filtered, `alert_rule` for a rule's id), kept to the scope in the plugin (the route has no device
+  filter). A row per fault: `alert_id`, the device, `rule_id`, `rule`, `severity`, `state` (`active`,
+  `acknowledged`, `worse`, `better`, `changed`, `recovered`), `acked`, `first_seen` (server-local, read in
+  `librenms_timezone` with its age; as written and with no age without it; `timestamp` for faults older than
+  `first_seen`), the acknowledgement `note`, the rule's runbook link (`procedure`) and what alerted: `entity_type`
+  (`port` for LibreNMS's `interface`, `sensor`, ...; null for a device-wide rule), `port_id` or `sensor_id` (else
+  `entity_id`) and `entity`, its label (a port as `ifName (description)`, a sensor as its description and class
+  with its reading as `value`, a processor, memory pool, storage, BGP peer or service by its names; `entities` and
+  `entities_total` when a fault covers several). The label is read from the rows the rule matched through the same
+  allow-list of label keys as `librenms_query`'s `entities`; a port fault whose rows hold none is named from its
+  device's ports (`devices/{id}/ports` with four columns, at most 10 devices, before the order when sorting by name
+  or filtering on text). Fault `details` (every column of every table the rule joins) and the alert's contacts
+  never reach a row or the summary. An answer too large to read is read again one severity at a time; a severity
+  still too large is left out and the answer is partial. Filters `state`, `severity`, `acked`, `rule` (an id, or
+  part of a name), `entity_type` (`port` or `interface`, `sensor`, ..., `device` for a device-wide rule) and `text`
+  (in the device, the rule, what alerted or the note); sorts `severity` (critical first, unacknowledged before
+  acknowledged, newest first), `newest`, `oldest`, `name`. `summary`: `by_state`, `by_severity`,
+  `unacknowledged`, `devices`, `rules` and `by_rule` (the ten rules with the most alerts).
+- View `alert_history`: what alerted over a window, from LibreNMS's alert log (`logs/alertlog` from the window's
+  start, `sortorder=DESC`, 250 entries a request and at most 2,000 a report, the page halved while an answer is too
+  large to read; each device's log for a scope of up to 10 devices, none for a scope that holds no device (an empty
+  group, a location or os no device has: no rows, `logged` 0, and the scope's note), else every device's) and the
+  alert rules (`rules`, once; a failed read leaves the rules unnamed and the answer partial). `filter.by` shapes
+  the rows: `rule` (default; for the whole fleet every rule, also those that logged nothing, with `disabled`,
+  `notifies` (it has an alert operation and is not muted in the UI) and `muted`), `device` (with `top_rule`, the
+  rule that fired most there) or `event` (each entry, newest first: time and age, device, rule, severity, `state`
+  `alerted`, `recovered`, `acknowledged`, `worse`, `better` or `changed`, `alert_id`, what alerted). Counts:
+  `entries`, `fired` (alerts raised), `cleared`, `flaps` (an alert raised again for the same fault, or rule and
+  device in releases without faults, after it had cleared within the window) and `last_fired` with its age. Filters
+  `by`, `rule`, `severity`, `state`, `entity`, `disabled`, `notifies` and `fired`; sorts `fired`, `flaps`,
+  `last_fired`, `name`. `summary`: the window and the bound sent (`from`, server time; `exact`), `logged` (what
+  LibreNMS holds there for the scope), the totals, the five rules and devices that fired most, and for the whole
+  fleet `rules_disabled` and `rules_without_notifications`. A window holding more than the report reads is partial,
+  saying how many entries there are and how many were read.
+- `window` for `alert_history` (and the event views to come): `1h`, `24h` (default), `7d`, `30d`, any duration up
+  to a year, or `today` (since midnight in `librenms_timezone`, refused without it). It is counted back from
+  LibreNMS's clock and sent as server-local text, exact in `librenms_timezone`; without it the bound is read 12
+  hours earlier still, which holds the window whatever zone LibreNMS runs in (UTC-12 to UTC+14), and a note and
+  `summary.exact: false` say it may hold up to 26 hours more. A window on a view that takes none is refused.
+- View `help`, answered by the plugin with no client and no LibreNMS call: without `topic`, the views (a line
+  each) and what they share (scope, filter, sort, paging, window, units, untrusted text); with `topic` (a view's
+  name), what it answers, its scope keys, term and window, each filter with what it takes (from the view's own
+  definition: `alert_history`'s `by` takes one value, never a list) and what it keeps, each sort, the keys of its
+  rows and summary, and examples. A test holds every view's filters and sorts to a line each in `help` and runs
+  every example against the fake LibreNMS.
+- The operator questions of the conversational audit about alerts, each answered in one or two calls and tested
+  as such (tests/test_report_alerts.py): what is alerting now (28), since when (29), unacknowledged critical
+  alerts (30), what was acknowledged and with what note (31), which port or sensor an alert is about (32, and the
+  port in depth by the `port_id` it gives), the noisiest rules this week (33), the alert history of a device
+  (34), and disabled rules and rules that notify no one (35).
+- `ReportContext.page` (a logs route's rows with LibreNMS's `total`) and `ReportContext.since` (where a window
+  starts in server time); `redact.alert_entities`, the allow-list of what a fault's or alert-log entry's details
+  may show, which `librenms_query`'s `entities` now use too. The fake LibreNMS's faults take `first_seen` and
+  `last_seen` as null by default, as the table does.
+
+### Changed
+- The `librenms_report` schema is restructured to leave room for the views to come: the description keeps the
+  purpose, a line per view, the scope, filter, sort and paging contract and the unit facts; the per-view filters,
+  sorts, row keys and examples moved to view `help`. `sort` takes a string (no enum of every view's orders), and
+  `scope` names its keys without types (each takes a name or an id, as its description says). The six schemas
+  take 14,320 of their 16,384 bytes (they took 16,381): 2,064 bytes are left for 0.8.0 and 0.9.0.
+- A filter or sort a view does not take is refused naming those it does, and now also pointing to view `help`
+  with that view as `topic`; a `topic` on another view is refused, pointing to `help`.
+- `librenms_timezone` (README, settings description) names the alert views among those that read fault and log
+  times in it.
+
 ## [0.6.1] - 2026-10-29
 
 ### Security

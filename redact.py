@@ -16,13 +16,16 @@ alike, and marked as data where a tool result returns it.
   model, at any depth, with Windows line ends read as newlines.
 - :func:`mark_untrusted` puts the marker (:func:`untrusted`: ``untrusted_fields`` and ``untrusted_notice``) on a tool
   result that returns text from LibreNMS, naming the keys that hold it.
+- :func:`alert_entities` is all of an alert's ``details`` a result may show: the labels of what alerted, never the
+  rows its rule joined or the alert's contacts.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List, Tuple
 from urllib.parse import quote
 
 SECRET_KEYS = frozenset(
@@ -97,6 +100,28 @@ _SYMBOL = ("So", "Sm")
 _WIDEST_ESCAPE = 10
 # A string clip() cut: what it kept, then the note.
 _CLIPPED_RE = re.compile(r"(.*)… \[truncated \d{1,15} chars\]", re.DOTALL)
+# What a fault or alert-log row shows of the rows its rule matched (``details.rule``): the keys that name the port,
+# sensor, processor, storage, service or BGP peer it is about, at most ENTITY_ROWS rows of ENTITY_CHARS each as
+# escaped (clip), so a label of characters that show as nothing cannot take a listing's room. ``details`` itself
+# holds every column of every table the rule joins and the alert's contacts (e-mail addresses), for every matched
+# row.
+ENTITY_KEYS = (
+    "ifName",
+    "ifAlias",
+    "ifDescr",
+    "sensor_descr",
+    "sensor_class",
+    "sensor_current",
+    "processor_descr",
+    "mempool_descr",
+    "storage_descr",
+    "service_type",
+    "service_desc",
+    "bgpPeerIdentifier",
+    "bgpPeerDescr",
+)
+ENTITY_ROWS = 10
+ENTITY_CHARS = 200
 # The notice beside ``untrusted_fields`` (:func:`untrusted`). Hermes puts its own boundary only around the results
 # of its web, browser and MCP tools and offers a plugin no way into it, so a result marks itself; the JSON quoting
 # around every value is the boundary a value cannot close.
@@ -314,3 +339,21 @@ def mark_untrusted(payload: Dict[str, Any], *keys: str) -> Dict[str, Any]:
             out.update(untrusted(*marked))
         out[key] = value
     return out
+
+
+def alert_entities(details: Any) -> Tuple[List[Dict[str, Any]], int]:
+    """What an alert's *details* (a fault's or an alert-log row's) may show: the :data:`ENTITY_KEYS` of each row its
+    rule matched, each value clipped to :data:`ENTITY_CHARS`, once per distinct set (a rule over joined tables
+    repeats a port once per joined row), at most :data:`ENTITY_ROWS` of them; and how many distinct sets there were.
+    Nothing else of *details* is read."""
+    matched = details.get("rule") if isinstance(details, dict) else None
+    entities: List[Dict[str, Any]] = []
+    seen = set()
+    for item in matched if isinstance(matched, list) else []:
+        labels = {key: clip(item[key], ENTITY_CHARS) for key in ENTITY_KEYS if isinstance(item, dict) and item.get(key)}
+        seen_as = json.dumps(labels, sort_keys=True, default=str)
+        if labels and seen_as not in seen:
+            seen.add(seen_as)
+            if len(entities) < ENTITY_ROWS:
+                entities.append(labels)
+    return entities, len(seen)

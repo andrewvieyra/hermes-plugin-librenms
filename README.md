@@ -153,9 +153,11 @@ set it to about half the window's token count (`32000` for 64K tokens).
 alert-log, eventlog and syslog times in that zone with no offset, and no API field says which zone
 it is, so a time such as `2026-10-28 10:02:00` is an hour off for a model that reads it as UTC when
 LibreNMS runs in Amsterdam. Every `librenms_report` answer names this zone in `timezone`, or says
-it is unknown while the setting is empty. The views that show fault and log times (the `port`
-view's open faults, and alerts and events in later releases) read them in this zone, and without
-it show them as LibreNMS wrote them, with no age. Every other time a report shows is exact in any
+it is unknown while the setting is empty. The views that show fault and log times (`alerts`,
+`alert_history`, the `port` view's open faults, and events in a later release) read them in this
+zone, and without it show them as LibreNMS wrote them, with no age; `alert_history` then reads its
+window from a bound early enough to hold it in any zone, and says so, and refuses `today`. Every
+other time a report shows is exact in any
 zone: device times (ISO-8601 UTC), outages and port polls (unix seconds), uptimes and the age of a
 port's last change (counted from the device's uptime), every age counted to LibreNMS's own clock
 (the `Date` of its answer). A name the host's zone database does not hold is refused and the
@@ -188,7 +190,7 @@ environment):
 | Tool | Writes | Purpose |
 |---|---|---|
 | `librenms_query` | no | Look up devices, ports, alerts, sensors and logs through any allowed API v0 GET path, or `{"action": "status"}` for connectivity, version and settings |
-| `librenms_report` | no | Answer a question in one call: `find` what a name, address or phrase could mean (ranked, with why), or report on `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), one `port` in depth, free-port `capacity`, LLDP/CDP `neighbours` (both ends, speed, duplex, MTU and description mismatches), where an IP or MAC is (`locate`: the edge port first) or `vlans` (per device, and the ports in one), with names joined, units worked out and counts summed |
+| `librenms_report` | no | Answer a question in one call: `find` what a name, address or phrase could mean (ranked, with why), or report on `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), one `port` in depth, free-port `capacity`, LLDP/CDP `neighbours` (both ends, speed, duplex, MTU and description mismatches), where an IP or MAC is (`locate`: the edge port first), `vlans` (per device, and the ports in one), what is alerting (`alerts`: severity, acknowledged and its note, since when, the port or sensor) or what alerted over a window (`alert_history`: per rule, device or event), with names joined, units worked out and counts summed; `help` says what each view takes, without a LibreNMS call |
 | `librenms_plan` | no | Validate and diff a list of operations; save a plan |
 | `librenms_apply` | yes | Apply a plan with preconditions, verified writes, a journal and auto-rollback; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or partially applied plan |
@@ -292,6 +294,9 @@ approval, and is available in every `write_mode`.
 | `neighbours` | Per LLDP/CDP link of the devices in scope: the local port (label, description, state, interface speed, duplex, MTU), what the neighbour advertised (`remote_hostname`, `remote_port`, `remote_platform`), whether LibreNMS monitors it (`remote_monitored`, `remote_device`) and, when LibreNMS matched its port (`remote_port_id`), that port's state, speed, duplex and MTU. Checks: `speed_mismatch` and `duplex_mismatch` (both ends up and different; the speed the interfaces run at, never a circuit speed from a description), `mtu_mismatch` (a note when the two differ by an ethernet header, as Junos counts it), `description_mismatch` (the local description names neither the neighbour nor its port, compared as whole words; null without a description); each null when it cannot be checked. `summary` counts links, protocols, unmonitored neighbours (and names them), links whose far port is not known, each mismatch and ports without a description | `scope`; `filter` `mismatch` (`speed`, `duplex`, `mtu`, `description`, or a list: any of them), `remote_unmonitored`, `port` (the local port: its name, long or short, or port_id), `remote` (part of the neighbour's name), `protocol`; `sort` `name`, `remote` |
 | `locate` | Where an IPv4 or MAC address is: the switch ports that learned the MAC (`kind` `port`), with how many MACs each learned (`macs_learned`), the device LibreNMS monitors that its LLDP/CDP neighbour is (`neighbour`), `uplink` (that neighbour learned the MAC too: the MAC is behind it), `likely_edge` (of a MAC's ports that are not uplinks, those that learned the fewest, as LibreNMS guesses; a port to the device at the address looked up is never an uplink), its VLANs, `trunk`, `last_seen` and its age; then the routers' ARP entries (`kind` `arp`: IP, MAC, router interface). `summary` names the likely edge ports, the MACs and IPs found and, for an IP, the device LibreNMS monitors at it. An IPv6 address is refused (the API has no IPv6 neighbour table; `find` matches interface addresses) | `term` (a MAC in any usual form, or an IPv4 address); `sort` `edge` |
 | `vlans` | Per device in scope, each VLAN: tag (`vlan`), `name`, `type`. With `filter.vlan` and on at most 10 devices, the `ports` in it, `untagged` (access, or a trunk's native VLAN) or `tagged`, with their state and counts. `summary` counts VLANs and devices and names tags that are called differently on different devices | `scope`; `filter` `vlan` (a tag, or part of a name); `sort` `vlan` (by tag, then device), `name` (by device, then tag) |
+| `alerts` | What is alerting now: LibreNMS's open faults, one per rule, device and alerted object, each with the rule and its `severity`, `state` (`active`, `acknowledged`, `worse`, `better`, `changed`; `recovered` only when asked for), `acked`, the acknowledgement `note`, `first_seen` and its age, the rule's runbook link (`procedure`) and what alerted: `entity_type` (`port`, `sensor`, ...), `port_id` or `sensor_id`, and `entity`, its label (a port as `ifName (description)`, a sensor by its description and class, with the reading as `value`). The label comes from the rows the rule matched, through an allow-list of label keys; a port fault that holds none is named from its device's ports. Never the fault's `details` (every column the rule joined) or the alert's contacts. `summary` counts states, severities, the unacknowledged alerts, devices and rules, and the rules with the most alerts | `scope`; `filter` `state`, `severity`, `acked`, `rule` (an id, or part of a name), `entity_type` (`port`, `sensor`, ..., `device` for a device-wide rule), `text` (in the device, rule, what alerted or the note); `sort` `severity` (critical and unacknowledged first, newest first), `newest`, `oldest`, `name` |
+| `alert_history` | What alerted over `window` (`1h`, `24h` by default, `7d`, `30d`, any duration up to a year, or `today` with `librenms_timezone`), from LibreNMS's alert log, counted per rule (`filter.by` `rule`, the default; for the whole fleet every rule, also those that logged nothing, with `disabled`, `notifies` and `muted`), per `device` (with the rule that fired most there) or as each `event` (newest first: time, device, rule, `state` `alerted`, `recovered`, `acknowledged`, ..., what alerted). Counts: `fired` (alerts raised), `cleared`, `flaps` (raised again after clearing, within the window), `last_fired` and its age. `summary` gives the window and the bound sent (`from`, server time; `exact` false without `librenms_timezone`), what LibreNMS logged there, the totals, the five rules and devices that fired most and, for the whole fleet, how many rules are disabled or notify no one | `scope`, `window`; `filter` `by`, `rule`, `severity`, `state`, `entity`, `disabled`, `notifies`, `fired`; `sort` `fired`, `flaps`, `last_fired`, `name` |
+| `help` | What each view answers and takes: without `topic` the views and what they share (scope, filter, sort, paging, window, units); with `topic` (a view) its scope keys, each filter with what it takes, each sort, the keys of its rows and summary, and examples. Answered by the plugin, without a LibreNMS call | `topic` |
 
 `scope` narrows a report to devices: `device` (an id, a hostname, or a sysName, display name,
 first label, IP or phrase), `devices` (a list of them), `group` (a device group's name or id),
@@ -318,7 +323,17 @@ than guess; so does a port name that could be several ports.
 {"view": "neighbours", "filter": {"remote_unmonitored": true}}
 {"view": "locate", "term": "00:11:22:33:44:55"}
 {"view": "vlans", "scope": {"device": "access-sw2"}, "filter": {"vlan": 20}}
+{"view": "alerts", "filter": {"severity": "critical", "acked": false}}
+{"view": "alerts", "scope": {"device": "edge-rtr1"}, "filter": {"entity_type": "port"}}
+{"view": "alert_history", "window": "7d", "sort": "fired", "limit": 10}
+{"view": "alert_history", "scope": {"device": "edge-rtr1"}, "window": "7d", "filter": {"by": "event"}}
+{"view": "alert_history", "filter": {"notifies": false}}
+{"view": "help", "topic": "alert_history"}
 ```
+
+The tool's description names the views and what they share; each view's filters, sorts, row keys and
+examples are in view `help`, so the schema sent to the model on every turn stays small. A scope,
+filter or sort key a view does not take is refused, naming those it does and pointing to `help`.
 
 A port view reads the ports of a scope of up to 10 devices one device at a time, and otherwise one
 listing of every port, always naming the columns it needs; LibreNMS keeps their counters in mixed
@@ -332,7 +347,16 @@ learned the MAC, its forwarding entries and the ARP tables, then the VLANs and l
 devices that learned it (a port whose monitored neighbour learned the MAC too is an uplink, not an
 edge port). `vlans` reads the VLANs of up to 10 devices one device at a time, otherwise every
 device's at once, and for one VLAN the ports of each device that has it, with their VLAN
-memberships.
+memberships. `alerts` reads the faults once (LibreNMS has no device filter for them; one severity
+at a time when the answer is too large to read) and, for a port fault whose rows hold no label, the
+ports of its device (four columns, at most 10 devices). `alert_history` reads the alert rules
+once and the alert log from the window's start, newest first, 250 entries a request (fewer while
+LibreNMS's answer is too large to read) and at most 2,000 a report: each device's log for a scope
+of up to 10 devices (none for a scope that holds no device, which answers no rows), otherwise every
+device's; a window that holds more is answered `partial`.
+LibreNMS writes alert-log times in its server's zone: without `librenms_timezone` the window is
+read from a bound early enough to hold it in any zone (up to 26 hours more), and the result says
+so (`exact: false`).
 
 Every report carries `data_as_of` (LibreNMS's clock, from the `Date` of its answer), `timezone`
 (see `librenms_timezone`), `count`, `returned`, `offset`, `truncated` and `next_offset` (more rows:
@@ -597,7 +621,7 @@ commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query
 listing.py    librenms_query's where and sort over the rows read
-reports/      librenms_report: views (find, devices, ports, port, capacity, neighbours, locate, vlans), shared reads, scope, budgets, units, ranking
+reports/      librenms_report: views (find, devices, ports, port, capacity, neighbours, locate, vlans, alerts, alert_history), help, shared reads, scope, budgets, units, ranking
 redact.py     credential masking, clipping, terminal-safe text
 diff.py       value normalisation and field-level diffs
 resources/    one module per resource: validate, resolve, diff, execute, verify, revert

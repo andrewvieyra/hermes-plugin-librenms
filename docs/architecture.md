@@ -28,7 +28,8 @@ v0 route to what the plugin does with it.
 | `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings, partial reasons), scope resolution with ambiguity, argument checks, the result envelope | `client`, `routes`, `listing`, `redact`, `settings` |
 | `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
 | `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; zone-safe times, and server-local times read in `librenms_timezone` | none |
-| `reports/find`, `reports/devices`, `reports/ports`, `reports/port` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context` |
+| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context`, `redact` (`alert_entities`) |
+| `reports/help` | View `help`: what each view answers, its filters (with what they take, read from the view), sorts, row and summary keys and examples, answered without a LibreNMS call | `reports/context` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
@@ -85,7 +86,10 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   0 (unchanged since the SNMP agent started). Fault, alert-log, eventlog and syslog times are server-local
   `Y-m-d H:i:s`, and no API field names the server's zone (`system`'s `local_date` is the date of
   the LibreNMS commit), so `reports/units` reads them only in `librenms_timezone` and otherwise
-  gives them no age; `timezone` says which zone a report used.
+  gives them no age; `timezone` says which zone a report used. A window (`alert_history`) is
+  counted back from LibreNMS's clock and sent as server-local text: exact in `librenms_timezone`,
+  and without it from 12 hours earlier still, which holds the window whatever the server's zone
+  (UTC-12 to UTC+14) and may hold up to 26 hours more, as the result says (`exact: false`).
 - **Views.** `find` ranks devices (names, attributes, management and interface addresses, ARP
   entries for a MAC), ports (an interface name, `ports/search`), locations, device groups and port
   groups, 10 an answer (`count` counts them all), `ambiguous` when the best two score within 10.
@@ -115,7 +119,21 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   port, while a port to a monitored hypervisor, access point or server that did not learn it, or
   to the device at the IP looked up, can be. `vlans` lists each device's VLANs and, for one VLAN
   on up to 10 devices, the ports in it from `with=vlans`, untagged when LibreNMS's PortVlan says
-  so or the VLAN is the port's own `ifVlan`.
+  so or the VLAN is the port's own `ifVlan`. `alerts` reads the open faults once (in the states
+  `filter.state` names, narrowed at LibreNMS by one severity or a rule's id; one severity at a time
+  when the answer is too large to read) and keeps the scope's; what alerted is named from the rows
+  the rule matched through `redact.alert_entities`, the allow-list of label keys `librenms_query`
+  uses for `entities`, and a port fault without a label from its device's ports. `alert_history`
+  reads the rules once and the alert log from the window's start, newest first, in pages (halved
+  while an answer is too large to read) up to 2,000 entries, per device for a scope of up to 10;
+  it counts alerts raised, cleared and raised again (`flaps`, per fault) per rule, device or
+  event. Neither view puts any other part of a fault's or entry's `details` (every column of
+  every table the rule joins, and the alert's contacts) in a row or a summary.
+- **Help.** The tool's schema names the views and the contract they share; each view's filters,
+  sorts, row keys and examples are view `help`'s (`reports/help`), answered in the handler before a
+  client is made. A filter's line says what it takes from the view's own definition, and a test
+  holds every view's filters and sorts to a line each in `help` and runs every example. A scope,
+  filter or sort key a view does not take is refused, naming those it does and pointing to `help`.
 
 ## The plan document
 
