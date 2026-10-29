@@ -24,6 +24,8 @@ How the plugin maps onto the LibreNMS API v0, route by route: all 145 registrati
 - **plan**: written only through a reviewed plan (`librenms_plan`, then `librenms_apply`), as the
   resource operation named. Every write path uses numeric ids, is verified by re-reading and has a
   journaled inverse or an explicit inverse kind. Operations behind a gate say which.
+- **report**: also read by `librenms_report`, which builds its paths from fixed words and resolved
+  ids and checks each against this same table before sending it (see Reports below).
 - **refused**: `librenms_query` refuses it, with the reason given; no setting enables it.
 - **not in 0.1.0**: the plugin never sends it, for the reason given.
 
@@ -51,6 +53,16 @@ or an array (`hostname[]` is `hostname`), which would pass the paging clamps and
 `hostname`, `limit`, `start`, `sortorder` and `columns` must also be written in lower case.
 `columns` is trimmed (LibreNMS checks trimmed names but selects them as sent, so a blank after a
 comma was an HTTP 500) and must hold column names only.
+
+## Reports
+
+`librenms_report` reads these routes, nothing else, at most 30 requests a call:
+
+| View | Routes |
+|---|---|
+| every view | #83 `devices` (once; scope, names, states); for `scope.group` #21 and #20 by the group's id; for a `scope.location` no device is at, #134 |
+| `find` | #134, #21, #28; #103 when the term holds an interface name; #83 with `type=ipv4`, `ipv6` or `mac` when it is an address, and once more with an address no device holds when every device answered (an older LibreNMS reads an unknown `type` as no filter) |
+| `devices` | #60 for each down device on the page (at most 20) |
 
 ## System
 
@@ -103,8 +115,8 @@ comma was an HTTP 500) and must hold column names only.
 
 | # | Route | Coverage |
 |---|---|---|
-| 20 | `GET devicegroups/{name}` | query; planning reads (static membership) |
-| 21 | `GET devicegroups` | query; planning reads (lookup by name) |
+| 20 | `GET devicegroups/{name}` | query; planning reads (static membership); report: `scope.group`, by the group's id, never `full=1` |
+| 21 | `GET devicegroups` | query; planning reads (lookup by name); report: `scope.group`, `find` |
 | 22 | `POST devicegroups` | plan: `device_group` `create` (static with `devices`, or dynamic with `rules`); also the rollback of a delete |
 | 23 | `PATCH devicegroups/{name}` | plan: `device_group` `update` (`name`, `desc`, `rules`, static membership as the full list, with `devices`, `devices_add` or `devices_remove`); also its rollback |
 | 24 | `DELETE devicegroups/{name}` | plan: `device_group` `delete` (`allow_delete`; rollback re-creates it with a new id, and alert rules, user permissions and maintenance linked to the old id are not restored) |
@@ -116,7 +128,7 @@ comma was an HTTP 500) and must hold column names only.
 
 | # | Route | Coverage |
 |---|---|---|
-| 28 | `GET port_groups` | query |
+| 28 | `GET port_groups` | query; report: `find` |
 | 29 | `GET port_groups/{name}` | query |
 | 30 | `GET portgroups/multiport/bits/{id}` | refused: graph image |
 | 31 | `GET portgroups/{group}` | refused: graph image |
@@ -168,7 +180,7 @@ on the poller.
 | 57 | `GET devices/{hostname}` | query (SNMP credentials masked); planning reads |
 | 58 | `GET devices/{hostname}/discover` | refused in `librenms_query`: this GET schedules a rediscovery, a write. plan: `device` `discover` (rollback not needed) |
 | 59 | `GET devices/{hostname}/availability` | query |
-| 60 | `GET devices/{hostname}/outages` | query |
+| 60 | `GET devices/{hostname}/outages` | query; report: `devices` (`down_since`, by device id, for at most 20 down devices a page) |
 | 61 | `GET devices/{hostname}/graphs/health/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/health` lists the graphs) |
 | 62 | `GET devices/{hostname}/graphs/wireless/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/wireless` lists the graphs) |
 | 63 | `GET devices/{hostname}/vlans` | query |
@@ -191,7 +203,7 @@ on the poller.
 | 80 | `GET devices/{hostname}/services/{id}/graphs/{datasource}` | refused: graph image |
 | 81 | `POST devices/{hostname}/eventlog` | not in 0.1.0: it appends an eventlog row that cannot be removed (LibreNMS accepts it even from a global-read token), and the eventlog is the record plans are linked to |
 | 82 | `GET devices/{hostname}/{type}` | refused: LibreNMS serves every device sub-path it has no other route for as a graph image, so a mistyped sub-path lands here too |
-| 83 | `GET devices` | query (SNMP credentials masked); planning reads (`type=location_id`: the devices at a location) |
+| 83 | `GET devices` | query (SNMP credentials masked); planning reads (`type=location_id`: the devices at a location); report: every view (one listing a report, named fields only), `find` (`type=ipv4`, `ipv6` or `mac` for an address). `type` with `query`: `hostname`, `display`, `location`, `serial`, `version`, `hardware`, `features` match part of the value, `sysName`, `os`, `type`, `location_id`, `device_id` the whole, `ipv4`, `ipv6` an address on a port and `mac` an ARP entry on one; `up`, `down`, `disabled`, `ignored`, `active` need no `query`; any other `type` is no filter at all |
 | 84 | `POST devices` | plan: `device` `create` (`allow_device_add`; SNMP credentials only as `{"env": "LIBRENMS_SNMP_…"}` references, resolved at apply time; rollback deletes the device) |
 | 85 | `DELETE devices/{hostname}` | plan: `device` `delete` (`allow_delete`; irreversible: LibreNMS drops the device's RRD history, ports, alerts and group membership, and re-adding makes a new device) |
 | 86 | `PATCH devices/{hostname}` | plan: `device` `update` (`notes`, `purpose`, `location`, `poller_group`, `display_template`, the `disabled`/`ignore`/`disable_notify`/`ignore_status`/`override_sysLocation` flags, `type`, `icon`, and `overwrite_ip` with `allow_device_add`; never SNMP settings, which v0 cannot change); also its rollback |
@@ -221,7 +233,7 @@ on the poller.
 | 100 | `GET ports/{portid}/fdb` | query |
 | 101 | `GET ports/{portid}/ip` | query |
 | 102 | `GET ports/{portid}/transceiver` | query |
-| 103 | `GET ports/search/{field}/{search?}` | query; with `{search}`, `{field}` is a column list and is trimmed like `columns`; alone, LibreNMS reads it as the search term over `ifAlias`, `ifDescr` and `ifName` |
+| 103 | `GET ports/search/{field}/{search?}` | query; with `{search}`, `{field}` is a column list and is trimmed like `columns`; alone, LibreNMS reads it as the search term over `ifAlias`, `ifDescr` and `ifName`; report: `find` (`ifName,ifDescr` and an interface name, with a `columns` list) |
 | 104 | `GET ports/mac/{search}` | query (the MAC in any usual form; ports that learned it, fewest FDB entries first; `filter=first` gives that port alone) |
 | 105 | `GET ports` | query |
 | 106 | `GET ports/{portid}/description` | query; planning reads |
@@ -258,7 +270,7 @@ on the poller.
 | 131 | `GET resources/nac/{mac}` | query; `{mac}` normalised as #122 |
 | 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device |
 | 133 | `GET resources/vlans` | query (`?hostname=` resolved) |
-| 134 | `GET resources/locations` | query; planning reads (lookup by name) |
+| 134 | `GET resources/locations` | query; planning reads (lookup by name); report: `find`, `scope.location` when no device is at the location named |
 
 ## Inventory, port security
 

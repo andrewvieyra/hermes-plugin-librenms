@@ -131,8 +131,9 @@ plugins:
         allow_services: false        # service operations are refused unless true
         allow_insecure_transport: false  # http://, LIBRENMS_VERIFY_SSL=false, plain or unverified audit sinks
         max_operations: 100          # cap per plan (at most 1000)
-        max_query_results: 500       # rows per librenms_query call, the rest by offset (at most 5000)
+        max_query_results: 500       # rows per librenms_query or librenms_report call, the rest by offset (at most 5000)
         max_result_chars: 60000      # characters per tool result for the model (8000 to 90000)
+        librenms_timezone: ""        # IANA zone LibreNMS runs in (e.g. Europe/Amsterdam); empty: not known
         max_plan_age_hours: 24       # older plans are refused by librenms_apply
         max_maintenance_hours: 72    # longest maintenance window a plan may schedule
         plan_retention_days: 90      # prune plan files older than this; 0 keeps them forever
@@ -147,6 +148,16 @@ plugins:
 Hermes shows the model only a 1,500-character preview: 100,000 characters, or 15% of the context
 window (at four characters a token) on a smaller model. On a model with a window under 100K tokens,
 set it to about half the window's token count (`32000` for 64K tokens).
+
+`librenms_timezone` is the zone LibreNMS runs in (its PHP `date.timezone`). LibreNMS writes fault,
+alert-log, eventlog and syslog times in that zone with no offset, and no API field says which zone
+it is, so a time such as `2026-10-28 10:02:00` is an hour off for a model that reads it as UTC when
+LibreNMS runs in Amsterdam. Every `librenms_report` answer names this zone in `timezone`, or says
+it is unknown while the setting is empty. The views that show fault and log times (alerts and
+events, in later releases) read them in this zone, and without it give them no age. The 0.4.0
+views show only times that are exact in any zone: device times (ISO-8601 UTC), outages (unix
+seconds) and uptimes, every age counted to LibreNMS's own clock (the `Date` of its answer). A name
+the host's zone database does not hold is refused and the setting stays empty.
 
 A value that cannot be read as its setting's type fails closed: a flag takes the value that lets the
 model do least, a number its default (or its upper limit when it is too large), and an unknown
@@ -175,6 +186,7 @@ environment):
 | Tool | Writes | Purpose |
 |---|---|---|
 | `librenms_query` | no | Look up devices, ports, alerts, sensors and logs through any allowed API v0 GET path, or `{"action": "status"}` for connectivity, version and settings |
+| `librenms_report` | no | Answer a question in one call: `find` what a name, address or phrase could mean (ranked, with why), or report on `devices` (state, down since, uptime, last poll, naming checks) with names joined and counts summed |
 | `librenms_plan` | no | Validate and diff a list of operations; save a plan |
 | `librenms_apply` | yes | Apply a plan with preconditions, verified writes, a journal and auto-rollback; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or partially applied plan |
@@ -257,6 +269,45 @@ after every row is read.
 [docs/api-coverage.md](docs/api-coverage.md) maps every v0 route to a query, a plan operation, or the
 reason it is refused.
 
+### Reports
+
+`librenms_query` hands the model LibreNMS's rows as they are: ids rather than names, octets and
+timeticks rather than rates and ages, and whole listings to scan for "which" and "how many".
+`librenms_report` answers such questions in the plugin. It reads LibreNMS through the same
+allow-list (GET only; a path off it is refused before it is sent), at most 30 requests per call,
+joins the rows, and returns a `summary` (the counts a short answer needs, over every row that
+passed the filter) and the `rows`, each naming its device (`device_id`, `hostname`, `display`)
+with units in the key names (`uptime_s` beside `uptime: "100d 0h"`). It never writes, needs no
+approval, and is available in every `write_mode`.
+
+| View | Answers | Takes |
+|---|---|---|
+| `find` | What a hostname, sysName, display name, IP, MAC, interface name or phrase ("the core switch in SFO") could mean: devices, ports, locations, device groups and port groups, best first, each with a `score` and `why`, 10 an answer (`count` counts every candidate, `offset` reads on, and past 10 a note says to narrow the term). An IP or MAC that every device holds matches each; an older LibreNMS that ignores the address filter is detected and set aside. `ambiguous` is true when the best two score within 10 of each other: the model asks the user which one they mean | `term`; `filter.kind` |
+| `devices` | Per device: `status` (`up`, `down`, `disabled`, `ignored`, as LibreNMS decides them), `status_reason`, `down_since`/`down_for` (its open outage, read for up to 20 down devices on the page), `uptime`, `booted_at`, `last_polled` and its age, os, hardware, version, type, location, purpose, and `checks` (`naming_mismatch`: hostname and sysName name different hosts; `no_location`; `no_purpose`). `summary` counts states and checks | `scope`; `filter` `status`, `rebooted_within`, `not_polled_for` (`30m`, `24h`, `7d`), `naming_mismatch`, `no_location`, `no_purpose`, `os`, `type`; `sort` `name`, `status`, `uptime`, `last_polled` |
+
+`scope` narrows a report to devices: `device` (an id, a hostname, or a sysName, display name,
+first label, IP or phrase), `devices` (a list of them), `group` (a device group's name or id),
+`location` (a name, an id, or part of a name: every location that holds it, as LibreNMS's own
+`type=location` filter reads it), `os` and `type`; every key given must hold. A device named by
+anything but its id or hostname resolves only when exactly one device matches it exactly, or only
+one matches every word of the phrase; the result says how (`scope.resolved`). Otherwise the
+report answers `ambiguous: true` with the candidates and reports nothing, rather than guess.
+
+```json
+{"view": "find", "term": "core switch sfo"}
+{"view": "devices", "filter": {"status": "down"}}
+{"view": "devices", "scope": {"location": "SFO"}, "filter": {"rebooted_within": "24h"}}
+{"view": "devices", "filter": {"not_polled_for": "15m"}, "sort": "last_polled"}
+```
+
+Every report carries `data_as_of` (LibreNMS's clock, from the `Date` of its answer), `timezone`
+(see `librenms_timezone`), `count`, `returned`, `offset`, `truncated` and `next_offset` (more rows:
+read on with `offset`), and `partial` with a `partial_reason` when the data itself is incomplete
+(the request budget ran out, or a read for one device failed); `notes` say what to do next. Rows
+are cut to `limit` (default 20, at most `max_query_results`; 10 for `find`) and to
+`max_result_chars`. Text from LibreNMS is clipped to 200 characters, escaped like every result,
+and named in `untrusted_fields`.
+
 ### Operations
 
 `librenms_plan` takes `description` and an ordered `operations` list:
@@ -328,8 +379,9 @@ error; anything but 0 is printed on stderr. So `hermes librenms check 7dde && he
 
 ## Safety model
 
-- **Read-only until a plan exists.** `librenms_query`, `librenms_plan` and `librenms_plans` never
-  write, and the query tool calls only allow-listed GET routes.
+- **Read-only until a plan exists.** `librenms_query`, `librenms_report`, `librenms_plan` and
+  `librenms_plans` never write, and the query and report tools call only allow-listed GET routes
+  (a report at most 30 of them per call).
 - **Every write is diffed first.** Updates send only the fields that differ; unchanged operations
   become `noop` steps.
 - **Optimistic concurrency without stamps.** LibreNMS has no `last_updated` or ETag, so each step
@@ -416,8 +468,9 @@ and MCP tools, and a plugin cannot opt in, so a result that returns text from Li
 status and of an error, which is LibreNMS's answer, the `note` of an empty answer; a plan's `diff`
 and `warnings`, dry-run `conflicts`, and the `journal`, `report`, `eventlog`, `failure`,
 `auto_rollback_error`, `apply`, `rollback`, `checks` and `steps` of apply, rollback and
-`librenms_plans`), and before them an `untrusted_notice` telling the model that this is data, not
-instructions. The plugin's own keys (`next_step`, `note` on a cut listing, counts) are not listed.
+`librenms_plans`; for a report, the keys of its rows and scope that hold such text, such as
+`hostname`, `sysName`, `location`, `purpose`, `port` and a candidate's `why`), and before them an
+`untrusted_notice` telling the model that this is data, not instructions. The plugin's own keys (`next_step`, `note` on a cut listing, counts) are not listed.
 Refusals and errors are the plugin's own text and carry no marker of their own, but they may quote
 LibreNMS: an `error` holds LibreNMS's error message, the refusal of an unknown hostname names the
 devices LibreNMS holds whose names come close (autodiscovered ones among them), and a plan's
@@ -431,8 +484,8 @@ model reads and a person does not) and C0/C1 controls written as escapes (`\u202
 and a Windows line end reaches the model as a newline. The emoji and text presentation selectors
 stay only right after a symbol, an emoji or a keycap they change; after a letter or a digit, at
 the start of a text or after another selector they show as nothing and are escaped too. Every
-limit on that text (2,000 characters a value, 200 an alert's entity, 300 a linked eventlog row,
-400 and 500 of an error quoting LibreNMS) counts the escapes, so it bounds what the model reads.
+limit on that text (2,000 characters a value, 200 a report's value or an alert's entity, 300 a
+linked eventlog row, 400 and 500 of an error quoting LibreNMS) counts the escapes, so it bounds what the model reads.
 
 Escaping shows what would not show; it does not tell apart what shows alike. An escape reads the
 same as those characters written in LibreNMS (a Windows path, a JSON-encoded log line), so the
@@ -508,6 +561,7 @@ commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query
 listing.py    librenms_query's where and sort over the rows read
+reports/      librenms_report: views (find, devices), shared reads, scope, budgets, units, ranking
 redact.py     credential masking, clipping, terminal-safe text
 diff.py       value normalisation and field-level diffs
 resources/    one module per resource: validate, resolve, diff, execute, verify, revert
@@ -516,7 +570,7 @@ executor.py   apply with journal and verification, rollback, eventlog linking
 store.py      plan persistence and locks under plugin-data
 audit.py      actor capture and the audit.jsonl event stream
 sinks.py      optional syslog / HTTP forwarding of audit events
-timefmt.py    UTC-to-local rendering for reports (Hermes' timezone setting)
+timefmt.py    UTC-to-local rendering for plan diffs and journals (Hermes' timezone setting)
 settings.py   operator settings, fail-closed
 SKILL.md      bundled skill: the workflow the model follows
 ```

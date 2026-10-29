@@ -88,6 +88,20 @@ references (resolved to ids before the request), and whether `?hostname=` is hon
 that returns an image, returns secrets, or changes state gets a `refused` reason instead. Add a
 test in `tests/test_routes.py` and the row in `docs/api-coverage.md`.
 
+## Adding a report view
+
+A `librenms_report` view is a module in `reports/` with a `View` (its builder, the scope keys,
+filters and sorts it takes) registered in `reports.VIEWS`. It reads only through
+`ReportContext.get` or `optional` (fixed words and resolved ids; never a path the model wrote),
+resolves `scope` with `ReportContext.scope`, and answers with `ReportContext.envelope`: rows that
+name their device (`brief`) and port (`port_label`), units in key names with readable twins
+(`reports/units`), a `summary` over every row that passed the filter, a stable order with a
+unique tie-break, and `partial` whenever data is missing. Add its name, filters and sorts to the
+schema (within the budget), and tests in `tests/test_reports.py`: the happy path, units and edge
+cases, filters, sorts and paging, the call budget, the output budget, and the GET-only, allow-list
+and no-credential assertions. Then the README's Reports table, the skill, and the routes it reads
+in `docs/api-coverage.md`.
+
 ## Workflow
 
 ```bash

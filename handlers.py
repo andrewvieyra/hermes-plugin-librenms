@@ -27,7 +27,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Tuple
 
-from . import audit, listing, sinks
+from . import audit, listing, reports, sinks
 from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
 from .executor import (
     EVENTLOG_MESSAGE_CHARS,
@@ -497,20 +497,21 @@ def _fit_rows(
     payload: Dict[str, Any],
     key: str,
     budget: int | None,
-    note: Callable[[int, int], str],
+    note: Callable[[int, int], Any],
     offset: int | None = None,
+    note_key: str = "note",
 ) -> Dict[str, Any]:
     """*payload* with as many leading entries of its list *key* as keep it within *budget* characters serialised (all
     of them without a budget). When some are left out, ``returned`` is the number kept, ``truncated`` is true and
-    ``note`` says how to see the rest: *note* is given the number kept and the number there were. Given the *offset*
-    of the first entry in the whole listing, ``next_offset`` is that of the first one left out, unless that is the
-    first entry, which does not fit on its own (:func:`_read_on`)."""
+    *note_key* (``note``; a report's ``notes``) says how to see the rest: *note* is given the number kept and the
+    number there were. Given the *offset* of the first entry in the whole listing, ``next_offset`` is that of the
+    first one left out, unless that is the first entry, which does not fit on its own (:func:`_read_on`)."""
     rows = payload.get(key)
     if budget is None or not isinstance(rows, list) or _size(payload) <= budget:
         return payload
 
     def cut(kept: int) -> Dict[str, Any]:
-        out = {**payload, key: rows[:kept], "returned": kept, "truncated": True, "note": note(kept, len(rows))}
+        out = {**payload, key: rows[:kept], "returned": kept, "truncated": True, note_key: note(kept, len(rows))}
         return out if offset is None else _read_on(out, offset)
 
     # The room for rows, measured with one kept: every cut but the empty one has that shape, and the empty one's note
@@ -557,6 +558,27 @@ def _query_note(budget: int | None, offset: int) -> Callable[[int, int], str]:
             f"cut at {kept} of {of} rows to stay within max_result_chars ({budget} characters): name only the keys "
             f"you need in fields, or read on with offset {offset + kept}"
         )
+
+    return note
+
+
+def _report_note(budget: int | None, payload: Dict[str, Any]) -> Callable[[int, int], List[str]]:
+    """A report's ``notes`` once :func:`_fit_rows` cut its rows: the notes it had, then what was cut and where to read
+    on."""
+    offset, notes = payload.get("offset") or 0, list(payload.get("notes") or [])
+
+    def note(kept: int, of: int) -> List[str]:
+        if not kept:
+            return [
+                *notes,
+                f"the row at offset {offset} does not fit within max_result_chars ({budget} characters) on its own; "
+                f"offset {offset + 1} reads on past it",
+            ]
+        return [
+            *notes,
+            f"cut at {kept} of the {of} rows of this page to stay within max_result_chars ({budget} characters): read "
+            f"on with offset {offset + kept}, or narrow the scope or filter",
+        ]
 
     return note
 
@@ -855,6 +877,34 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 @guarded
+def librenms_report(args: Dict[str, Any], **kwargs: Any) -> str:
+    """A report view (:mod:`reports`): read-only, every GET through the route allow-list. A malformed argument is an
+    error; a refusal (a scope that names nothing, a read off the allow-list) is audited as ``query_refused``, as
+    librenms_query's are. The result is kept within ``max_result_chars`` by cutting its rows."""
+    settings = get_settings()
+    client = make_client(settings)
+    try:
+        payload = reports.run(client, settings, args)
+    except reports.ArgumentError as exc:
+        return _fail(str(exc))
+    except reports.ReportError as exc:
+        audit.emit(
+            "query_refused",
+            plan_id=None,
+            actor=_actor_from(kwargs),
+            librenms_url=client.base_url,
+            tool="librenms_report",
+            view=str(args.get("view") or "")[:40],
+            path=exc.path,
+            reason=clip(str(exc), audit.REASON_LIMIT),
+        )
+        return _fail(str(exc), refused=True)
+    budget = _budget(settings, kwargs)
+    key = "candidates" if payload.get("candidates") else "rows"  # an ambiguous scope answers with candidates
+    return _json(_fit_rows(payload, key, budget, _report_note(budget, payload), payload["offset"], "notes"))
+
+
+@guarded
 def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
     settings = get_settings()
     client = make_client(settings)
@@ -1095,6 +1145,7 @@ def _check(check: Any, start: int, end: int) -> Any:
 
 HANDLERS = {
     "librenms_query": librenms_query,
+    "librenms_report": librenms_report,
     "librenms_plan": librenms_plan,
     "librenms_apply": librenms_apply,
     "librenms_rollback": librenms_rollback,

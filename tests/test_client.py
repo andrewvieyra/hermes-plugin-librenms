@@ -941,6 +941,17 @@ class CallLog(unittest.TestCase):
         self.assertEqual((client.calls, client.reset_calls()), ([], []))
         self.assertEqual(client.last_call["path"], "/api/v0/devices/1")  # last_call survives a reset
 
+    def test_last_date_is_the_date_header_of_the_last_answer_that_had_one(self):
+        date = {"Content-Type": "application/json", "Date": "Wed, 28 Oct 2026 12:00:00 GMT"}
+        client, _, _ = make(Resp(200, OK, headers=date), Resp(200, OK), Resp(404, {"message": "No ports found"}))
+        self.assertIsNone(client.last_date)
+        client.get("system")
+        self.assertEqual(client.last_date, "Wed, 28 Oct 2026 12:00:00 GMT")
+        client.get("system")  # an answer without one leaves the last
+        client.get_or_none("devices/1/ports")
+        self.assertEqual(client.last_date, "Wed, 28 Oct 2026 12:00:00 GMT")
+        self.assertNotIn("date", client.last_call)  # the journal's request record stays as it was
+
     def test_the_call_log_keeps_the_latest_entries(self):
         client, _, _ = make(Resp(200, OK))
         for number in range(client_mod.MAX_CALLS + 5):

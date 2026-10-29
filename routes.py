@@ -430,12 +430,21 @@ def _mac(route: Route, value: str) -> str:
     """*value* as the 12 lowercase hex digits LibreNMS stores. ``resources/fdb/{mac}`` and ``resources/nac/{mac}``
     compare the segment with the column exactly, so a MAC written with separators is never found and the empty
     answer would read as "not on the network"; and ``0`` reads as no filter at all."""
-    text = value.strip()
-    if not _MAC_RE.match(text):
+    digits = mac_hex(value)
+    if digits is None:
         raise QueryError(
             f"{route.template} takes a whole MAC address (00:11:22:33:44:55, 00-11-22-33-44-55, 0011.2233.4455 or "
             f"001122334455), not {value[:40]!r}"
         )
+    return digits
+
+
+def mac_hex(value: str) -> str | None:
+    """A whole MAC address in any of its usual spellings as the 12 lowercase hex digits LibreNMS stores; None for
+    anything else."""
+    text = value.strip()
+    if not _MAC_RE.match(text):
+        return None
     if ":" in text or "-" in text:  # by the separator, not the length: 0:0:c:7:ac:1 is 12 characters too
         return "".join(part.zfill(2) for part in re.split("[:-]", text)).lower()
     return text.replace(".", "").lower()

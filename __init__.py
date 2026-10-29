@@ -1,6 +1,6 @@
 """hermes-plugin-librenms — LibreNMS change management plugin for Hermes Agent.
 
-Registers five tools (query / plan / apply / rollback / plans), three hooks (the approval prompt for apply and
+Registers six tools (query / report / plan / apply / rollback / plans), three hooks (the approval prompt for apply and
 rollback, the user's request for the audit trail, the approval decision), a ``/librenms`` slash command, a
 ``hermes librenms`` CLI subcommand, and the bundled ``librenms:workflow`` skill. Registration performs no network
 I/O; the LibreNMS client is created lazily inside each tool call.
@@ -22,6 +22,7 @@ _PLUGIN_DIR = Path(__file__).parent
 _TOOLSET = "librenms"
 _EMOJI = {
     "librenms_query": "🔎",
+    "librenms_report": "📊",
     "librenms_plan": "📋",
     "librenms_apply": "🚀",
     "librenms_rollback": "⏪",

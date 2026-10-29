@@ -233,6 +233,12 @@ def _natural(text: str) -> Tuple[Tuple[Any, ...], str, str]:
     return tuple(runs), folded, text
 
 
+def natural_key(text: Any) -> Tuple[Tuple[Any, ...], str, str]:
+    """The key *text* sorts by in natural order, ignoring case (``Gi1/0/2`` before ``Gi1/0/10``), as ``sort`` orders
+    text; None and other values read as ``""``. For the report views' own orders."""
+    return _natural(text if isinstance(text, str) else "")
+
+
 def _text(value: Any) -> str:
     """A value as a ``contains`` reads it: a text as it is, a number as JSON writes it; "" for the other kinds."""
     if isinstance(value, str):

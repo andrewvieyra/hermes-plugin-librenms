@@ -3,18 +3,20 @@
 It is a ``requests``-compatible session and behaves like LibreNMS where the plugin depends on it (specs/ln-*.md):
 ``X-Auth-Token`` auth answered with Laravel's bare 401; the catch-all 404 ``This API route doesn't exist.`` for an
 unknown path and for a known path with the wrong method; a web server's 301 for a trailing slash; the ``{status,
-<key>, message, count}`` envelope, with ``count`` only where PHP returns an array; 200 or 201 per handler; lists that
-404 when empty; writes answered with a message only (the new location's id inside it, the new service as JSON inside
-it); the no-op traps (an unchanged service edit is a 500, an unchanged group name a 422) and the silent no-ops
-(unknown device fields, ``"true"``/``"false"`` for a device flag, a location edit not sent as JSON); alert-rule
-writes that return no id and rebuild everything the body omits; fault ack and unmute that change every open sibling
-when the rule does not notify per entity (or has more open faults than its limit); ids that are never reused; a device
-added with poller group 0 put in the default group; eventlog paging with an exact ``DESC`` and an id-valued numeric
-``from``; the eventlog rows DeviceObserver writes; and SNMP secrets in clear for an admin token. The read-only routes
-the report views read answer as their handlers do too: the result key, ``count`` only for a PHP array, 404s for empty
-lists where the handler sends one, an unknown hostname in a filter read as no filter, column lists checked trimmed
-but selected as sent, ``resources/fdb/{mac}`` compared exactly, the alert log's details decoded, and components as
-an object keyed by id. Bills are modelled for CDR bills in the current period only.
+<key>, message, count}`` envelope, with ``count`` only where PHP returns an array, and the web server's ``Date``
+(``send_date``); 200 or 201 per handler; lists that 404 when empty; writes answered with a message only (the new
+location's id inside it, the new service as JSON inside it); the no-op traps (an unchanged service edit is a 500, an
+unchanged group name a 422) and the silent no-ops (unknown device fields, ``"true"``/``"false"`` for a device flag,
+a location edit not sent as JSON); alert-rule writes that return no id and rebuild everything the body omits; fault
+ack and unmute that change every open sibling when the rule does not notify per entity (or has more open faults than
+its limit); ids that are never reused; a device added with poller group 0 put in the default group; eventlog paging
+with an exact ``DESC`` and an id-valued numeric ``from``; the eventlog rows DeviceObserver writes; and SNMP secrets
+in clear for an admin token. The read-only routes the report views read answer as their handlers do too: the result
+key, ``count`` only for a PHP array, 404s for empty lists where the handler sends one, an unknown hostname in a
+filter read as no filter (and an unknown ``devices`` ``type`` as none), the ``ipv4``, ``ipv6`` and ``mac`` device
+filters, column lists checked trimmed but selected as sent, ``resources/fdb/{mac}`` compared exactly, the alert
+log's details decoded, and components as an object keyed by id. Bills are modelled for CDR bills in the current
+period only.
 
 Test hooks: :meth:`FakeLibreNMS.fail_on` (a forced answer or exception, optionally after the write took effect),
 :meth:`~FakeLibreNMS.touch` (an edit made outside the plugin), :meth:`~FakeLibreNMS.after` (another client's write
@@ -32,7 +34,8 @@ import json
 import re
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any, Callable, Dict, Iterator, List, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
@@ -44,12 +47,14 @@ _CATCH_ALL = "This API route doesn't exist."
 _TABLES = (
     "devices", "locations", "device_groups", "services", "rules", "faults", "ports", "eventlog", "poller_groups",
     "port_groups", "links", "sensors", "transceivers", "components", "bgp_peers", "ospf_nbrs", "alert_log", "syslog",
-    "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills",
+    "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills", "ipv4_addresses",
+    "ipv6_addresses",
 )  # fmt: skip
 _ID_KEYS = {
     "devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id",
     "sensors": "sensor_id", "bgp_peers": "bgpPeer_id", "syslog": "seq", "vlans": "vlan_id",
     "ports_fdb": "ports_fdb_id", "ports_nac": "ports_nac_id", "availability": "availability_id", "bills": "bill_id",
+    "ipv4_addresses": "ipv4_address_id", "ipv6_addresses": "ipv6_address_id",
 }  # fmt: skip
 
 # App\Http\Resources\Device, in its key order (dependency_parent_* only where list_devices loads parents).
@@ -426,6 +431,7 @@ class FakeLibreNMS:
         self.hooks: Dict[str, List[Callable[[], None]]] = {}
         self.redirect_to: str | None = None
         self.now = datetime(2026, 10, 28, 12, 0, 0)  # the server clock (UTC); each write moves it on a second
+        self.send_date = True  # every answer carries a Date header, as the web server in front of LibreNMS sends it
         self._routes = [
             (verb, _compile(tpl, _REST.get(name)), name, tpl, getattr(self, handler))
             for verb, tpl, name, handler in _ROUTES
@@ -519,6 +525,8 @@ class FakeLibreNMS:
         self.calls.append(call)
         response = self._answer(call["method"], call["path"], rest, req)
         call["status"] = response.status_code
+        if self.send_date:  # the web server's Date, from the server clock (UTC)
+            response.headers.setdefault("Date", format_datetime(self.now.replace(tzinfo=timezone.utc), usegmt=True))
         return response
 
     def _answer(self, method: str, path: str, rest: str, req: _Req) -> FakeResponse:
@@ -721,6 +729,8 @@ class FakeLibreNMS:
             ]
         elif kind in ("device_id", "os", "sysName", "location_id", "type"):
             rows = [d for d in rows if d[kind] is not None and _same(str(d[kind]), query)]
+        elif kind in ("ipv4", "ipv6", "mac"):  # whereHas('ports.ipv4' | 'ports.ipv6' | 'ports.macs'): exact
+            rows = [d for d in rows if d["device_id"] in self._holding(kind, query)]
         elif kind in _STATE_FILTERS:
             rows = [d for d in rows if _STATE_FILTERS[kind](d)]
         order = re.fullmatch(r"([a-z_]+)(?: (desc|asc))?", r.params.get("order", ""), re.I)
@@ -730,6 +740,17 @@ class FakeLibreNMS:
             return _server_error()
         rows.sort(key=lambda d: _sort_key(d[key]), reverse=bool(order and (order.group(2) or "").lower() == "desc"))
         return _api_success([self._device_out(d, parents=True) for d in rows], "devices", array=True)
+
+    def _holding(self, kind: str, query: str) -> Set[int]:
+        """The devices with a port that holds *query*: an IPv4 address, an IPv6 address (full or compressed), or a MAC
+        in the ARP table (``ipv4_mac``, the Port ``macs`` relation), compared exactly as stored."""
+        table, columns = {
+            "ipv4": ("ipv4_addresses", ("ipv4_address",)),
+            "ipv6": ("ipv6_addresses", ("ipv6_address", "ipv6_compressed")),
+            "mac": ("ipv4_mac", ("mac_address",)),
+        }[kind]
+        ports = {row["port_id"] for row in self.tables[table].values() if any(row[c] == query for c in columns)}
+        return {self.tables["ports"][i]["device_id"] for i in ports if i in self.tables["ports"]}
 
     def _get_device(self, r: _Req) -> FakeResponse:
         d = self._device(r.args["hostname"])
@@ -2166,11 +2187,11 @@ def seeded() -> FakeLibreNMS:
 
 
 def _seed_reports(fake: FakeLibreNMS) -> None:
-    """What the read-only report routes show: a port group, LLDP/CDP links (one to an unmonitored neighbour),
-    sensors (one past its limit, an optic), a transceiver, NTP components, BGP sessions (one idle, one without a
-    state), OSPF neighbours, alert-log rows whose details carry contacts, syslog, VLANs, a MAC learned on an access
-    port and on the uplink, a NAC session, ARP entries, outages and availability, and two CDR bills (one over its
-    commit)."""
+    """What the read-only report routes show: interface addresses (IPv4 and IPv6, for ``devices?type=ipv4|ipv6``), a
+    port group, LLDP/CDP links (one to an unmonitored neighbour), sensors (one past its limit, an optic), a
+    transceiver, NTP components, BGP sessions (one idle, one without a state), OSPF neighbours, alert-log rows whose
+    details carry contacts, syslog, VLANs, a MAC learned on an access port and on the uplink, a NAC session, ARP
+    entries, outages and availability, and two CDR bills (one over its commit)."""
     seed = fake.seed
     seed("port_groups", {"id": 1, "name": "uplinks", "desc": "Core and WAN uplinks", "ports": [1, 5, 6]})
     seed("port_groups", {"id": 2, "name": "spare"})
@@ -2289,6 +2310,15 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
         "host_mode": "multiAuth", "authz_status": "authorizationSuccess", "authz_by": "Authentication Server",
         "authc_status": "authcSuccess", "method": "mab", "timeout": 3600, "time_left": 1800, "vlan": 10,
         "time_elapsed": 1800, "created_at": "2026-10-28T11:00:00.000000Z", "updated_at": "2026-10-28T11:30:00.000000Z",
+    })  # fmt: skip
+    for row in (
+        {"ipv4_address_id": 1, "ipv4_address": "192.0.2.1", "ipv4_prefixlen": 24, "port_id": 1},
+        {"ipv4_address_id": 2, "ipv4_address": "203.0.113.2", "ipv4_prefixlen": 30, "port_id": 5},
+    ):
+        seed("ipv4_addresses", {**row, "ipv4_network_id": None, "context_name": ""})
+    seed("ipv6_addresses", {
+        "ipv6_address_id": 1, "ipv6_address": "2001:0db8:0000:0000:0000:0000:0000:0002", "ipv6_compressed": "2001:db8::2",
+        "ipv6_prefixlen": 64, "ipv6_origin": "manual", "port_id": 5, "ipv6_network_id": None, "context_name": "",
     })  # fmt: skip
     for row in (
         {"id": 1, "port_id": 9, "device_id": 3, "mac_address": "001122334455", "ipv4_address": "192.0.2.50"},

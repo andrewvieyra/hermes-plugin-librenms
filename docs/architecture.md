@@ -21,10 +21,14 @@ v0 route to what the plugin does with it.
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`) | `requests` (lazy), `redact` |
+| `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`), LibreNMS's clock (`last_date`, the `Date` of its last answer) | `requests` (lazy), `redact` |
 | `redact` | Credential masking by key, error-text scrubbing, clipping that counts escapes, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals, `visible()` and `for_model()` for what the model reads, the untrusted-data marker (`untrusted()`, `mark_untrusted()`) | none |
 | `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` or `start` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; `offset` sent as `start` on the logs routes, which refuse `where` and `sort`; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
-| `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused | `redact` |
+| `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused. Its natural order also orders reports | `redact` |
+| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings, partial reasons), scope resolution with ambiguity, argument checks, the result envelope | `client`, `routes`, `listing`, `redact`, `settings` |
+| `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
+| `reports/units` | Rates, speeds, percentages and durations with their readable forms; zone-safe times, and server-local times read in `librenms_timezone` | none |
+| `reports/find`, `reports/devices` | The views; `reports/__init__` holds their registry and `run` | `reports/context` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
@@ -33,16 +37,57 @@ v0 route to what the plugin does with it.
 | `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl` | Hermes `gateway.session_context` (optional) |
 | `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread per Hermes profile; the warning about a credential written into `config.yaml` | `settings`, `store`, Hermes `hermes_cli.config` (optional) |
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
-| `settings` | Operator settings with fail-closed coercion | Hermes `ctx.get_config` (optional) |
+| `settings` | Operator settings with fail-closed coercion (a time zone the host's zone database does not hold is refused) | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |
 | `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
 | `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
 | `__init__` | `register(ctx)` | all |
 
-Dependencies point downward only. The engine (`client`, `redact`, `routes`, `listing`, `diff`,
+Dependencies point downward only. The engine (`client`, `redact`, `routes`, `listing`, `reports`, `diff`,
 `resources`, `planner`, `executor`, `store`) imports nothing from Hermes at module load; Hermes imports are lazy
 and guarded, which is why the whole engine is testable with plain `unittest` against
 `tests/fake_librenms.py`.
+
+## Reports
+
+`librenms_report` answers a question in one read-only call where `librenms_query` would hand the
+model raw listings to scan and join: LibreNMS's list routes take few filters and no order, rows
+carry ids rather than names, and a fleet-wide listing passes Hermes' result threshold at a few
+hundred rows. A report reads what it needs, joins and counts in the plugin, and returns a
+`summary` and the matching rows.
+
+- **Reads.** Every GET goes through `ReportContext.get`: the path is built from fixed words and
+  resolved ids (each a percent-encoded segment, none holding `/`), matched with `routes.match` as a
+  `librenms_query` path is (so a refused route is refused here too, before anything is sent), and
+  counted against a budget of 30 requests. LibreNMS's 404 for an empty list is no rows; any other
+  failure of a read the report cannot do without fails it, and a failed read it can do without
+  (one device's outages, a listing `find` ranks) is left out and makes the answer `partial`, with
+  the reason. The devices, locations and group listings are read once per report; nothing is kept
+  between calls.
+- **Scope.** `scope` becomes a set of device ids from one `devices` listing: `device`/`devices`
+  add devices, `group` (`devicegroups/{id}`, never `full=1`), `location` (an id, a name, or every
+  location whose name holds the text), `os` and `type` narrow. A device named by an id or its exact
+  hostname is that device. Anything else is ranked (`reports/fuzzy`) and resolves only when one
+  device matches exactly (sysName, display name, first label, IP) or only one matches every word of
+  the phrase; otherwise the answer is `ambiguous: true` with the candidates and no report, so a
+  phrase never quietly widens or picks a scope.
+- **Envelope.** `success`, `view`, the untrusted marker (the row and scope keys that hold text from
+  LibreNMS), `scope`, `data_as_of` (LibreNMS's `Date`, else the plugin's clock), `timezone`,
+  `count`, `returned`, `offset`, `truncated`/`next_offset`, `partial`/`partial_reason`, `summary`,
+  `rows`, `notes`. Strings from LibreNMS are clipped to 200 characters (counted as escaped). The
+  handler then fits the result to `max_result_chars` as it fits a query's, cutting rows and saying
+  where to read on.
+- **Time.** Device times are ISO-8601 UTC and outages unix seconds, so ages are exact and are
+  counted to LibreNMS's own clock. Fault, alert-log, eventlog and syslog times are server-local
+  `Y-m-d H:i:s`, and no API field names the server's zone (`system`'s `local_date` is the date of
+  the LibreNMS commit), so `reports/units` reads them only in `librenms_timezone` and otherwise
+  gives them no age; `timezone` says which zone a report used.
+- **Views.** `find` ranks devices (names, attributes, management and interface addresses, ARP
+  entries for a MAC), ports (an interface name, `ports/search`), locations, device groups and port
+  groups, 10 an answer (`count` counts them all), `ambiguous` when the best two score within 10.
+  `devices` gives each device's state as LibreNMS's own filters decide it, its open outage (read
+  for the down devices of the page, at most 20), uptime and boot time, last poll and the naming
+  checks, with counts in `summary`.
 
 ## The plan document
 
@@ -505,7 +550,7 @@ for the re-read to settle, not a second request.
   `redact.clip` and `redact.cut` count a character as long as its escape, so every limit on text
   from LibreNMS (`for_model`'s, an alert entity's, a linked eventlog row's, the text of an error)
   bounds what the model reads, though the text stays raw where it is kept. A report reuses all of
-  this: its `untrusted_fields` may name the label columns of its rows.
+  this: its `untrusted_fields` names the label keys of its rows and scope.
 - A result for the model stays within `max_result_chars` (default 60,000 characters). Hermes saves
   a larger one to a file and shows the model a 1,500-character preview of it (past 100,000
   characters, or 15% of the context window on a smaller model), and `register_tool` offers a plugin

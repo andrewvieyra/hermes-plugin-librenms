@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 from .base import PluginTestCase
 from .helpers import REPO_ROOT, load_plugin, submodule
 
-# Every tool schema is sent to the model on every turn, so all five together stay under this many bytes of JSON
+# Every tool schema is sent to the model on every turn, so all six together stay under this many bytes of JSON
 # (``json.dumps`` defaults). Raise it only with a reason in the CHANGELOG.
 SCHEMA_BUDGET_BYTES = 16 * 1024
 # 2.32.4 fixes CVE-2024-47081 (.netrc credentials sent to another host) and, from 2.32.0, CVE-2024-35195
@@ -175,7 +175,7 @@ class Manifest(unittest.TestCase):
 
     def test_the_manifest_lists_every_tool_schema(self):
         names = [schema["name"] for schema in submodule("schemas").ALL]
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 6)
         self.assertEqual(manifest()["provides_tools"], names)
 
     def test_every_setting_has_a_schema_entry_with_its_type_default_and_description(self):

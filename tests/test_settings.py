@@ -34,7 +34,7 @@ COUNTS = {
     "plan_retention_days": (90, 3650),
 }
 LEAST = {"plan_retention_days": 0, "max_result_chars": 8000}
-TEXTS = ("write_mode", "audit_log_path")
+TEXTS = ("write_mode", "audit_log_path", "librenms_timezone")
 LISTS = ("audit_sinks",)
 
 
@@ -247,6 +247,18 @@ class Texts(unittest.TestCase):
         self.assertEqual(built("audit_log_path", "~/logs/audit.jsonl"), ("~/logs/audit.jsonl", []))
         self.assertEqual(built("audit_log_path", "  "), ("", []))  # empty: the default file
 
+    def test_librenms_timezone_is_a_zone_the_host_knows(self):
+        self.assertEqual(built("librenms_timezone", " Europe/Amsterdam "), ("Europe/Amsterdam", []))
+        self.assertEqual(built("librenms_timezone", "UTC"), ("UTC", []))
+        self.assertEqual(built("librenms_timezone", ""), ("", []))  # not known: reports say so
+        for raw in ("Mars/Olympus_Mons", "CEST", "../../etc/passwd", "/etc/localtime"):
+            value, errors = built("librenms_timezone", raw)
+            self.assertEqual(value, "", raw)
+            [error] = errors
+            self.assertTrue(error.startswith("librenms_timezone: expected an IANA time zone name such as "), error)
+            self.assertTrue(error.endswith("; using ''"), error)
+        self.assertEqual(built("librenms_timezone", 1)[1], ["librenms_timezone: expected text, got 1; using ''"])
+
 
 class Sinks(unittest.TestCase):
     def test_mappings_are_kept_as_deep_copies(self):
@@ -347,11 +359,13 @@ class PublicAndDigest(unittest.TestCase):
         self.assertRegex(digest, r"^[0-9a-f]{12}$")
         summary = dict(settings.to_dict(), audit_sinks={"count": 4, "types": ["http", "syslog", "unknown"]})
         del summary["max_result_chars"]  # added in 0.1.3: counted only once it differs from its default
+        del summary["librenms_timezone"]  # added in 0.4.0, likewise
         canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         self.assertEqual(digest, hashlib.sha256(canonical.encode("ascii")).hexdigest()[:12])
         # what 0.1.0 gave, so an upgrade raises no alert on an unapproved configuration
         self.assertEqual(Settings().digest(), "82752853a9ac")
         self.assertNotEqual(Settings(max_result_chars=30000).digest(), "82752853a9ac")
+        self.assertNotEqual(Settings(librenms_timezone="Europe/Amsterdam").digest(), "82752853a9ac")
         self.assertEqual(Settings(audit_log_path="/var/log/hermes/librenms-audit.jsonl").digest(), "0a6839d34d47")
         self.assertEqual(Settings(audit_sinks=list(reversed(self.SINKS))).digest(), digest)  # types are a set
         self.assertEqual(Settings(audit_sinks=self.SINKS, errors=["x"]).digest(), digest)
@@ -365,6 +379,7 @@ class PublicAndDigest(unittest.TestCase):
         changed = {
             "write_mode": "read_only",
             "audit_log_path": "/var/log/x.jsonl",
+            "librenms_timezone": "Europe/Amsterdam",
             "audit_sinks": [{"type": "http"}],
             **{name: not value for name, value in FAIL_CLOSED_FLAGS.items()},
             **{name: default + 1 for name, (default, _limit) in COUNTS.items()},

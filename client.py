@@ -614,7 +614,9 @@ class LibreNMSClient:
     tests. ``retry_sleep`` waits between tries of a GET (tests make it a no-op).
 
     ``last_call`` is the last try made (``method``, ``path`` as ``/api/v0/<path>``, ``status``, ``duration_ms``) and
-    ``calls`` every try since :meth:`reset_calls`, the latest :data:`MAX_CALLS`; neither holds params or bodies."""
+    ``calls`` every try since :meth:`reset_calls`, the latest :data:`MAX_CALLS`; neither holds params or bodies.
+    ``last_date`` is the ``Date`` header of the last answer that had one: LibreNMS's clock, which a report states its
+    data as of."""
 
     def __init__(
         self,
@@ -637,6 +639,7 @@ class LibreNMSClient:
         self.retry_sleep: Callable[[float], None] = time.sleep
         self.last_call: Dict[str, Any] = {}
         self.calls: List[Dict[str, Any]] = []
+        self.last_date: str | None = None
 
     @classmethod
     def from_env(
@@ -739,6 +742,7 @@ class LibreNMSClient:
                 status = int(getattr(resp, "status_code", 0) or 0)
                 headers = _headers(resp)
                 self._record(method, path, status, started)
+                self.last_date = headers.get("date") or self.last_date
                 wait = _seconds(headers.get("retry-after"))
                 if method == "GET" and status == 429 and not rate_limited:
                     rate_limited = True

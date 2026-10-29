@@ -17,6 +17,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List
+from zoneinfo import ZoneInfo
 
 WRITE_MODES = ("full", "operator_only", "read_only")
 # Upper limits: a larger value is lowered to the limit. max_result_chars stays under Hermes' per-result threshold
@@ -47,7 +48,7 @@ _FAIL_CLOSED: Dict[str, Any] = {
 }
 # Settings added after 0.1.0: the digest counts one only once it differs from its default, so an upgrade does not
 # change the digest of a configuration a collector has approved.
-_LATER_SETTINGS = frozenset({"max_result_chars"})
+_LATER_SETTINGS = frozenset({"max_result_chars", "librenms_timezone"})
 _TRUE = frozenset({"true", "yes", "on", "1"})
 _FALSE = frozenset({"false", "no", "off", "0"})
 _SHOWN_CHARS = 40
@@ -64,6 +65,7 @@ class Settings:
     max_operations: int = 100
     max_query_results: int = 500
     max_result_chars: int = 60000  # serialised size of one tool result the model reads
+    librenms_timezone: str = ""  # IANA zone of LibreNMS's server-local stamps; empty: not known
     max_plan_age_hours: int = 24
     max_maintenance_hours: int = 72
     plan_retention_days: int = 90  # 0 keeps plans forever
@@ -167,11 +169,22 @@ def coerce(name: str, raw: Any, default: Any, errors: List[str]) -> Any:
     if not isinstance(raw, str):
         return _reject(name, "text", _shown(raw), default, errors)
     text = raw.strip()  # paths keep their case
+    if name == "librenms_timezone" and text and not _is_zone(text):
+        return _reject(name, "an IANA time zone name such as Europe/Amsterdam", _shown(raw), default, errors)
     if name == "audit_log_path" and text and not os.path.isabs(os.path.expanduser(text)):
         # a relative path would land in whatever directory each process (gateway, cron, CLI) was started from; the
         # path itself is not quoted, since it names the OS account and status shows errors to the model
         return _reject(name, "an absolute path (~ is expanded)", "a relative path", default, errors)
     return text
+
+
+def _is_zone(name: str) -> bool:
+    """Whether *name* is a time zone this host's zone database holds (``Europe/Amsterdam``, ``UTC``)."""
+    try:
+        ZoneInfo(name)
+    except Exception:  # an unknown name, or one zoneinfo refuses as a path
+        return False
+    return True
 
 
 def flag(raw: Any) -> bool | None:

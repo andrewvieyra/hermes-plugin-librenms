@@ -17,7 +17,7 @@ from .fake_librenms import TOKEN, seeded
 from .helpers import load_plugin, submodule
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TOOLS = ("librenms_query", "librenms_plan", "librenms_apply", "librenms_rollback", "librenms_plans")
+TOOLS = ("librenms_query", "librenms_report", "librenms_plan", "librenms_apply", "librenms_rollback", "librenms_plans")
 HOOKS = ("pre_tool_call", "pre_llm_call", "post_approval_response")
 ENV = {"LIBRENMS_URL": "https://librenms.test", "LIBRENMS_TOKEN": "0123456789abcdef"}
 
@@ -184,7 +184,7 @@ class RegisterWithAFakeContext(PluginTestCase):
     def test_an_older_hermes_without_cli_or_skill_registration_still_loads(self):
         self.plugin_dir(REPO_ROOT)
         ctx = self.register(FakeContext(old=True))
-        self.assertEqual(len(ctx.tools), 5)
+        self.assertEqual(len(ctx.tools), 6)
         self.assertIn("librenms", ctx.commands)
         self.assertEqual((ctx.cli, ctx.skills, len(ctx.hooks)), ([], [], 3))
 
@@ -198,7 +198,7 @@ class RegisterWithAFakeContext(PluginTestCase):
             self.plugin_dir(Path(empty))
             ctx = self.register(FakeContext())
         self.assertEqual(ctx.skills, [])
-        self.assertEqual(len(ctx.tools), 5)
+        self.assertEqual(len(ctx.tools), 6)
 
 
 def _hermes_importable() -> bool:
@@ -273,7 +273,7 @@ class LoadThroughPluginManager(unittest.TestCase):
         loaded = {p["name"]: p for p in mgr.list_plugins()}
         self.assertIn("librenms", loaded, loaded)
         self.assertIsNone(loaded["librenms"]["error"])
-        self.assertEqual((loaded["librenms"]["tools"], loaded["librenms"]["hooks"]), (5, 3))
+        self.assertEqual((loaded["librenms"]["tools"], loaded["librenms"]["hooks"]), (6, 3))
         self.assertGreaterEqual(loaded["librenms"]["commands"], 1)
         for name in TOOLS:
             self.assertIsNotNone(registry.get_schema(name), name)

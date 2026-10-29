@@ -6,6 +6,117 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-29
+
+### Added
+- `librenms_report`, a read-only tool that answers a question about the network in one call instead of handing the
+  model raw listings to scan and join (conv-fleet-scan-spills-context, conv-missing-joins-fanout). LibreNMS's list
+  routes take few filters and no order, their rows carry ids rather than names, and a fleet-wide `devices` listing
+  passed Hermes' 100,000-character threshold at about 74 devices, after which the model saw a 1,500-character
+  preview. A report reads what it needs, joins and counts in the plugin, and returns a `summary` (the counts a
+  short answer needs, over every row that passed the filter) and the matching `rows`, each naming its device
+  (`device_id`, `hostname`, `display`), with units in the key names and readable twins (`uptime_s` 8640000 beside
+  `uptime` "100d 0h"). It is registered beside `librenms_query` with the same `check_fn`, so it is available in
+  every `write_mode`, needs no approval and never writes. 0.4.0 has two views, `find` and `devices`; the port,
+  neighbour, alert, health, routing, event and bill views follow in later releases on the same foundation.
+- The foundation every view shares (`reports/`). Every GET goes through one helper that builds the path from
+  fixed words and resolved ids (each a percent-encoded segment, none holding `/`), checks it against
+  `librenms_query`'s route allow-list before it is sent (a refused route stays refused), counts it against a
+  budget of 30 requests a report, and reads LibreNMS's 404-for-an-empty-list as no rows. A read the report can do
+  without that fails, or one past the budget, is left out and makes the answer `partial`, with a `partial_reason`
+  that names what is missing; a report never presents partial data as complete. Every answer has one envelope:
+  `scope`, `data_as_of` (LibreNMS's own clock, from the `Date` of its answer, so ages do not depend on the Hermes
+  host's clock), `timezone`, `count`, `returned`, `offset`, `truncated` and `next_offset`, `partial`, `summary`,
+  `rows` and `notes`. Rows are cut to `limit` (default 20, at most `max_query_results`) and to `max_result_chars`,
+  as a query's are, saying where to read on. Text from LibreNMS is clipped to 200 characters (counted as escaped),
+  escaped like every result, and the row and scope keys that hold it (`hostname`, `sysName`, `location`, `purpose`,
+  a candidate's `why`, ...) are named in `untrusted_fields`. The devices, locations and group listings are read once
+  per report and nothing is kept between calls.
+- `scope` narrows a report to devices: `device` (an id, a hostname, or a sysName, display name, first DNS label, IP
+  or phrase), `devices` (a list of them), `group` (a device group by name or id, read as `devicegroups/{id}`, never
+  with `full=1`, which returns device rows with their SNMP credentials), `location` (an id, a name, or part of a
+  name: every location that holds it, as LibreNMS's own `type=location` filter reads it), `os` and `type`; every key
+  given must hold. A device named by anything but its id or exact hostname resolves only when exactly one device
+  matches it exactly, or only one matches every word of the phrase, and the result says how (`scope.resolved`, with
+  why). Otherwise the answer is `ambiguous: true` with the `candidates` and no report: a phrase never quietly picks
+  one device or widens to several. `count` counts every candidate and an answer shows 10 of them, best first
+  (`offset` reads on; past 10 a note says to ask for more of the name). A group named by part of its name works the
+  same way. A device, group or location LibreNMS does not hold is refused naming what it does hold, and audited as
+  `query_refused` (with `tool` and `view`), like a `librenms_query` refusal; a key the view does not take is an
+  error naming those it does.
+- View `find` (conv-no-fuzzy-resolution). People name devices by short name, sysName, role, site or address, and
+  LibreNMS resolves only an id or the exact hostname: `devices/core-sw1` (the sysName) and "the core switch in
+  Amsterdam" found nothing, with no candidates. `find` ranks what a term could mean among devices, ports, locations,
+  device groups and port groups, best first, each with a `score` and a `why` ("sysName equals 'core-sw1'", "'switch'
+  as 'sw1' in hostname 'core-sw1.example.net'; 'sfo' in location 'SFO-1'"). The whole term is compared with each
+  name as words (`core sw1` is `core-sw1`): equal, its leading words, a prefix, whole words inside, the start of a
+  word inside, any other part. Each word of a phrase is matched against the name words (role words find their
+  abbreviations: switch `sw`, router `rtr`, firewall `fw`, server `srv`), the location, purpose, type, os, hardware
+  and serial. An IP address matches exactly, never as part of another (`192.0.2.1` is not in `192.0.2.12`): a
+  device's address or hostname, and the addresses on its interfaces (`devices?type=ipv4|ipv6`); a MAC address finds
+  the devices whose ARP tables hold it (`devices?type=mac`), and says where its switch port is read instead. When
+  one of those lookups names every device the token sees, a second asks for an address no device can hold: an older
+  LibreNMS, which reads an unknown `type` as no filter, names devices again, and the lookup is set aside rather than
+  shown as a match for each; otherwise every device does hold it (two routers sharing an anycast address, the
+  gateway's MAC in each one's ARP table). An interface name (`Gi1/0/48`, `xe-0/0/1`, `eth0`) is searched among the
+  ports (`ports/search/ifName,ifDescr/...`) and the rest of the term matched against each port's device, so
+  "Gi1/0/48 on access-sw2" finds that port, with its label (`Gi1/0/48 (to core-sw1)`) and state. An answer shows at
+  most 10 candidates; `count` and `summary` count every one that matched, `offset` reads on, and past 10 a note says
+  to give more of the name, the site or the IP, so the model does not take the first 10 for all there are.
+  `ambiguous` is true when the best two score within 10 of each other, and the note says to ask the user; the view
+  never picks one. The ranking is deterministic (ties by name, then id) and tested with near misses (`core-sw1`
+  against `core-sw10`, two devices sharing a sysName).
+- View `devices`: for each device in scope, its state as LibreNMS's own filters decide it (`disabled`, `ignored`,
+  `down`, `up`) and `status_reason`, `down_since` and `down_for` from its open outage (`devices/{id}/outages`,
+  read for the down devices on the page, at most 20; past that the answer is partial and says to ask for fewer
+  rows), `uptime_s` and `booted_at` (its last poll less its uptime; an uptime past a century, a counter that
+  wrapped or was never set, is unknown rather than failing the report), `last_polled` and its age, os, hardware,
+  version, type, location, purpose, and `checks`: `naming_mismatch` (hostname and sysName name different hosts:
+  their first DNS labels differ, ignoring case), `no_location`, `no_purpose`. `filter` takes `status` (one or a
+  list), `rebooted_within` and `not_polled_for` (`30m`, `24h`, `7d`; a disabled device is not counted as unpolled),
+  `naming_mismatch`, `no_location`, `no_purpose`, `os` and `type`; `sort` takes `name`, `status` (down first),
+  `uptime` (shortest first) and `last_polled` (never polled, then oldest). `summary` counts the states and checks
+  of every device that passed the filter, so "how many devices are down" needs no row. The conversational audit's
+  device questions (which devices are down and since when, which rebooted in the last day, which have not polled,
+  hostnames that do not match sysName, devices without a location, every hostname against a naming convention,
+  and a device named by role and site) are each answered in one or two calls, and tested as such.
+- Setting `librenms_timezone` (conv-timezone-ages): the IANA zone LibreNMS runs in. LibreNMS writes fault,
+  alert-log, eventlog and syslog times in its own zone with no offset, and no API field names that zone (`system`'s
+  `local_date` is the date of the LibreNMS commit), so with LibreNMS in Amsterdam a fault first seen at
+  `2026-10-28 10:02:00` read as UTC was an hour younger than it is. `reports/units` reads such times in this
+  zone, as ISO 8601 with the offset, so a view can give them an age, and every report names the zone in
+  `timezone`; left empty (the default), a server-local time gets no time and no age, and `timezone` says the zone
+  is unknown. A name the host's zone database does not hold falls back to empty with a settings error. The 0.4.0
+  views show only zone-safe times (the device API's ISO UTC, outages' unix seconds, uptimes), which are exact
+  either way. Like `max_result_chars`, it counts in `config_digest` only once
+  set, so an upgrade does not change the digest of an approved configuration.
+- `reports/units`: bit rates, interface speeds (`10G`, `100M`, read back with `parse_speed`), percentages of a speed,
+  durations and duration arguments, and zone-safe and server-local times, for the views to come as well.
+- The client keeps the `Date` header of LibreNMS's last answer (`last_date`); journal request records are
+  unchanged. `listing.natural_key` exposes the natural order `sort` uses, for the report views' own orders, and
+  `routes.mac_hex` the MAC normalisation the exact-match MAC routes use.
+- Tests: tests/test_report_units.py (units, durations, zone-safe and server-local times with the audit's
+  Amsterdam case, term parsing, match levels, near misses, role words, addresses, ports) and tests/test_reports.py
+  (every request a report makes is a GET on an allow-listed, non-refused route and nothing is written; refused
+  and malformed paths never sent; 404 as empty; the call budget and a failed per-device read make the answer
+  partial; the output budget cuts rows and reads on until every row was seen once; paging, sorting and filters;
+  the envelope and `data_as_of` from the `Date` header; escaping, clipping, marking and no credential in any
+  report; scope by every key, ambiguity, more candidates than an answer shows, refusals and their audit; `find`
+  for names, phrases, addresses (one every device holds, and a lookup LibreNMS ignores), MACs, interfaces, sites
+  and groups; `devices` states, outages, the outage cap and implausible uptimes; and the operator questions). The
+  fake LibreNMS sends a `Date` header from its clock and answers `devices?type=ipv4|ipv6|mac` from new interface
+  address tables, as `list_devices` does.
+
+### Changed
+- `librenms_query`'s description of `params` names the `devices` `type` filters (part of a hostname, display name,
+  location, serial, version or hardware; an exact sysName, os, type or location id; an address on a port or in an
+  ARP table; up, down, disabled, ignored) and that LibreNMS reads any other `type` as no filter at all, so the
+  model can find a device by sysName or address without guessing a hostname. The skill says when to use
+  `librenms_report` instead, and how to read its answers: find first for a vague device name and ask on
+  `ambiguous`, the summary for counts, `data_as_of`, `truncated`, `partial` and `timezone`.
+- `max_query_results` caps a report's rows as it caps a query's. The six tool schemas take 15.1 KB of the 16 KB
+  budget.
+
 ## [0.3.0] - 2026-10-29
 
 ### Security
