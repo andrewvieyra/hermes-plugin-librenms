@@ -109,7 +109,9 @@ Every event carries `config_digest`: the first 12 hex digits of the SHA-256 of t
 force, as canonical JSON, with `audit_sinks` reduced to their count and types (a sink's URL and
 headers can hold a credential). The same settings give the same digest in every process, so a
 collector can alert on any digest you have not approved, and two events with different digests ran
-under different configurations. `/librenms status` shows the settings behind the digest.
+under different configurations. A setting added in a later release (`max_result_chars`, 0.1.3)
+counts only once it differs from its default, so upgrading does not change the digest of a
+configuration. `/librenms status` shows the settings behind the digest.
 
 ## The plan file
 

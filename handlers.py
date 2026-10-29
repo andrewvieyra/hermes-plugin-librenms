@@ -32,7 +32,7 @@ from .executor import ExecutionRefused, apply_plan, pending_entries, render_jour
 from .planner import DESCRIPTION_CHARS, PlanError, build_plan, render_plan
 from .redact import clip, for_model, mask, one_line
 from .resources import get_resource
-from .routes import QueryError, prepare
+from .routes import QueryError, Route, prepare, too_large_hint
 from .settings import Settings, get_settings
 from .store import PlanStore, get_store, profile_key
 from .version import __version__
@@ -83,6 +83,31 @@ _RULE_KEY_RE = re.compile(
     r"(?:^|:)(?P<key>librenms:(?P<tool>librenms_apply|librenms_rollback):(?P<plan>[^:]+):(?P<variant>[^:]+))$"
 )
 _COUNTED = ("create", "update", "delete", "action")
+# Envelope keys that carry no data of their own: LibreNMS's api_success puts them around every result.
+_ENVELOPE_KEYS = frozenset({"status", "message", "count", "total"})
+# What a fault or alert-log row shows of the rows its rule matched (``details.rule``): the keys that name the port,
+# sensor, processor, storage, service or BGP peer it is about, at most ENTITY_ROWS rows of ENTITY_CHARS each.
+# ``details`` itself holds every column of every table the rule joins and the alert's contacts (e-mail addresses),
+# for every matched row, so it is returned only when ``fields`` names it, and never with its contacts.
+ENTITY_KEYS = (
+    "ifName",
+    "ifAlias",
+    "ifDescr",
+    "sensor_descr",
+    "sensor_class",
+    "sensor_current",
+    "processor_descr",
+    "mempool_descr",
+    "storage_descr",
+    "service_type",
+    "service_desc",
+    "bgpPeerIdentifier",
+    "bgpPeerDescr",
+)
+ENTITY_ROWS = 10
+ENTITY_CHARS = 200
+# "[12] note" in a plan's warnings: the step the warning is about
+_STEP_WARNING_RE = re.compile(r"^\[(\d+)\] ")
 _PRUNE_INTERVAL = 3600.0
 # store.profile_key() -> when this process last swept that profile's plans (absent: never)
 _last_prune_at: Dict[str, float] = {}
@@ -196,7 +221,8 @@ def _unknown(raw: Any, candidates: List[str]) -> str:
 
 
 def journal_summary(journal: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Per-entry summary for tool output (no snapshots or inverse payloads; librenms_plans returns those)."""
+    """Per-entry summary for tool output (no snapshots or inverse payloads; librenms_plans with ``detail`` returns
+    those)."""
     out = []
     for e in journal:
         item = {
@@ -321,7 +347,9 @@ def guarded(fn: Callable[..., str]) -> Callable[..., str]:
         try:
             return fn(dict(args or {}), **kwargs)
         except PlanError as exc:
-            return _fail("plan not created: fix the listed operations and re-plan", errors=exc.errors)
+            failed = {"success": False, "error": "plan not created: fix the listed operations and re-plan"}
+            budget = _budget(get_settings(), kwargs)
+            return _json(_fit_rows({**failed, "errors": exc.errors}, "errors", budget, _errors_note(budget)))
         except ExecutionRefused as exc:
             return _fail(str(exc), refused=True)
         except LibreNMSError as exc:
@@ -363,7 +391,8 @@ def _plan_summary(plan: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _rollback_summary(rb: Dict[str, Any] | None) -> Dict[str, Any] | None:
+def _rollback_summary(rb: Dict[str, Any] | None, entries: List[Dict[str, Any]], compact: bool) -> Dict[str, Any] | None:
+    """A rollback record for apply and rollback results, its eventlog cut to the shown journal *entries*."""
     if not rb:
         return None
     keys = (
@@ -380,7 +409,9 @@ def _rollback_summary(rb: Dict[str, Any] | None) -> Dict[str, Any] | None:
         "recovered",
         "eventlog",
     )
-    return {k: rb.get(k) for k in keys}
+    summary = {k: rb.get(k) for k in keys}
+    summary["eventlog"] = _eventlog(summary["eventlog"], entries, "revert_eventlog_ids", compact)
+    return summary
 
 
 def _public(record: Any) -> Any:
@@ -396,12 +427,119 @@ def _project(value: Any, fields: List[str] | None) -> Any:
     return value
 
 
-def _listing(rows: List[Any], body: Any, fields: List[str] | None, limit: int, start: int) -> Dict[str, Any]:
+def _budget(settings: Settings, kwargs: Dict[str, Any]) -> int | None:
+    """The most characters a result may serialise to: ``max_result_chars`` for the model, since Hermes replaces a
+    larger one with a 1,500-character preview and a file (its threshold is 100,000 characters, less on a model with
+    a small context window); none on an operator path (``_actor``), which prints the whole result."""
+    return None if isinstance(kwargs.get("_actor"), dict) else settings.max_result_chars
+
+
+def _size(value: Any) -> int:
+    """Characters *value* takes in a tool result (:func:`_json`)."""
+    return (
+        len(_json(value)) if isinstance(value, dict) else len(json.dumps(mask(value), ensure_ascii=False, default=str))
+    )
+
+
+def _fit_rows(payload: Dict[str, Any], key: str, budget: int | None, note: Callable[[int, int], str]) -> Dict[str, Any]:
+    """*payload* with as many leading entries of its list *key* as keep it within *budget* characters serialised (all
+    of them without a budget). When some are left out, ``returned`` is the number kept, ``truncated`` is true and
+    ``note`` says how to see the rest: *note* is given the number kept and the number there were."""
+    rows = payload.get(key)
+    if budget is None or not isinstance(rows, list) or _size(payload) <= budget:
+        return payload
+    out = {**payload, key: [], "returned": 0, "truncated": True, "note": note(len(rows), len(rows))}
+    room, kept = budget - _size(out), 0
+    for row in rows:
+        room -= _size(row) + (2 if kept else 0)  # json.dumps separates list items with ", "
+        if room < 0:
+            break
+        kept += 1
+    while True:
+        out.update({key: rows[:kept], "returned": kept, "note": note(kept, len(rows))})
+        if kept == 0 or _size(out) <= budget:
+            return out
+        kept -= 1
+
+
+def _errors_note(budget: int | None) -> Callable[[int, int], str]:
+    return lambda kept, of: (
+        f"{kept} of {of} errors shown, to stay within max_result_chars ({budget} characters); fix these and plan "
+        "again to see the rest"
+    )
+
+
+def _conflicts_note(kept: int, of: int) -> str:
+    return (
+        f"{kept} of {of} conflicts shown, to stay within max_result_chars; librenms_plans with this plan_id and an "
+        "offset shows the checks of later steps"
+    )
+
+
+def _plans_note(kept: int, of: int) -> str:
+    return f"{kept} of {of} plans shown, to stay within max_result_chars; filter by status or ask for fewer with limit"
+
+
+def _query_note(route: Route, budget: int | None, start: int) -> Callable[[int, int], str]:
+    def note(kept: int, of: int) -> str:
+        text = (
+            f"cut at {kept} of {of} rows to stay within max_result_chars ({budget} characters): name only the keys "
+            "you need in fields"
+        )
+        if route.paginated:
+            return text + f", or read on with params start={start + kept}"
+        return text + ", or narrow the query (a smaller limit returns the same first rows)"
+
+    return note
+
+
+def _alert_row(row: Any, keep_details: bool) -> Any:
+    """A fault or alert-log row with ``details`` replaced by ``entities``: the label keys (:data:`ENTITY_KEYS`) of the
+    rows its rule matched, so "what is alerting" names the port or sensor without the blob. With *keep_details*
+    (``fields`` names it) ``details`` stays too, without its ``contacts``."""
+    if not isinstance(row, dict) or "details" not in row:
+        return row
+    row = dict(row)
+    details = row.pop("details")
+    matched = details.get("rule") if isinstance(details, dict) else None
+    entities: List[Dict[str, Any]] = []
+    seen = set()
+    for item in matched if isinstance(matched, list) else []:
+        labels = {key: clip(item[key], ENTITY_CHARS) for key in ENTITY_KEYS if isinstance(item, dict) and item.get(key)}
+        seen_as = json.dumps(labels, sort_keys=True, default=str)
+        if labels and seen_as not in seen:  # a rule over joined tables repeats a port once per joined row
+            seen.add(seen_as)
+            if len(entities) < ENTITY_ROWS:
+                entities.append(labels)
+    row["entities"] = entities
+    if len(seen) > ENTITY_ROWS:
+        row["entities_total"] = len(seen)
+    if keep_details:
+        row["details"] = {k: v for k, v in details.items() if k != "contacts"} if isinstance(details, dict) else details
+    return row
+
+
+def _keyed_rows(value: Any) -> List[Dict[str, Any]] | None:
+    """An object of objects keyed by id (``devices/{hostname}/components``) as rows, each carrying its key as ``id``,
+    so ``limit`` and ``fields`` apply per row; None for anything else."""
+    if not isinstance(value, dict) or not value or not all(isinstance(item, dict) for item in value.values()):
+        return None
+    return [
+        item if "id" in item else {"id": int(key) if is_digits(key) else key, **item} for key, item in value.items()
+    ]
+
+
+def _listing(
+    rows: List[Any], body: Any, fields: List[str] | None, limit: int, start: int, route: Route
+) -> Dict[str, Any]:
     """*rows* as a tool result. ``truncated`` says whether more rows exist than were shown: past the client-side
     limit, or (logs routes) past *start* plus what this page returned."""
     if len(rows) == 1 and isinstance(rows[0], list):  # LibreNMS wraps service rows in one more list
         rows = rows[0]
-    shown = [_project(row, fields) for row in rows[:limit]]
+    shown = rows[:limit]
+    if route.alert_rows:
+        shown = [_alert_row(row, bool(fields) and "details" in fields) for row in shown]
+    shown = [_project(row, fields) for row in shown]
     out: Dict[str, Any] = {"count": len(rows)}
     total = body.get("total") if isinstance(body, dict) else None
     if is_digits(total):  # logs routes: every matching row, of which ``count`` were returned from ``start`` on
@@ -409,6 +547,115 @@ def _listing(rows: List[Any], body: Any, fields: List[str] | None, limit: int, s
     more = "total" in out and out["total"] > start + len(rows)
     out.update(returned=len(shown), truncated=len(shown) < len(rows) or more, results=for_model(shown))
     return out
+
+
+def _extra(body: Any, route: Route) -> Dict[str, Any]:
+    """What the envelope carries beside the result (``resources/fdb/{mac}/detail``: the MAC as LibreNMS writes it and
+    its vendor, ``mac_oui``), under ``extra``."""
+    if not isinstance(body, dict) or route.list_key is None:
+        return {}
+    extra = {key: value for key, value in body.items() if key not in _ENVELOPE_KEYS and key != route.list_key}
+    return {"extra": for_model(extra)} if extra else {}
+
+
+def _in_window(item: Any, start: int, end: int) -> bool:
+    index = item.get("index") if isinstance(item, dict) else None
+    return isinstance(index, int) and start <= index < end
+
+
+def _page(plan: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    """*plan* cut to steps *start* up to *end*: its steps, journal entries and the warnings about them (a warning
+    about no step in particular stays)."""
+    warnings = []
+    for warning in plan.get("warnings") or []:
+        found = _STEP_WARNING_RE.match(str(warning))
+        if found is None or start <= int(found.group(1)) < end:
+            warnings.append(warning)
+    return {
+        **plan,
+        "steps": [step for step in plan.get("steps") or [] if _in_window(step, start, end)],
+        "journal": [entry for entry in plan.get("journal") or [] if _in_window(entry, start, end)],
+        "warnings": warnings,
+    }
+
+
+def _irreversible(plan: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    """The indexes of *plan*'s irreversible steps among steps *start* up to *end*, and ``irreversible_count`` when
+    there are others: a plan of 1,000 deletes would otherwise repeat 1,000 indexes beside every page of steps."""
+    every = plan.get("irreversible") or []
+    shown = [index for index in every if start <= index < end]
+    if len(shown) == len(every):
+        return {"irreversible": shown}
+    return {"irreversible": shown, "irreversible_count": len(every)}
+
+
+def _window(
+    build: Callable[[int, int, bool], Dict[str, Any]], start: int, total: int, budget: int | None
+) -> Dict[str, Any]:
+    """What *build* makes of a plan's steps from *start* on: all of them when that fits within *budget* characters
+    serialised (or there is no budget), else as many as fit and at least one. A single step that does not fit is
+    built compact (eventlog rows as counts). *build* takes the window ``(start, end, compact)`` and says what it
+    shows (:func:`_paging`)."""
+    whole = build(start, total, False)
+    if budget is None or start >= total or _size(whole) <= budget:
+        return whole
+    low, high, best = start + 2, total - 1, start + 1
+    while low <= high:
+        middle = (low + high) // 2
+        if _size(build(start, middle, False)) <= budget:
+            best, low = middle, middle + 1
+        else:
+            high = middle - 1
+    page = build(start, best, False)
+    return page if best > start + 1 or _size(page) <= budget else build(start, best, True)
+
+
+def _paging(payload: Dict[str, Any], start: int, end: int, total: int) -> Dict[str, Any]:
+    """*payload* (a page of steps *start* up to *end* of *total*) saying which steps it shows, when that is not all of
+    them: ``offset``, ``steps_shown`` and ``step_count``, and while steps follow ``truncated``, ``next_offset`` and a
+    ``note``. The diff, which the user is shown verbatim, says so in its last line."""
+    if (start, end) == (0, total):
+        return payload
+    payload.update(offset=start, steps_shown=max(0, end - start), step_count=total)
+    if start >= total:
+        payload["note"] = f"the plan has {total} steps, numbered from 0; offset {start} is past the last"
+    elif end < total:
+        shown = f"steps {start}-{end - 1} of {total} are shown"
+        payload.update(
+            truncated=True,
+            next_offset=end,
+            note=f"{shown}, to stay within max_result_chars; librenms_plans with this plan_id and offset {end} "
+            "shows the next ones",
+        )
+        if payload.get("diff"):
+            payload["diff"] += f"\n… {shown}; the next ones start at step {end}"
+    elif payload.get("diff"):
+        payload["diff"] += f"\n… steps {start}-{end - 1} of {total} are shown"
+    return payload
+
+
+def _eventlog(eventlog: Any, entries: List[Dict[str, Any]], key: str, compact: bool) -> Any:
+    """A phase's linked eventlog (apply or rollback) cut to the rows the journal *entries* name under *key*
+    (``eventlog_ids`` or ``revert_eventlog_ids``); *compact* counts each device's rows instead of listing them."""
+    if not isinstance(eventlog, dict) or not isinstance(eventlog.get("devices"), dict):
+        return eventlog
+    wanted = {event_id for entry in entries for event_id in entry.get(key) or []}
+    every = {row.get("event_id") for rows in eventlog["devices"].values() for row in rows if isinstance(row, dict)}
+    devices = {}
+    for device, rows in eventlog["devices"].items():
+        kept = [row for row in rows if isinstance(row, dict) and row.get("event_id") in wanted]
+        if kept or every <= wanted:  # the whole journal is shown: every device, also one without new rows
+            devices[device] = len(kept) if compact else kept
+    return {**eventlog, "devices": devices}
+
+
+def _phase(record: Any, entries: List[Dict[str, Any]], key: str, compact: bool) -> Any:
+    """A plan's ``apply`` or ``rollback`` record for a tool result: its actor in public form and its eventlog cut to
+    the shown journal *entries* (:func:`_eventlog`)."""
+    record = _public(record)
+    if isinstance(record, dict) and "eventlog" in record:
+        record = {**record, "eventlog": _eventlog(record["eventlog"], entries, key, compact)}
+    return record
 
 
 # -- handlers -------------------------------------------------------------------------------------
@@ -447,16 +694,30 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
     try:
         body = client.get(prepared.request_path, prepared.params or None)
     except LibreNMSError as exc:
+        if exc.kind == "too_large":  # the client's advice is generic; on most routes limit would fail alike
+            return _fail(f"{exc}: {too_large_hint(route, prepared.path)}", librenms=exc.to_dict())
         if exc.kind != "not_found":
             raise
         # LibreNMS answers an empty list with a 404 and a message ("No ports found")
         note = exc.body.get("message") if isinstance(exc.body, dict) else None
         return _ok(**where, count=0, returned=0, truncated=False, results=[], note=for_model(note or str(exc)))
+    budget = _budget(settings, kwargs)
     value = LibreNMSClient.result(body, route.list_key) if route.list_key else body
-    if isinstance(value, list):
+    rows = value if isinstance(value, list) else _keyed_rows(value)
+    if rows is not None:
         start = int(prepared.params["start"]) if route.paginated else 0
-        return _ok(**where, **_listing(value, body, fields, prepared.limit, start))
-    return _ok(**where, result=for_model(_project(value, fields)))
+        listing = {"success": True, **where, **_listing(rows, body, fields, prepared.limit, start, route)}
+        return _json(
+            _fit_rows({**listing, **_extra(body, route)}, "results", budget, _query_note(route, budget, start))
+        )
+    payload = {"success": True, **where, "result": for_model(_project(value, fields)), **_extra(body, route)}
+    if budget is not None and _size(payload) > budget:
+        return _fail(
+            f"the result is {_size(payload)} characters, more than max_result_chars allows ({budget}); name only the "
+            "keys you need in fields",
+            **where,
+        )
+    return _json(payload)
 
 
 @guarded
@@ -494,20 +755,39 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
         irreversible=plan["irreversible"],
     )
     summary = plan["summary"]
-    if sum(summary.get(key, 0) for key in ("create", "update", "delete", "action")) == 0:
-        next_step = "Nothing to apply: every operation already matches LibreNMS."
-    else:
-        next_step = "Show this diff to the user and call librenms_apply only after they explicitly say yes."
-        if plan["irreversible"]:
-            next_step += f" Tell them that steps {plan['irreversible']} cannot be rolled back."
-    return _ok(
-        **_plan_summary(plan),
-        diff=render_plan(plan),
-        steps=plan["steps"],
-        warnings=plan["warnings"],
-        irreversible=plan["irreversible"],
-        next_step=next_step,
-    )
+    total = len(plan["steps"])
+
+    def build(start: int, end: int, _compact: bool) -> Dict[str, Any]:
+        irreversible = _irreversible(plan, start, end)
+        if sum(summary.get(key, 0) for key in _COUNTED) == 0:
+            next_step = "Nothing to apply: every operation already matches LibreNMS."
+        else:
+            next_step = "Show this diff to the user and call librenms_apply only after they explicitly say yes."
+            if end < total:
+                next_step = (
+                    f"This diff shows steps 0-{end - 1} of {total}. Read the rest with librenms_plans (this plan_id, "
+                    f"offset {end}), show the user every step, and call librenms_apply only after they explicitly say "
+                    "yes."
+                )
+            if "irreversible_count" in irreversible:  # the whole list would not fit beside the steps shown
+                next_step += (
+                    f" Tell them that {irreversible['irreversible_count']} steps cannot be rolled back; the diff marks "
+                    "each one 'rollback: none'."
+                )
+            elif plan["irreversible"]:
+                next_step += f" Tell them that steps {plan['irreversible']} cannot be rolled back."
+        page = _page(plan, start, end)
+        payload = {
+            "success": True,
+            **_plan_summary(plan),
+            "diff": render_plan(page),
+            "warnings": page["warnings"],
+            **irreversible,
+            "next_step": next_step,
+        }
+        return _paging(payload, start, end, total)
+
+    return _json(_window(build, 0, total, _budget(settings, kwargs)))
 
 
 @guarded
@@ -547,26 +827,33 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
             dry_run=dry_run,
         )
         raise
+    budget = _budget(settings, kwargs)
     if dry_run:
         checks = plan.get("checks") or []
         if plan.get("status") != "planned" or not checks:  # claimed by another run while the checks ran
             return _fail(f"plan {plan['id']} is {plan.get('status')}; the check was not recorded", refused=True)
         conflicts = checks[-1]["conflicts"]
-        return _ok(**_plan_summary(plan), dry_run=True, applicable=not conflicts, conflicts=conflicts)
+        checked = {"success": True, **_plan_summary(plan), "dry_run": True, "applicable": not conflicts}
+        return _json(_fit_rows({**checked, "conflicts": conflicts}, "conflicts", budget, _conflicts_note))
     apply = plan.get("apply") or {}
-    payload = {
-        "success": apply.get("outcome") == "applied",
-        **_plan_summary(plan),
-        "outcome": apply.get("outcome"),
-        "failure": apply.get("failure"),
-        "eventlog": apply.get("eventlog"),
-        "rollback": _rollback_summary(plan.get("rollback")),
-        "journal": journal_summary(plan["journal"]),
-        "report": render_journal(plan),
-    }
-    if apply.get("auto_rollback_error"):
-        payload["auto_rollback_error"] = apply["auto_rollback_error"]
-    return _json(payload)
+
+    def build(start: int, end: int, compact: bool) -> Dict[str, Any]:
+        page = _page(plan, start, end)
+        payload = {
+            "success": apply.get("outcome") == "applied",
+            **_plan_summary(plan),
+            "outcome": apply.get("outcome"),
+            "failure": apply.get("failure"),
+            "eventlog": _eventlog(apply.get("eventlog"), page["journal"], "eventlog_ids", compact),
+            "rollback": _rollback_summary(plan.get("rollback"), page["journal"], compact),
+            "journal": journal_summary(page["journal"]),
+            "report": render_journal(page),
+        }
+        if apply.get("auto_rollback_error"):
+            payload["auto_rollback_error"] = apply["auto_rollback_error"]
+        return _paging(payload, start, end, len(plan["steps"]))
+
+    return _json(_window(build, 0, len(plan["steps"]), budget))
 
 
 @guarded
@@ -605,42 +892,70 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
             force=force,
         )
         raise
-    rb = plan.get("rollback") or {}
-    return _json(
-        {
+
+    def build(start: int, end: int, compact: bool) -> Dict[str, Any]:
+        page = _page(plan, start, end)
+        payload = {
             "success": plan["status"] == "rolled_back",
             **_plan_summary(plan),
-            "rollback": _rollback_summary(rb),
-            "journal": journal_summary(plan["journal"]),
-            "report": render_journal(plan),
+            "rollback": _rollback_summary(plan.get("rollback") or {}, page["journal"], compact),
+            "journal": journal_summary(page["journal"]),
+            "report": render_journal(page),
         }
-    )
+        return _paging(payload, start, end, len(plan["steps"]))
+
+    return _json(_window(build, 0, len(plan["steps"]), _budget(settings, kwargs)))
 
 
 @guarded
 def librenms_plans(args: Dict[str, Any], **kwargs: Any) -> str:
     maybe_prune(lambda: _actor_from(kwargs))
     store = get_store()
+    budget = _budget(get_settings(), kwargs)
     if str(args.get("plan_id") or "").strip():
         _plan_id, plan, candidates = find_plan(store, args.get("plan_id"))
         if plan is None:
             return _fail(_unknown(args.get("plan_id"), candidates))
-        return _ok(
-            **_plan_summary(plan),
-            diff=render_plan(plan),
-            steps=plan["steps"],
-            warnings=plan.get("warnings", []),
-            irreversible=plan.get("irreversible", []),
-            checks=[_public(check) for check in plan.get("checks") or []],
-            journal=plan.get("journal", []),
-            apply=_public(plan.get("apply")),
-            rollback=_public(plan.get("rollback")),
-            report=render_journal(plan),
-        )
+        detail = parse_bool(args.get("detail"), False)
+        total = len(plan["steps"])
+        checks = plan.get("checks") or []
+        latest = checks if budget is None else checks[-1:]  # a record per dry run: the model reads the latest
+
+        def build(start: int, end: int, compact: bool) -> Dict[str, Any]:
+            page = _page(plan, start, end)
+            payload = {
+                "success": True,
+                **_plan_summary(plan),
+                "diff": render_plan(page),
+                "warnings": page["warnings"],
+                **_irreversible(plan, start, end),
+                "checks": [_check(check, start, end) for check in latest],
+                "journal": page["journal"] if detail else journal_summary(page["journal"]),
+                "apply": _phase(plan.get("apply"), page["journal"], "eventlog_ids", compact),
+                "rollback": _phase(plan.get("rollback"), page["journal"], "revert_eventlog_ids", compact),
+                "report": render_journal(page),
+            }
+            if len(latest) < len(checks):
+                payload["check_count"] = len(checks)
+            if detail:
+                payload["steps"] = page["steps"]
+            return _paging(payload, start, end, total)
+
+        return _json(_window(build, _int(args.get("offset"), 0, minimum=0), total, budget))
     limit = _int(args.get("limit"), 20, maximum=200)
     status = args.get("status")
     plans = store.list(status=str(status) if status else None, limit=limit)
-    return _ok(count=len(plans), plans=[_plan_summary(p) for p in plans])
+    listing = {"success": True, "count": len(plans), "plans": [_plan_summary(p) for p in plans]}
+    return _json(_fit_rows(listing, "plans", budget, _plans_note))
+
+
+def _check(check: Any, start: int, end: int) -> Any:
+    """A dry-run check record for a tool result: its actor in public form, its conflicts cut to steps *start* up to
+    *end*."""
+    check = _public(check)
+    if isinstance(check, dict) and isinstance(check.get("conflicts"), list):
+        check = {**check, "conflicts": [item for item in check["conflicts"] if _in_window(item, start, end)]}
+    return check
 
 
 HANDLERS = {

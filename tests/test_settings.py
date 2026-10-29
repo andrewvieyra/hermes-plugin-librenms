@@ -24,14 +24,16 @@ FAIL_CLOSED_FLAGS = {
     "audit_include_request": True,
     "link_eventlog": True,
 }
-# Every count: (default, upper limit).
+# Every count: (default, upper limit), and the least value of those whose least is not 1.
 COUNTS = {
     "max_operations": (100, 1000),
     "max_query_results": (500, 5000),
+    "max_result_chars": (60000, 90000),
     "max_plan_age_hours": (24, 720),
     "max_maintenance_hours": (72, 8760),
     "plan_retention_days": (90, 3650),
 }
+LEAST = {"plan_retention_days": 0, "max_result_chars": 8000}
 TEXTS = ("write_mode", "audit_log_path")
 LISTS = ("audit_sinks",)
 
@@ -68,6 +70,7 @@ class EverySettingIsCovered(unittest.TestCase):
         names = set(FAIL_CLOSED_FLAGS) | set(COUNTS) | set(TEXTS) | set(LISTS)
         self.assertEqual(names, set(Settings().to_dict()))
         self.assertEqual(set(settings_mod.LIMITS), set(COUNTS))
+        self.assertEqual(settings_mod.MINIMUMS, LEAST)
         for name, (default, limit) in COUNTS.items():
             self.assertEqual((getattr(Settings(), name), settings_mod.LIMITS[name]), (default, limit), name)
 
@@ -132,8 +135,9 @@ class Flags(unittest.TestCase):
 class Counts(unittest.TestCase):
     def test_ints_and_digit_strings(self):
         for name, (_default, limit) in COUNTS.items():
-            self.assertEqual(built(name, 7), (7, []), name)
-            self.assertEqual(built(name, " 12 "), (12, []), name)
+            least = LEAST.get(name, 1)
+            self.assertEqual(built(name, least + 7), (least + 7, []), name)
+            self.assertEqual(built(name, f" {least + 12} "), (least + 12, []), name)
             self.assertEqual(built(name, limit), (limit, []), name)
             self.assertEqual(built(name, str(limit)), (limit, []), name)
 
@@ -158,7 +162,7 @@ class Counts(unittest.TestCase):
             {"a": 1},
         )
         for name, (default, _limit) in COUNTS.items():
-            least = 0 if name == "plan_retention_days" else 1
+            least = LEAST.get(name, 1)
             for raw in junk:
                 value, errors = built(name, raw)
                 self.assertEqual(value, default, (name, raw))
@@ -180,11 +184,20 @@ class Counts(unittest.TestCase):
         for name, (default, _limit) in COUNTS.items():
             if name == "plan_retention_days":
                 continue
+            least = LEAST.get(name, 1)
             for raw in (0, "0"):
                 self.assertEqual(
                     built(name, raw),
-                    (default, [f"{name}: expected a whole number of 1 or more, got {raw!r}; using {default}"]),
+                    (default, [f"{name}: expected a whole number of {least} or more, got {raw!r}; using {default}"]),
                 )
+
+    def test_a_result_budget_below_hermes_floor_keeps_the_default(self):
+        # Hermes never spills a result under 8,000 characters; a smaller budget would leave no room for a row
+        self.assertEqual(built("max_result_chars", 8000), (8000, []))
+        self.assertEqual(
+            built("max_result_chars", 7999),
+            (60000, ["max_result_chars: expected a whole number of 8000 or more, got 7999; using 60000"]),
+        )
 
     def test_values_above_the_limit_are_lowered_to_it(self):
         for name, (_default, limit) in COUNTS.items():
@@ -333,10 +346,12 @@ class PublicAndDigest(unittest.TestCase):
         digest = settings.digest()
         self.assertRegex(digest, r"^[0-9a-f]{12}$")
         summary = dict(settings.to_dict(), audit_sinks={"count": 4, "types": ["http", "syslog", "unknown"]})
+        del summary["max_result_chars"]  # added in 0.1.3: counted only once it differs from its default
         canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         self.assertEqual(digest, hashlib.sha256(canonical.encode("ascii")).hexdigest()[:12])
         # what 0.1.0 gave, so an upgrade raises no alert on an unapproved configuration
         self.assertEqual(Settings().digest(), "82752853a9ac")
+        self.assertNotEqual(Settings(max_result_chars=30000).digest(), "82752853a9ac")
         self.assertEqual(Settings(audit_log_path="/var/log/hermes/librenms-audit.jsonl").digest(), "0a6839d34d47")
         self.assertEqual(Settings(audit_sinks=list(reversed(self.SINKS))).digest(), digest)  # types are a set
         self.assertEqual(Settings(audit_sinks=self.SINKS, errors=["x"]).digest(), digest)

@@ -103,11 +103,11 @@ def _result(text: str) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False, default=str)
 
 
-def _plans(positional: List[str]) -> str:
+def _plans(positional: List[str], actor: Dict[str, Any]) -> str:
     args: Dict[str, Any] = {"limit": 50}
     if positional:
         args["status"] = positional[0]
-    data = json.loads(handlers.librenms_plans(args))
+    data = json.loads(handlers.librenms_plans(args, _actor=actor))
     if not data.get("success"):
         return f"Error: {data.get('error')}"
     if not data.get("plans"):
@@ -188,8 +188,8 @@ def _agent_shell_refusal(cmd: str, plan_id: str, actor: Dict[str, Any]) -> str |
 
 
 def _plan_command(cmd: str, plan_id: str, options: Dict[str, Any], via: str, actor: Dict[str, Any]) -> str:
-    if cmd == "show":
-        data = json.loads(handlers.librenms_plans({"plan_id": plan_id}))
+    if cmd == "show":  # an operator path: the whole plan, never a page of it
+        data = json.loads(handlers.librenms_plans({"plan_id": plan_id}, _actor=actor))
         if not data.get("success"):
             return f"Error: {data.get('error')}"
         out = data.get("diff") or ""
@@ -231,7 +231,7 @@ def _run(argv: List[str], via: str, actor: Dict[str, Any]) -> str:
     if cmd == "status":
         return json.dumps(mask(handlers.status_report()), indent=2, ensure_ascii=False, default=str)
     if cmd == "plans":
-        return _plans(positional)
+        return _plans(positional, actor)
     if cmd == "prune":
         return _prune(options, prog, actor)
     plan_id, message = _resolve(positional[0], prog)

@@ -615,5 +615,139 @@ class Ports(_FakeCase):
         self.assertEqual(len(self.fake.tables["ports"][2]["ifAlias"]), 255)
 
 
+class ReportRoutes(_FakeCase):
+    """The read-only routes the report views use, with the quirks of their LibreNMS handlers."""
+
+    def test_bgp_and_ospf(self):
+        body = self.call("GET", "bgp")[1]
+        self.assertEqual(([b["bgpPeer_id"] for b in body["bgp_sessions"]], body["count"]), ([1, 2], 2))  # stateless
+        self.assertEqual(len(self.call("GET", "bgp", {"hostname": "nope.example.net"})[1]["bgp_sessions"]), 2)
+        self.assertEqual(len(self.call("GET", "bgp", {"hostname": "core-sw1.example.net"})[1]["bgp_sessions"]), 0)
+        self.assertEqual(self.call("GET", "bgp", {"bgp_state": "IDLE"})[1]["bgp_sessions"][0]["bgpPeer_id"], 2)
+        self.assertEqual(self.call("GET", "bgp", {"remote_asn": "AS64500"})[1]["bgp_sessions"][0]["bgpPeer_id"], 1)
+        self.assertEqual(
+            self.call("GET", "bgp/x"), (400, {"status": "error", "message": "Invalid id has been provided"})
+        )
+        self.assertEqual(self.call("GET", "bgp/3")[1]["message"], "BGP peer 3 does not exist")
+        self.assertEqual(self.call("GET", "bgp/1")[1]["count"], 1)
+        body = self.call("GET", "ospf", {"hostname": "2"})[1]
+        self.assertEqual(([o["ospfNbrRtrId"] for o in body["ospf_neighbours"]], body["count"]), (["192.0.2.1"], 1))
+
+    def test_port_groups(self):
+        body = self.call("GET", "port_groups")[1]
+        self.assertEqual(
+            (body["message"], [g["name"] for g in body["groups"]]), ("Found 2 port groups", ["spare", "uplinks"])
+        )
+        self.assertEqual(
+            self.call("GET", "port_groups/1")[1]["ports"], [{"port_id": 1}, {"port_id": 5}, {"port_id": 6}]
+        )
+        self.assertEqual(self.call("GET", "port_groups/UPLINKS", {"full": 1})[1]["ports"][0]["ifName"], "Gi1/0/1")
+        self.assertEqual(self.call("GET", "port_groups/nope")[1]["message"], "Port group not found")
+        self.assertEqual(
+            self.call("GET", "port_groups/spare"),
+            (404, {"status": "error", "message": "No ports found in group spare"}),
+        )
+        self.fake.tables["port_groups"].clear()
+        self.assertEqual(self.call("GET", "port_groups")[1]["message"], "No port groups found")
+
+    def test_availability_outages_and_vlans(self):
+        body = self.call("GET", "devices/edge-rtr1.example.net/availability")[1]
+        self.assertEqual([a["duration"] for a in body["availability"]], [86400, 604800, 2592000, 31536000])
+        self.assertNotIn("count", body)  # an Eloquent collection
+        self.assertEqual(
+            self.call("GET", "devices/4/outages")[1],
+            {"status": "ok", "outages": [{"going_down": 1761600000, "up_again": None}]},
+        )
+        self.assertEqual(self.call("GET", "devices/99/outages")[1], {"status": "ok", "outages": []})
+        body = self.call("GET", "devices/core-sw1.example.net/vlans")[1]
+        self.assertEqual(
+            (list(body["vlans"][0]), body["count"]),
+            (["vlan_vlan", "vlan_domain", "vlan_name", "vlan_type", "vlan_state"], 3),
+        )
+        self.assertEqual(self.call("GET", "devices/nope/vlans")[1]["message"], "Device nope not found")
+        self.assertEqual(len(self.call("GET", "resources/vlans", {"hostname": "nope"})[1]["vlans"]), 4)  # no filter
+        self.assertEqual(
+            self.call("GET", "resources/vlans", {"hostname": "2"}),
+            (404, {"status": "error", "message": "VLANs do not exist"}),
+        )
+
+    def test_links(self):
+        self.assertEqual(self.call("GET", "devices/3/links")[1]["links"][0]["remote_port"], "Gi1/0/2")
+        self.assertEqual(len(self.call("GET", "devices/nope.example.net/links")[1]["links"]), 4)  # no filter
+        self.assertEqual(
+            self.call("GET", "devices/4/links"), (404, {"status": "error", "message": "Links do not exist"})
+        )
+        self.assertEqual(self.call("GET", "resources/links/x")[0], 400)
+        self.assertEqual(self.call("GET", "resources/links/2")[1]["link"][0]["remote_port_id"], 9)
+
+    def test_fdb_nac_and_arp(self):
+        self.assertEqual(len(self.call("GET", "resources/fdb/001122334455")[1]["ports_fdb"]), 2)
+        self.assertEqual(len(self.call("GET", "resources/fdb/00000C9FF001")[1]["ports_fdb"]), 1)  # a ci collation
+        self.assertEqual(self.call("GET", "resources/fdb/00:11:22:33:44:55")[1]["message"], "Fdb entry does not exist")
+        self.assertEqual(len(self.call("GET", "resources/fdb/0")[1]["ports_fdb"]), 3)  # empty("0"): no filter
+        self.assertNotIn("count", self.call("GET", "resources/fdb")[1])
+        body = self.call("GET", "resources/fdb/0011.2233.4455/detail")[1]
+        self.assertEqual((body["mac"], body["mac_oui"], body["count"]), ("00:11:22:33:44:55", "CIMSYS Inc", 2))
+        self.assertEqual(
+            list(body["ports_fdb"][0]),
+            ["hostname", "sysName", "ifName", "ifAlias", "ifDescr", "updated_at", "last_seen"],
+        )
+        self.assertEqual(
+            self.call("GET", "resources/fdb/zz/detail"), (422, {"status": "error", "message": "Invalid MAC address"})
+        )
+        self.assertEqual(self.call("GET", "devices/nope/fdb")[1]["message"], "Device nope not found")
+        self.assertEqual(self.call("GET", "resources/nac/00:11:22:33:44:55")[1]["message"], " Nac entry does not exist")
+        self.assertEqual(self.call("GET", "resources/ip/arp/all", {"device": "nope"})[1], {"status": "ok", "arp": []})
+        self.assertEqual(self.call("GET", "resources/ip/arp/10.0.0.0/99")[0], 400)
+        self.assertEqual(self.call("GET", "resources/ip/arp/0011.2233.4455")[1]["arp"][0]["ipv4_address"], "192.0.2.50")
+        self.assertEqual(self.call("GET", "resources/ip/arp/0011.2233.44")[1]["arp"], [])  # read as an address
+
+    def test_ports_search_mac_and_the_fleet_listing(self):
+        self.assertEqual(self.call("GET", "ports/search/WAN")[1]["ports"][0]["ifAlias"], "WAN: transit-a")  # swapped
+        self.assertEqual(self.call("GET", "ports/search/ifName/Gi1/0/4")[1]["ports"][0]["ifName"], "Gi1/0/48")
+        self.assertEqual(self.call("GET", "ports/search/ifAlias, ifName/WAN"), (500, {"message": "Server Error"}))
+        self.assertEqual(self.call("GET", "ports/search/ifAlias/WAN", {"columns": "port_id, ifName"})[0], 500)
+        self.assertEqual(self.call("GET", "ports/search/nope/WAN")[1]["message"], "Invalid columns: nope")
+        self.assertEqual(self.call("GET", "ports/search/ifName/xyz")[1]["message"], "No ports found")
+        body = self.call("GET", "ports/mac/00-11-22-33-44-55", {"filter": "first"})[1]
+        self.assertEqual((body["ports"]["port_id"], "count" in body), (9, False))  # one port, as an object
+        self.assertEqual(self.call("GET", "ports/mac/xyz")[0], 422)
+        self.assertEqual(self.call("GET", "ports/mac/aabbccddeeff")[1]["message"], "mac not found")
+        for port in self.fake.tables["ports"].values():
+            port["deleted"] = 1
+        self.assertEqual(self.call("GET", "ports")[1], {"status": "ok", "ports": []})  # never a 404
+
+    def test_bills(self):
+        body = self.call("GET", "bills")[1]
+        self.assertEqual([(b["bill_name"], b["percent"], b["overuse"]) for b in body["bills"]],
+                         [("Transit A", 81.2, "-"), ("Transit B", 124.0, "120 M")])  # fmt: skip
+        self.assertEqual(body["bills"][0]["allowed"], "1 Gbps")
+        self.assertEqual(len(self.call("GET", "bills/transit")[1]["bills"]), 2)  # not a number: every bill
+        self.assertEqual(len(self.call("GET", "bills/0")[1]["bills"]), 0)
+        self.assertEqual(self.call("GET", "bills/1", {"ref": "TRANSIT-B"})[1]["bills"][0]["bill_id"], 2)
+
+    def test_sensors_transceivers_and_components(self):
+        body = self.call("GET", "resources/sensors", {"device_id": 3})[1]
+        self.assertEqual((len(body["sensors"]), "count" in body), (4, False))  # no filter on this route
+        self.fake.tables["sensors"].clear()
+        self.assertEqual(self.call("GET", "resources/sensors")[1]["message"], "Sensors do not exist")
+        self.assertIs(self.call("GET", "devices/1/transceivers")[1]["transceivers"][0]["ddm"], True)
+        self.assertEqual(self.call("GET", "devices/nope/transceivers")[1], {"status": "ok", "transceivers": []})
+        body = self.call("GET", "devices/1/components")[1]
+        self.assertEqual((list(body["components"]), body["count"]), (["7", "8"], 2))
+        self.assertEqual(list(self.call("GET", "devices/1/components", {"status": 2})[1]["components"]), ["8"])
+        self.assertEqual(self.call("GET", "devices/2/components")[1], {"status": "ok"})
+
+    def test_syslog_and_the_alert_log(self):
+        body = self.call("GET", "logs/syslog", {"sortorder": "DESC", "limit": 2})[1]
+        self.assertEqual(([e["seq"] for e in body["logs"]], body["total"]), ([3, 2], 3))
+        self.assertEqual(list(body["logs"][0])[:4], ["hostname", "sysName", "device_id", "facility"])
+        self.assertEqual([e["seq"] for e in self.call("GET", "logs/syslog", {"from": 2})[1]["logs"]], [2, 3])
+        body = self.call("GET", "logs/alertlog/2")[1]
+        self.assertEqual(([e["id"] for e in body["logs"]], body["total"]), ([2, 3, 1], 3))
+        self.assertEqual(body["logs"][0]["details"]["contacts"]["noc@example.net"], "NOC")  # decoded
+        self.assertEqual(self.call("GET", "alerts")[1]["alerts"][0]["id"], 4)  # the legacy alias
+
+
 if __name__ == "__main__":
     unittest.main()

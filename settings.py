@@ -19,16 +19,20 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List
 
 WRITE_MODES = ("full", "operator_only", "read_only")
-# Upper limits: a larger value is lowered to the limit. plan_retention_days is the one count where 0 means
-# something (keep plans forever); for the others 0 would be no cap at all, so it keeps the default.
+# Upper limits: a larger value is lowered to the limit. max_result_chars stays under Hermes' per-result threshold
+# (100,000 characters), past which the model sees only a 1,500-character preview of the result.
 LIMITS = {
     "max_operations": 1000,
     "max_query_results": 5000,
+    "max_result_chars": 90000,
     "max_plan_age_hours": 720,
     "max_maintenance_hours": 8760,
     "plan_retention_days": 3650,
 }
-_ZERO_ALLOWED = frozenset({"plan_retention_days"})
+# Lower limits where 1 is not the least: plan_retention_days is the one count where 0 means something (keep plans
+# forever), and a result budget below Hermes' own floor (8,000 characters) leaves no room for a row. A smaller value
+# keeps the default.
+MINIMUMS = {"plan_retention_days": 0, "max_result_chars": 8000}
 # What an unreadable value becomes when that is not simply the default: whatever lets the model do least. Every
 # flag listed here equals its default today; the table keeps it so when a default changes.
 _FAIL_CLOSED: Dict[str, Any] = {
@@ -41,6 +45,9 @@ _FAIL_CLOSED: Dict[str, Any] = {
     "audit_log": True,
     "link_eventlog": True,
 }
+# Settings added after 0.1.0: the digest counts one only once it differs from its default, so an upgrade does not
+# change the digest of a configuration a collector has approved.
+_LATER_SETTINGS = frozenset({"max_result_chars"})
 _TRUE = frozenset({"true", "yes", "on", "1"})
 _FALSE = frozenset({"false", "no", "off", "0"})
 _SHOWN_CHARS = 40
@@ -56,6 +63,7 @@ class Settings:
     allow_insecure_transport: bool = False  # http:// or LIBRENMS_VERIFY_SSL=false (also for audit sinks)
     max_operations: int = 100
     max_query_results: int = 500
+    max_result_chars: int = 60000  # serialised size of one tool result the model reads
     max_plan_age_hours: int = 24
     max_maintenance_hours: int = 72
     plan_retention_days: int = 90  # 0 keeps plans forever
@@ -129,8 +137,14 @@ class Settings:
         """Short SHA-256 of the settings as canonical JSON, sink entries reduced to their count and types: the same
         settings give the same digest in every process, so audit events can show which configuration a run used
         without carrying it. A different ``audit_log_path`` gives a different digest, though status shows neither
-        path."""
-        text = json.dumps(self._summary(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+        path. A setting added in a later release counts only once it differs from its default."""
+        defaults = Settings().to_dict()
+        summary = {
+            name: value
+            for name, value in self._summary().items()
+            if name not in _LATER_SETTINGS or value != defaults[name]
+        }
+        text = json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
         return hashlib.sha256(text.encode("ascii")).hexdigest()[:12]
 
 
@@ -189,7 +203,7 @@ def _coerce_int(name: str, raw: Any, default: int, errors: List[str]) -> int:
     elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
         with contextlib.suppress(ValueError):  # more digits than int() converts: the default is the safe answer
             value = int(raw.strip())
-    least = 0 if name in _ZERO_ALLOWED else 1
+    least = MINIMUMS.get(name, 1)
     if value is None or value < least:
         return _reject(name, f"a whole number of {least} or more", _shown(raw), default, errors)
     limit = LIMITS.get(name)

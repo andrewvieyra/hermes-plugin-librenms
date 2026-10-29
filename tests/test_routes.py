@@ -8,12 +8,48 @@ client_mod = submodule("client")
 routes = submodule("routes")
 
 LONE = chr(0xD800)  # a lone surrogate, as JSON can carry
+UNKNOWN = (
+    "no LibreNMS device has hostname '{}' (hostnames match exactly); find the stored one with the path 'devices' and "
+    "params type=hostname, query=<part of it>"
+)
 SETTINGS = types.SimpleNamespace(max_query_results=500)
+# Each read route's result key: the second argument of the api_success() its LibreNMS handler answers with
+# (includes/html/api_functions.inc.php, checked route by route against LibreNMS 26.10). A wrong key makes the result
+# null while the tool reports success, so a change here needs that check again.
+LIST_KEYS = {
+    "server_info": "system", "get_alert_template": "alert_templates", "list_alert_templates": "alert_templates",
+    "list_pollers": "pollers", "list_poller_log": "log", "list_bgp": "bgp_sessions", "get_bgp": "bgp_session",
+    "list_ospf": "ospf_neighbours", "list_ospf_ports": "ospf_ports", "list_ospfv3": "ospfv3_neighbours",
+    "list_ospfv3_ports": "ospfv3_ports", "get_devices_by_group": "devices", "get_device_groups": "groups",
+    "get_port_groups": "groups", "get_ports_by_group": "ports", "get_alert": "alerts", "list_alerts": "alerts",
+    "legacy_get_alert": "alerts", "legacy_list_alerts": "alerts", "get_alert_rule": "rules",
+    "list_alert_rules": "rules", "get_vrf": "vrf", "list_ipsec": "ipsec", "list_services": "services",
+    "list_services_device": "services", "get_poller_group": "get_poller_group", "get_device": "devices",
+    "device_availability": "availability", "device_outages": "outages", "get_vlans": "vlans",
+    "list_links_device": "links", "get_graphs": "graphs", "get_fdb": "ports_fdb", "get_nac": "ports_nac",
+    "list_available_health_graphs": "graphs", "list_available_wireless_graphs": "graphs",
+    "get_device_wireless_sensors": "wireless_sensors", "get_device_ports": "ports", "get_ip_addresses": "addresses",
+    "get_port_stack": "mappings", "get_transceivers": "transceivers", "get_components": "components",
+    "get_device_groups_device": "groups", "device_under_maintenance": "is_under_maintenance",
+    "list_devices": "devices", "list_eventlog": "logs", "list_syslog": "logs", "list_alertlog": "logs",
+    "list_authlog": "logs", "get_port_info": "port", "get_port_fdb": "macs", "get_port_ip_info": "addresses",
+    "get_port_transceiver": "transceivers", "search_ports": "ports", "search_mac": "ports", "get_all_ports": "ports",
+    "get_port_description": "port_description", "list_bills": "bills", "get_bill": "bills",
+    "get_bill_graphdata": "graph_data", "get_bill_history": "bill_history",
+    "get_bill_history_graphdata": "graph_data", "list_cbgp": "bgp_counters", "list_vrf": "vrfs",
+    "list_mpls_services": "mpls_services", "list_mpls_saps": "saps", "list_fdb": "ports_fdb",
+    "list_fdb_mac": "ports_fdb", "list_fdb_detail": "ports_fdb", "list_ip_addresses": "ip_addresses",
+    "list_arp": "arp", "list_ip_networks": "ip_networks", "get_network_ip_addresses": "addresses",
+    "list_links": "links", "get_link": "link", "list_nac": "ports_nac", "list_nac_mac": "ports_nac",
+    "list_sensors": "sensors", "list_vlans": "vlans", "list_locations": "locations", "get_inventory": "inventory",
+    "get_inventory_for_device": "inventory", "get_port_security_by_port": "port",
+    "get_port_security_by_hostname": "port", "get_port_security": "port", "get_location": "get_location",
+}  # fmt: skip
 
 
 class StubClient:
-    """Answers ``GET devices/{hostname}`` and ``GET devices/{id}`` (digits, as LibreNMS reads them) from a table;
-    records every path asked for."""
+    """Answers ``GET devices/{hostname}`` and ``GET devices/{id}`` (digits, as LibreNMS reads them) from a table, and
+    ``GET devices?type=hostname|display&query=x`` with the hostnames containing x; records every path asked for."""
 
     def __init__(self, devices=None, errors=None):
         self.devices = {"sw1": 12, "core switch": 7} if devices is None else devices
@@ -22,6 +58,10 @@ class StubClient:
 
     def get(self, path, params=None):
         self.asked.append(path)
+        if path == "devices":
+            query = (params or {}).get("query", "").lower()
+            found = [{"device_id": i, "hostname": h} for h, i in self.devices.items() if query in h.lower()]
+            return {"status": "ok", "devices": found, "count": len(found)}
         name = unquote(path.split("/", 1)[1])
         if name in self.errors:
             raise self.errors[name]
@@ -111,6 +151,66 @@ class Table(unittest.TestCase):
         )
         oxidized = next(route for route in routes.ROUTES if route.name == "list_oxidized")
         self.assertEqual(oxidized.device_params, ())  # LibreNMS matches the hostname column only
+        self.assertEqual(
+            {route.name: route.id_params for route in routes.ROUTES if route.id_params},
+            {
+                "get_alert_template": ("id",),
+                "get_alert": ("id",),
+                "legacy_get_alert": ("id",),
+                "get_alert_rule": ("id",),
+                "list_available_health_graphs": ("sensor_id",),
+                "list_available_wireless_graphs": ("sensor_id",),
+                "get_port_info": ("portid",),
+                "get_port_fdb": ("portid",),
+                "get_port_ip_info": ("portid",),
+                "get_port_transceiver": ("portid",),
+                "get_port_description": ("portid",),
+                "get_bill": ("bill_id",),
+                "get_bill_graphdata": ("bill_id",),
+                "get_bill_history": ("bill_id",),
+                "get_bill_history_graphdata": ("bill_id",),
+                "get_network_ip_addresses": ("id",),
+                "get_port_security_by_port": ("portid",),
+            },
+        )
+        self.assertEqual({route.name for route in routes.ROUTES if route.mac_params}, {"list_fdb_mac", "list_nac_mac"})
+        self.assertEqual(
+            {route.name for route in routes.ROUTES if route.alert_rows},
+            {"get_alert", "list_alerts", "legacy_get_alert", "legacy_list_alerts", "list_alertlog"},
+        )
+        self.assertEqual(
+            {route.name for route in routes.ROUTES if route.columns},
+            {"get_device_ports", "search_ports", "get_all_ports"},
+        )
+
+    def test_every_read_route_names_the_key_librenms_answers_with(self):
+        readable = {route.name: route.list_key for route in routes.ROUTES if not route.refused}
+        self.assertEqual({name: key for name, key in readable.items() if key}, LIST_KEYS)
+        self.assertEqual({name for name, key in readable.items() if not key}, {"ping", "index", "list_oxidized"})
+
+
+class TooLargeHint(unittest.TestCase):
+    def hint(self, path):
+        return routes.too_large_hint(routes.match(path)[0], path)
+
+    def test_limit_is_offered_only_where_librenms_pages(self):
+        self.assertEqual(
+            self.hint("logs/syslog"), "ask for fewer rows at a time with a smaller limit, and page with start"
+        )
+        for path in ("devices", "ports", "resources/sensors", "faults", "devices/sw1/ports", "resources/vlans"):
+            self.assertTrue(self.hint(path).endswith("(limit does not help here: LibreNMS sends every row and the "
+                                                     "limit applies after)"), path)  # fmt: skip
+
+    def test_each_route_gets_the_narrowing_it_takes(self):
+        self.assertIn("filter with params type and query", self.hint("devices"))
+        self.assertIn("query the path 'devices/<hostname>' for one device's rows", self.hint("devices"))
+        self.assertIn("params.columns", self.hint("ports"))
+        self.assertIn("'devices/<hostname>/ports'", self.hint("ports"))
+        self.assertIn("params.columns", self.hint("devices/sw1/ports"))
+        self.assertIn("'devices/<hostname>/health'", self.hint("resources/sensors"))
+        self.assertIn("filter by device with params.hostname", self.hint("bgp"))
+        self.assertIn("'services/<hostname>'", self.hint("services"))
+        self.assertTrue(self.hint("faults").startswith("read one object's or one device's path instead"))
 
 
 class Normalise(unittest.TestCase):
@@ -256,7 +356,7 @@ class Prepare(unittest.TestCase):
     def test_unknown_and_invisible_hostnames_are_refused(self):
         with self.assertRaises(routes.QueryError) as caught:
             prepare("devices/sw9/vlans")
-        self.assertEqual(str(caught.exception), "no LibreNMS device has hostname 'sw9'")
+        self.assertEqual(str(caught.exception), UNKNOWN.format("sw9"))
         forbidden = client_mod.LibreNMSError("GET -> HTTP 403", status=403, kind="forbidden")
         with self.assertRaises(routes.QueryError) as caught:
             prepare("logs/syslog/sw8", client=StubClient(errors={"sw8": forbidden}))
@@ -288,29 +388,61 @@ class Prepare(unittest.TestCase):
             with self.assertRaises(routes.QueryError, msg=bad):
                 prepare("routing/vrf", {"hostname": bad})
 
-    def test_a_hostname_param_is_matched_by_the_name_php_reads(self):
-        # PHP drops leading blanks, so these reach LibreNMS as hostname (a trailing blank is taken as one too):
-        # none of them may skip the lookup
-        for key in (" hostname", "  hostname", "hostname "):
+    def test_a_params_name_php_reads_as_another_is_refused(self):
+        # PHP drops leading spaces, turns spaces, dots and an unclosed [ into _, reads name[...] as an array called
+        # name, and keeps the last of two names it reads alike: none of these may reach LibreNMS unchecked
+        for key, read in (
+            (" hostname", "'hostname'"),
+            ("  limit", "'limit'"),
+            ("hostname ", "'hostname_'"),
+            ("host name", "'host_name'"),
+            ("hostname.", "'hostname_'"),
+            ("hostname[", "'hostname_'"),
+            ("a[b.c", "'a_b_c'"),
+        ):
             client = StubClient()
-            self.assertEqual(prepare("ospf", {key: "sw1"}, client=client).params, {key: "12"}, key)
-            self.assertEqual(client.asked, ["devices/sw1"], key)
             with self.assertRaises(routes.QueryError, msg=key) as caught:
-                prepare("ospf", {key: "sw9"})
-            self.assertEqual(str(caught.exception), "no LibreNMS device has hostname 'sw9'")
-        # PHP names are case-sensitive, and it turns . and [ into _: LibreNMS reads none of these as hostname
-        for key in ("Hostname", "hostname.", "hostname["):
-            client = StubClient()
-            self.assertEqual(prepare("ospf", {key: "sw9"}, client=client).params, {key: "sw9"}, key)
+                prepare("ospf", {key: "sw1"}, client=client)
+            self.assertEqual(
+                str(caught.exception),
+                f"params key {key!r} reaches LibreNMS as {read} (PHP drops leading spaces and turns spaces, dots and "
+                "[ into _); write the name LibreNMS reads",
+            )
             self.assertEqual(client.asked, [], key)
+        for key in ("hostname[]", "hostname[0]", " hostname[x].y"):
+            with self.assertRaises(routes.QueryError, msg=key) as caught:
+                prepare("logs/eventlog", {key: "no-such-device"})
+            self.assertEqual(
+                str(caught.exception),
+                f"params key {key!r} reaches LibreNMS as an array named 'hostname'; use plain names (a list value is "
+                "sent joined with commas)",
+            )
+        # names are case-sensitive: LibreNMS would ignore these, while the plugin checks and clamps the real ones
+        for key in ("Hostname", "LIMIT", "Start", "sortOrder", "Columns"):
+            with self.assertRaises(routes.QueryError, msg=key) as caught:
+                prepare("logs/eventlog", {key: "1"})
+            self.assertEqual(
+                str(caught.exception),
+                f"params key {key!r}: LibreNMS reads names as written; write it as {key.lower()!r}",
+            )
+        self.assertEqual(prepare("ospf", {"hostname": "sw1"}).params, {"hostname": "12"})
+        self.assertEqual(prepare("faults", {"host_name": "x"}).params, {"host_name": "x"})  # a name PHP keeps
+
+    def test_a_paging_name_php_reads_alike_never_reaches_the_wire(self):
+        # {"limit": 5, " limit": -1} was sent as limit=5&+limit=-1, which LibreNMS read as no limit at all
+        for params in ({"limit": 5, " limit": -1}, {" limit": "-1"}, {"start": 0, "start ": 9}, {" sortorder": "ASC"}):
+            with self.assertRaises(routes.QueryError, msg=params) as caught:
+                prepare("logs/syslog", params)
+            self.assertIn("reaches LibreNMS as", str(caught.exception))
+        self.assertEqual(prepare("logs/syslog", {"limit": 5}).params, {"limit": "5", "start": "0", "sortorder": "DESC"})
 
     def test_a_hostname_param_a_route_ignores_is_refused_naming_the_path_form(self):
         # list_logs and list_services read only the path's hostname and list_alerts has no device filter: the param
         # would be dropped and every device's rows returned for whatever hostname was asked for
         for path, params, form in (
             ("logs/eventlog", {"hostname": "no-such-device"}, "logs/eventlog/<hostname>"),
-            ("logs/syslog", {"hostname ": "sw1"}, "logs/syslog/<hostname>"),
-            ("services", {" hostname": "sw1"}, "services/<hostname>"),
+            ("logs/syslog", {"hostname": "sw1"}, "logs/syslog/<hostname>"),
+            ("services", {"hostname": "sw1"}, "services/<hostname>"),
             ("devices", {"type": "hostname", "query": "sw", "hostname": "x"}, "devices/<hostname>"),
             ("oxidized", {"hostname": "sw1"}, "oxidized/<hostname>"),
             ("faults", {"hostname": "sw1"}, None),
@@ -399,6 +531,137 @@ class Prepare(unittest.TestCase):
             with self.assertRaises(routes.QueryError, msg=repr(params)) as caught:
                 prepare("faults", params)
             self.assertIn(said, str(caught.exception), params)
+
+    def test_an_object_id_librenms_would_read_as_no_filter_is_refused(self):
+        # list_alerts filters only when $id > 0, the rule and template lists when($id), bills when is_numeric,
+        # get_port_security if ($port_id), the health list $sensor_id ? where : list: so faults/0, rules/0, bills/x,
+        # port_security/port/0 or .../health/{type}/0 answered with every object under a path that names one; and the
+        # port, bill, network and sensor routes compare the text with an integer column, where MySQL reads 1abc as 1
+        for path in ("faults/0", "faults/-1", "alerts/0", "rules/0", "rules/1abc", "alert_templates/0", "bills/x",
+                     "bills/0", "faults/1.0", "rules/²", "port_security/port/0", "port_security/port/1abc",
+                     "ports/0", "ports/1abc", "ports/1abc/fdb", "ports/x/ip", "ports/0/transceiver",
+                     "ports/1abc/description", "ports/search", "ports/mac/fdb", "bills/1abc/history",
+                     "bills/0/graphdata/bits", "bills/x/history/2/graphdata/bits", "resources/ip/networks/1abc/ip",
+                     "devices/sw1/health/device_temperature/0", "devices/sw1/health/device_temperature/1abc",
+                     "devices/sw1/wireless/device_wireless_clients/0"):  # fmt: skip
+            client = StubClient()
+            with self.assertRaises(routes.QueryError, msg=path) as caught:
+                prepare(path, client=client)
+            message = str(caught.exception)
+            self.assertRegex(
+                message, r"^\{(id|bill_id|portid|sensor_id)\} must be a positive whole number \(got ", path
+            )
+            self.assertIn(f"LibreNMS's {routes.match(path)[0].name} reads 0 or text as no filter", message)
+            self.assertEqual(client.asked, [], path)
+        for path, sent in (
+            ("faults/5", "faults/5"),
+            ("rules/007", "rules/7"),
+            ("bills/2", "bills/2"),
+            ("ports/12/fdb", "ports/12/fdb"),
+            ("port_security/port/3", "port_security/port/3"),
+            ("bills/2/history/7/graphdata/bits", "bills/2/history/7/graphdata/bits"),
+            ("resources/ip/networks/5/ip", "resources/ip/networks/5/ip"),
+            ("devices/sw1/health/device_temperature/4", "devices/12/health/device_temperature/4"),
+            ("devices/sw1/health/device_temperature", "devices/12/health/device_temperature"),  # every sensor: asked
+        ):
+            self.assertEqual(prepare(path).request_path, sent)
+        self.assertEqual(prepare("bgp/0").request_path, "bgp/0")  # get_bgp answers 0 with a 404, not a list
+
+    def test_poller_group_0_is_refused_and_names_are_sent(self):
+        # get_poller_group answers empty($poller_group) with every group, and PHP's empty("0") is true; devices are in
+        # group 0 (General, no poller_groups row) by default
+        with self.assertRaises(routes.QueryError) as caught:
+            prepare("poller_group/0")
+        self.assertIn("LibreNMS reads poller_group/0 as no group at all", str(caught.exception))
+        for path in ("poller_group", "poller_group/1", "poller_group/00", "poller_group/core-pollers"):
+            self.assertEqual(prepare(path).request_path, path)
+
+    def test_macs_are_sent_as_the_12_hex_digits_librenms_stores(self):
+        # list_fdb and list_nac compare {mac} with the column exactly: a MAC with separators was never found, and
+        # the empty answer read as "not on the network"; 0 is read as no filter at all
+        for given, sent in (
+            ("00:11:22:33:44:55", "001122334455"),
+            ("00-11-22-33-44-55", "001122334455"),
+            ("0011.2233.4455", "001122334455"),
+            ("AABBCCDDEEFF", "aabbccddeeff"),
+            ("0:11:22:33:44:5", "001122334405"),  # SNMP drops leading zeros
+            ("0:0:c:7:ac:1", "00000c07ac01"),  # 12 characters with its separators, like the bare form
+            ("0-0-5e-0-1-a", "00005e00010a"),
+            ("00:1:2:3:4:5", "000102030405"),
+            ("00:11:22:33:44:55 ", "001122334455"),
+        ):
+            for route in ("fdb", "nac"):
+                query = prepare(f"resources/{route}/{given}")
+                self.assertEqual(query.request_path, f"resources/{route}/{sent}", given)
+                self.assertEqual(query.path, f"resources/{route}/{given.strip()}")  # as the model wrote it
+        for bad in ("0", "001122", "00:11:22:33:44", "00:11-22:33:44:55", "0011.2233", "zz:11:22:33:44:55", "all"):
+            with self.assertRaises(routes.QueryError, msg=bad) as caught:
+                prepare(f"resources/fdb/{bad}")
+            self.assertIn("takes a whole MAC address", str(caught.exception))
+        # the detail route and ports/mac parse the MAC themselves
+        self.assertEqual(prepare("resources/fdb/00:11:22:33:44:55/detail").request_path,
+                         "resources/fdb/00%3A11%3A22%3A33%3A44%3A55/detail")  # fmt: skip
+
+    def test_column_lists_are_trimmed_and_checked(self):
+        # LibreNMS checks the trimmed names but selects them as sent: "port_id, ifName" was an opaque HTTP 500
+        for given in ("port_id, ifName, ifAlias", " port_id,ifName ,ifAlias", ["port_id", " ifName", "ifAlias "],
+                      "port_id,,ifName,ifAlias,"):  # fmt: skip
+            self.assertEqual(
+                prepare("devices/sw1/ports", {"columns": given}).params["columns"], "port_id,ifName,ifAlias", given
+            )
+        self.assertEqual(prepare("ports", {"columns": ""}).params, {"columns": ""})  # LibreNMS's default columns
+        for bad in ("port_id;drop", "*", "if Name", "ports.ifName"):
+            with self.assertRaises(routes.QueryError, msg=bad) as caught:
+                prepare("ports", {"columns": bad})
+            self.assertIn("params.columns takes column names separated by commas", str(caught.exception))
+
+    def test_the_ports_search_field_list_is_trimmed_only_when_a_search_follows(self):
+        query = prepare("ports/search/ifAlias, ifName/core uplink")
+        self.assertEqual(query.request_path, "ports/search/ifAlias%2CifName/core%20uplink")
+        # with one segment LibreNMS reads it as the search term over ifAlias, ifDescr and ifName
+        self.assertEqual(prepare("ports/search/core, uplink").request_path, "ports/search/core%2C%20uplink")
+        for path in ("ports/search/if-Alias/core", "ports/search/ , /core"):
+            with self.assertRaises(routes.QueryError, msg=path):
+                prepare(path)
+
+    def test_an_unknown_hostname_names_the_hostnames_that_contain_its_first_label(self):
+        devices = {f"core-sw{i}.example.net": i for i in range(1, 8)} | {"edge-rtr1.example.net": 20}
+        client = StubClient(devices=devices)
+        with self.assertRaises(routes.QueryError) as caught:
+            prepare("devices/core-sw1.example.com/ports", client=client)
+        self.assertEqual(
+            str(caught.exception),
+            "no LibreNMS device has hostname 'core-sw1.example.com' (hostnames match exactly); devices whose hostname "
+            "or display name contains 'core-sw1': core-sw1.example.net",
+        )
+        with self.assertRaises(routes.QueryError) as caught:
+            prepare("logs/eventlog/core-sw", client=client)
+        self.assertTrue(str(caught.exception).endswith(
+            "contains 'core-sw': core-sw1.example.net, core-sw2.example.net, core-sw3.example.net, "
+            "core-sw4.example.net, core-sw5.example.net and 2 more"
+        ))  # fmt: skip
+        self.assertEqual(client.asked[-2:], ["devices/core-sw", "devices"])
+        # a short label or a LIKE wildcard would match half the inventory: not searched
+        for value in ("sw", "s%.example.net"):
+            client = StubClient()
+            with self.assertRaises(routes.QueryError):
+                prepare("bgp", {"hostname": value}, client=client)
+            self.assertEqual(client.asked, [f"devices/{value.replace('%', '%25')}"], value)
+        # an id is not searched; a failed search only leaves the candidates out
+        client = StubClient()
+        with self.assertRaises(routes.QueryError) as caught:
+            prepare("devices/99/ports", client=client)
+        self.assertEqual((str(caught.exception), client.asked), ("no LibreNMS device has id 99", ["devices/99"]))
+
+        class Failing(StubClient):
+            def get(self, path, params=None):
+                if path == "devices":
+                    raise client_mod.LibreNMSError("GET devices -> HTTP 500", status=500, kind="server")
+                return super().get(path, params)
+
+        with self.assertRaises(routes.QueryError) as caught:
+            prepare("devices/core-sw9/ports", client=Failing())
+        self.assertEqual(str(caught.exception), UNKNOWN.format("core-sw9"))
 
     def test_logs_defaults_and_clamps(self):
         query = prepare("logs/eventlog/sw1")

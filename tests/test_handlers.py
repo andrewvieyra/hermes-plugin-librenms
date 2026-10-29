@@ -371,8 +371,12 @@ class PlanApplyRollback(HandlerCase):
         pid = self.plan([self.update_purpose()])["id"]
         self.call("librenms_apply", plan_id=pid)
         shown = self.call("librenms_plans", plan_id=pid)
+        self.assertEqual((shown["journal"][0]["status"], shown["journal"][0]["inverse_kind"]), ("done", "exact"))
+        self.assertNotIn("inverse", shown["journal"][0])
+        shown = self.call("librenms_plans", plan_id=pid, detail=True)
         self.assertEqual(shown["journal"][0]["inverse"]["data"], {"purpose": "core"})
         self.assertIn("after_state", shown["journal"][0])
+        self.assertEqual(shown["steps"][0]["changes"], {"purpose": {"from": "core", "to": "spine"}})
         self.assertEqual(shown["apply"]["outcome"], "applied")
         self.assertEqual(self.call("librenms_plans", status="planned")["count"], 0)
         self.assertEqual(self.call("librenms_plans", status="applied", limit="junk")["count"], 1)

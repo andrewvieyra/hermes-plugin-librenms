@@ -6,6 +6,74 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-29
+
+### Security
+- A `params` name that PHP reads as another name is refused. PHP drops leading spaces and keeps the last of two
+  names it reads alike, so `{"limit": 5, " limit": -1}` on a log route reached LibreNMS as `limit=-1`, no limit at
+  all, past the clamp that keeps it positive: the whole syslog table was serialised. Likewise `hostname[]` and
+  `hostname[0]` reach LibreNMS as `hostname` (an array), which skipped both the device check and the refusal of a
+  `hostname` a route ignores, and returned every device's rows. Names with a space, a dot or a `[`, and `hostname`,
+  `limit`, `start`, `sortorder` and `columns` in another letter case, are refused before anything is sent.
+- `faults/0`, `faults/-1`, `alerts/0`, `rules/0`, `alert_templates/0`, `bills/<not a number>`,
+  `port_security/port/0`, `devices/{hostname}/health/{type}/0` and `poller_group/0` are refused: LibreNMS filters
+  by those ids only when they are set and positive (or numeric, for bills; PHP's `empty()` reads `"0"` as absent),
+  so each answered with every object, under a path that names one. `poller_group/0` named `core-pollers` for a
+  device in the General group (0, the default). MySQL also reads `rules/1abc` as rule 1, so the port, bill,
+  network and sensor ids (`ports/{portid}` and its sub-paths, `bills/{bill_id}/...`,
+  `resources/ip/networks/{id}/ip`, `.../health/{type}/{sensor_id}`, `.../wireless/{type}/{sensor_id}`) must be
+  positive whole numbers too; poller group names stay allowed.
+- Fault and alert-log rows no longer carry the alert engine's `details`: every column of every table the rule joins,
+  for every matched row, and the alert's contacts (e-mail addresses and names). They carry `entities` instead, the
+  labels of what alerted (`ifName`, `ifAlias`, `sensor_descr`, `processor_descr`, `bgpPeerDescr` and the like; at
+  most 10, 200 characters each). `fields: ["details"]` returns the blob, without its contacts.
+
+### Fixed
+- `resources/fdb/{mac}` and `resources/nac/{mac}` compare the MAC with the 12 hex digits LibreNMS stores, exactly,
+  so `00:11:22:33:44:55` was never found and the empty answer read as "not on the network". A MAC in any usual form
+  (colons, dashes, Cisco dots, single-digit groups, also when that makes it 12 characters long, as
+  `0:0:c:7:ac:1`) is now sent as those digits; anything else is refused (`0` listed the whole table).
+- A `columns` list with a blank after a comma (`"port_id, ifName"`) is trimmed. LibreNMS checks trimmed names but
+  selects them as sent, which failed in SQL as an opaque HTTP 500. The `{field}` list of
+  `ports/search/{field}/{search}` is trimmed alike; names other than letters, digits and `_` are refused.
+- Envelope extras are returned under `extra`: `resources/fdb/{mac}/detail` answers with the MAC's vendor
+  (`mac_oui`) beside the rows, which was dropped.
+- `devices/{hostname}/components` answers an object keyed by component id; it is returned as rows carrying the id,
+  so `limit` and `fields` apply (`fields` matched the ids, and gave `{}`).
+- An answer too large to read (16 MiB) says what narrows that route. The advice named `limit`, which LibreNMS
+  applies only on the log routes; elsewhere the plugin applies it after every row is read, so following it failed
+  alike. It now names `params.columns` (ports), `type`/`query` (devices), `params.hostname`, or the per-device path
+  (`devices/<hostname>/ports`, `.../fdb`, `.../health`), and says that `limit` does not help there.
+
+### Added
+- `max_result_chars` (default 60,000, 8,000 to 90,000): every result for the model stays within it. Hermes replaces
+  a result over its threshold (100,000 characters, 15% of the context window on a smaller model) with a
+  1,500-character preview of one long line, so 50 devices were already over it on a 64K-token model and a 100-step
+  plan's diff could not be shown before approval. A listing keeps the first rows that fit and says so (`returned`,
+  `truncated`, a `note` naming `fields`, or the next `start` on a log route); a single object that does not fit is
+  refused with the same advice; planning errors, conflicts and the plan listing are cut alike. The operator paths
+  (`/librenms`, `hermes librenms`) are never cut.
+- Plans are shown a range of steps at a time when a whole one does not fit: `librenms_plan`, `librenms_plans`,
+  `librenms_apply` and `librenms_rollback` show the diff, warnings, irreversible steps, checks, journal and eventlog
+  rows of the steps from `offset` on that fit, and `next_offset`; the diff's last line says which steps it shows.
+  When some irreversible steps fall outside the page, `irreversible_count` says how many there are in all and
+  `next_step` gives that count rather than every index. `librenms_plans` takes `offset` and `detail`, and shows the
+  model the latest dry-run check (`check_count` says how many were recorded).
+- An unknown hostname is refused naming up to five hostnames (or display names) that contain its first label, so
+  `core-sw1` finds `core-sw1.example.net`.
+- Tests: the fake LibreNMS answers the routes the report views will read (`ports`, `ports/search`, `ports/mac`,
+  links, sensors, transceivers, components, BGP, OSPF, syslog, the alert log, FDB and NAC, ARP, VLANs, outages,
+  availability, bills, port groups and the legacy `alerts` aliases) as their LibreNMS handlers do. Every read
+  route's result key is checked against a table taken from LibreNMS's handlers, and every allow-listed route is
+  read end to end: a key that drifted made a result null while the tool reported success.
+
+### Changed
+- `librenms_plan` no longer returns `steps`, which repeated the diff's content (`librenms_plans` with `detail`
+  has them). `librenms_plans` with a `plan_id` returns the journal in summary, as apply does; `detail: true` adds
+  the steps and the full journal entries.
+- The configuration digest counts a setting added after 0.1.0 only once it differs from its default, so the digest
+  of an unchanged configuration is the same after the upgrade.
+
 ## [0.1.2] - 2026-10-29
 
 ### Security

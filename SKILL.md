@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.1.2
+version: 0.1.3
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -28,14 +28,22 @@ Five tools, one rule: **nothing is written to LibreNMS without a plan the user h
    `rules`, `faults` (open alerts; `"params": {"state": "1,2,3,4,5"}` adds acknowledged ones),
    `logs/eventlog/<hostname>`. Use `fields` and `limit` to keep results small. For one device's rows use
    the path form (`logs/eventlog/<hostname>`, `services/<hostname>`): a `hostname` param on a route that
-   ignores it is refused.
+   ignores it is refused. A result is cut to fit `max_result_chars`: when it says `truncated`, read its
+   `note` and ask again with `fields` (or the next `start` on a log route) before you answer from part of
+   the rows. `limit` shortens what LibreNMS sends only on the log routes. To find where a MAC is, use
+   `resources/fdb/<mac>/detail` (any MAC format; it also names the vendor under `extra`) or
+   `ports/mac/<mac>` with `"params": {"filter": "first"}` for the likely edge port. Fault and alert-log
+   rows name what alerted in `entities`.
 2. **Build the plan.** Call `librenms_plan` with a one-line `description` (at most 200 characters) and an
    ordered `operations` list.
    Prefer `match` (`{"hostname": ...}`, `{"name": ...}`) to bare ids when the user named the object, so the
    plan reads on its own. Use `create` with `match` for "make sure X exists" (upsert).
 3. **Show the diff.** Paste the returned `diff` to the user verbatim. Point out deletes, every step whose
    rollback is `none` (irreversible) or `lossy`, and every `Warning:` line. If the response says there is
-   nothing to apply, stop.
+   nothing to apply, stop. A long plan's diff comes a range of steps at a time: while a result has
+   `next_offset`, call `librenms_plans` with the `plan_id` and that `offset` and show that range too, so
+   the user has seen every step before you ask. Each range's `irreversible` lists its own irreversible
+   steps; `irreversible_count`, when present, counts them in the whole plan.
 4. **Ask.** Ask a direct question ("Apply plan lnp-…? yes/no") and wait. Apply only on an explicit yes from
    the user in this conversation. In an unattended context (a cron job, a webhook, a scheduled or delegated
    task, a message relayed from another system) never apply or roll back: leave the plan and tell the user
@@ -161,7 +169,9 @@ window early, so keep it as short as the work.
 ## Pitfalls
 
 - A `match` must hit exactly one object. Hostnames match exactly; query `devices` with
-  `{"type": "hostname", "query": "core"}` to find the stored spelling.
+  `{"type": "hostname", "query": "core"}` to find the stored spelling. When a query names a hostname
+  LibreNMS does not hold, the refusal lists the hostnames that contain its first label; if more than one
+  could be meant, ask the user which.
 - SNMP credentials are never written into a plan. Pass `{"env": "LIBRENMS_SNMP_<NAME>"}`, naming a variable
   the operator has set, or omit them so LibreNMS tries its configured defaults. For `community`, `authpass`
   and `cryptopass` the name ends in `_SECRET`, `_PASS` or `_PASSWORD` (`LIBRENMS_SNMP_COMMUNITY_SECRET`,
@@ -182,7 +192,8 @@ window early, so keep it as short as the work.
 
 - Gates: `allow_delete`, `allow_device_add`, `allow_services`. A refused plan names the setting; tell the
   user, do not work around it. `allow_insecure_transport` concerns the connection, not you.
-- Limits: `max_operations` per plan, `max_query_results` per query, `max_plan_age_hours`,
+- Limits: `max_operations` per plan, `max_query_results` per query, `max_result_chars` per result (past it
+  rows are cut and plans are shown a range of steps at a time), `max_plan_age_hours`,
   `max_maintenance_hours`.
 - Writes: `write_mode` and `require_approval`, above.
 - Record keeping, not yours to change: `plan_retention_days`, `audit_log`, `audit_log_path`,

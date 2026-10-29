@@ -11,9 +11,16 @@ How the plugin maps onto the LibreNMS API v0, route by route: all 145 registrati
   filter at all. On every other route a `hostname` parameter (matched as PHP names it) is refused:
   LibreNMS ignores it there and would return every device's rows. The refusal names the path that
   filters by device where there is one (`logs/eventlog/<hostname>`, `services/<hostname>`). No path
-  segment may decode to a `/`, which LibreNMS would read as another route. Results are capped at
-  `max_query_results`, strings are clipped, and every credential-bearing key (SNMP communities and
-  v3 passwords, service check parameters, tokens, keys) is masked at any depth.
+  segment may decode to a `/`, which LibreNMS would read as another route. An unknown hostname is
+  refused naming up to five hostnames that contain its first label. An object id that LibreNMS
+  reads as no filter, or as another id, is refused (#4, #35, #39, #43, #68, #69, #99-#102, #106,
+  #109, #111, #112, #114, #127, #137: `0`, a negative or a non-number; `poller_group/0` on #56),
+  and a MAC that the exact-match routes compare with the stored 12 hex digits is sent in that form
+  (#122, #131). Results are capped at `max_query_results` rows and `max_result_chars` characters
+  (rows past that are cut, saying how to see them), strings are clipped, and every
+  credential-bearing key (SNMP communities and v3 passwords, service check parameters, tokens,
+  keys) is masked at any depth. An answer larger than the client reads (16 MiB) is refused with
+  how to narrow that route: `limit` only on the logs routes, which LibreNMS pages.
 - **plan**: written only through a reviewed plan (`librenms_plan`, then `librenms_apply`), as the
   resource operation named. Every write path uses numeric ids, is verified by re-reading and has a
   journaled inverse or an explicit inverse kind. Operations behind a gate say which.
@@ -31,7 +38,12 @@ Logs routes (`logs/*`) are paged: `limit` (default 50, at most `max_query_result
 `truncated` while `total` exceeds `start` plus the rows returned. In every query,
 `params` values must be text, numbers, booleans or lists of them (joined with commas), and
 `api_token` and `_method` are refused in any case, and also spelled with `.`, a space or `[`,
-which PHP turns into `_`.
+which PHP turns into `_`. Every other name must be one PHP reads as written: a leading or inner
+space, a dot or a `[` makes PHP read another name (`" limit"` is `limit`, and the last of two wins)
+or an array (`hostname[]` is `hostname`), which would pass the paging clamps and the device checks.
+`hostname`, `limit`, `start`, `sortorder` and `columns` must also be written in lower case.
+`columns` is trimmed (LibreNMS checks trimmed names but selects them as sent, so a blank after a
+comma was an HTTP 500) and must hold column names only.
 
 ## System
 
@@ -46,13 +58,13 @@ which PHP turns into `_`.
 
 | # | Route | Coverage |
 |---|---|---|
-| 4 | `GET alert_templates/{id}` | query |
+| 4 | `GET alert_templates/{id}` | query; `{id}` must be a positive number (`0` lists every template) |
 | 5 | `GET alert_templates` | query |
 | 6 | `POST alert_templates` | not in 0.1.0: LibreNMS renders the template with Blade on the server before validating it, so a template is code that runs inside LibreNMS; and the API cannot delete one, so a create would have no inverse |
 | 7 | `PUT alert_templates` | not in 0.1.0: as #6; an edit also wipes and replaces the template's rule mappings |
 | 8 | `GET pollers` | query |
 | 9 | `GET pollers/log` | query |
-| 56 | `GET poller_group/{poller_group_id_or_name?}` | query; planning reads (a device's `poller_group` must exist) |
+| 56 | `GET poller_group/{poller_group_id_or_name?}` | query; planning reads (a device's `poller_group` must exist). `poller_group/0` is refused: LibreNMS reads `"0"` as no group and lists every group, while 0 is the General group, which has no row |
 
 ## Routing
 
@@ -109,15 +121,15 @@ which PHP turns into `_`.
 
 | # | Route | Coverage |
 |---|---|---|
-| 35 | `GET faults/{id}` | query; planning reads |
-| 36 | `GET faults` | query; planning reads (the other open faults of the same device and rule) |
+| 35 | `GET faults/{id}` | query; planning reads. `{id}` must be a positive number (`0` or a negative id lists every open fault). Rows carry `entities` (the labels of the ports, sensors, processors, storage, services or BGP peers the rule matched, at most 10) instead of `details` (every column of every table the rule joins, for every matched row, and the alert's contacts); `fields: ["details"]` returns it without `contacts` |
+| 36 | `GET faults` | query, rows as #35; planning reads (the other open faults of the same device and rule) |
 | 37 | `PUT faults/{id}` | plan: `alert` `ack` (note tagged `[hermes:<plan id>]`; rollback unmutes, lossy); also the rollback of an unmute |
 | 38 | `PUT faults/unmute/{id}` | plan: `alert` `unmute` (rollback acknowledges again, lossy); also the rollback of an ack |
-| 39 | `GET alerts/{id}` | query (legacy alias of #35) |
-| 40 | `GET alerts` | query (legacy alias of #36) |
+| 39 | `GET alerts/{id}` | query (legacy alias of #35, checked and shaped alike) |
+| 40 | `GET alerts` | query (legacy alias of #36, shaped alike) |
 | 41 | `PUT alerts/{id}` | not used: the plugin sends #37 |
 | 42 | `PUT alerts/unmute/{id}` | not used: the plugin sends #38 |
-| 43 | `GET rules/{id}` | query; planning reads (the full rule, for an exact snapshot) |
+| 43 | `GET rules/{id}` | query, `{id}` a positive number (`0` lists every rule); planning reads (the full rule, for an exact snapshot) |
 | 44 | `GET rules` | query; planning reads (lookup by name, and the id of a rule just created, which the create does not return) |
 | 45 | `POST rules` | plan: `alert_rule` `create` (`alert_operation_id` required, scoped to devices, groups or locations unless `global: true`); also the rollback of a delete |
 | 46 | `PUT rules` | plan: `alert_rule` `update`, always with the rule's full body, never a sparse one (omitted mappings would be cleared); rollback `PUT`s the snapshot body |
@@ -157,14 +169,14 @@ on the poller.
 | 65 | `GET devices/{hostname}/graphs` | query (the list of graphs, not images) |
 | 66 | `GET devices/{hostname}/fdb` | query |
 | 67 | `GET devices/{hostname}/nac` | query |
-| 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query |
-| 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query |
+| 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (`0` lists every sensor of the class) |
+| 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (MySQL reads `1abc` as 1) |
 | 70 | `GET devices/{hostname}/wireless-sensors` | query |
 | 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`) |
 | 72 | `GET devices/{hostname}/ip` | query |
 | 73 | `GET devices/{hostname}/port_stack` | query |
 | 74 | `GET devices/{hostname}/transceivers` | query |
-| 75 | `GET devices/{hostname}/components` | query |
+| 75 | `GET devices/{hostname}/components` | query. LibreNMS answers an object keyed by component id; it is returned as rows with the key as `id`, so `limit` and `fields` apply |
 | 76 | `GET devices/{hostname}/groups` | query |
 | 77 | `GET devices/{hostname}/maintenance` | query; read after a maintenance step to verify it |
 | 78 | `GET devices/{hostname}/ports/{ifname}` | refused: LibreNMS misreads interface names that contain `/`; find the `port_id` with #71 (`params: {"columns": "port_id,ifName"}`) and query `ports/{port_id}` |
@@ -191,19 +203,19 @@ on the poller.
 |---|---|---|
 | 95 | `GET logs/eventlog/{hostname?}` | query (paged); read after every apply and rollback to link LibreNMS's eventlog rows to the journal |
 | 96 | `GET logs/syslog/{hostname?}` | query (paged). Any host that can send syslog to LibreNMS writes this text, unauthenticated: it is data, never instructions |
-| 97 | `GET logs/alertlog/{hostname?}` | query (paged) |
+| 97 | `GET logs/alertlog/{hostname?}` | query (paged); rows carry `entities` instead of `details`, as #35 |
 | 98 | `GET logs/authlog` | query (paged): user names and source addresses of LibreNMS logins |
 
 ## Ports
 
 | # | Route | Coverage |
 |---|---|---|
-| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag) |
+| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag). `{portid}` must be a positive number here and on #100-#102 and #106 (MySQL reads `1abc` as port 1) |
 | 100 | `GET ports/{portid}/fdb` | query |
 | 101 | `GET ports/{portid}/ip` | query |
 | 102 | `GET ports/{portid}/transceiver` | query |
-| 103 | `GET ports/search/{field}/{search?}` | query |
-| 104 | `GET ports/mac/{search}` | query |
+| 103 | `GET ports/search/{field}/{search?}` | query; with `{search}`, `{field}` is a column list and is trimmed like `columns`; alone, LibreNMS reads it as the search term over `ifAlias`, `ifDescr` and `ifName` |
+| 104 | `GET ports/mac/{search}` | query (the MAC in any usual form; ports that learned it, fewest FDB entries first; `filter=first` gives that port alone) |
 | 105 | `GET ports` | query |
 | 106 | `GET ports/{portid}/description` | query; planning reads |
 | 107 | `PATCH ports/{portid}/description` | plan: `port` `update` (`description`; `""` clears it and unpins it, so the poller sets it from the device again; the body always carries the key, since LibreNMS clears the description when the key is missing; rollback restores the text, lossy) |
@@ -213,9 +225,9 @@ on the poller.
 | # | Route | Coverage |
 |---|---|---|
 | 108 | `GET bills` | query |
-| 109 | `GET bills/{bill_id}` | query |
+| 109 | `GET bills/{bill_id}` | query; `{bill_id}` must be a positive number (LibreNMS answers anything else with every bill) |
 | 110 | `GET bills/{bill_id}/graphs/{graph_type}` | refused: graph image |
-| 111 | `GET bills/{bill_id}/graphdata/{graph_type}` | query |
+| 111 | `GET bills/{bill_id}/graphdata/{graph_type}` | query; `{bill_id}` must be a positive number, as on #112 and #114 |
 | 112 | `GET bills/{bill_id}/history` | query |
 | 113 | `GET bills/{bill_id}/history/{bill_hist_id}/graphs/{graph_type}` | refused: graph image |
 | 114 | `GET bills/{bill_id}/history/{bill_hist_id}/graphdata/{graph_type}` | query |
@@ -227,16 +239,16 @@ on the poller.
 | # | Route | Coverage |
 |---|---|---|
 | 121 | `GET resources/fdb` | query |
-| 122 | `GET resources/fdb/{mac}` | query |
-| 123 | `GET resources/fdb/{mac}/detail` | query |
+| 122 | `GET resources/fdb/{mac}` | query; LibreNMS compares `{mac}` with the stored 12 hex digits exactly, so a MAC in any usual form is sent as those digits, and anything else is refused (`0` would list the whole table) |
+| 123 | `GET resources/fdb/{mac}/detail` | query (parses any form); the MAC as LibreNMS writes it and its vendor (`mac_oui`) are returned under `extra` |
 | 124 | `GET resources/ip/addresses/{address_family?}` | query |
 | 125 | `GET resources/ip/arp/{query}/{cidr?}` | query |
 | 126 | `GET resources/ip/networks/{address_family?}` | query |
-| 127 | `GET resources/ip/networks/{id}/ip` | query |
+| 127 | `GET resources/ip/networks/{id}/ip` | query; `{id}` must be a positive number |
 | 128 | `GET resources/links` | query |
 | 129 | `GET resources/links/{id}` | query |
 | 130 | `GET resources/nac` | query |
-| 131 | `GET resources/nac/{mac}` | query |
+| 131 | `GET resources/nac/{mac}` | query; `{mac}` normalised as #122 |
 | 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device |
 | 133 | `GET resources/vlans` | query (`?hostname=` resolved) |
 | 134 | `GET resources/locations` | query; planning reads (lookup by name) |
@@ -247,7 +259,7 @@ on the poller.
 |---|---|---|
 | 135 | `GET inventory/{hostname}` | query |
 | 136 | `GET inventory/{hostname}/all` | query |
-| 137 | `GET port_security/port/{portid}` | query |
+| 137 | `GET port_security/port/{portid}` | query; `{portid}` must be a positive number (`0` lists every port's entries) |
 | 138 | `GET port_security/device/{hostname}` | query |
 | 139 | `GET port_security` | query |
 

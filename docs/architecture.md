@@ -23,7 +23,7 @@ v0 route to what the plugin does with it.
 |---|---|---|
 | `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`) | `requests` (lazy), `redact` |
 | `redact` | Credential masking by key, error-text scrubbing, clipping, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals | none |
-| `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks; refusal of a `hostname` parameter a route ignores | `client` |
+| `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
@@ -34,7 +34,7 @@ v0 route to what the plugin does with it.
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only | Hermes `hermes_time` (optional) |
 | `settings` | Operator settings with fail-closed coercion | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |
-| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam | everything above |
+| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam; result shaping (alert rows, envelope extras, keyed objects) and the result budget, with plans shown a range of steps at a time | everything above |
 | `commands` | `/librenms` and `hermes librenms` built on the handlers | `handlers` |
 | `__init__` | `register(ctx)` | all |
 
@@ -471,6 +471,19 @@ for the re-read to settle, not a second request.
   hidden while `write_mode` is `read_only`.
 - Handlers follow the contract `handler(args, **kwargs) -> str` and never raise; an unexpected
   exception becomes an error id, with the detail in the log.
+- A result for the model stays within `max_result_chars` (default 60,000 characters). Hermes saves
+  a larger one to a file and shows the model a 1,500-character preview of it (past 100,000
+  characters, or 15% of the context window on a smaller model), and `register_tool` offers a plugin
+  no per-tool threshold. A listing keeps as many leading rows as fit and says so (`returned`,
+  `truncated`, a `note` naming `fields` or, on the logs routes, the next `start`); a single object
+  that does not fit is refused with the same advice. A plan, its journal, and the results of
+  `librenms_plan`, `librenms_plans`, `librenms_apply` and `librenms_rollback` are cut by steps:
+  each shows the steps from `offset` on that fit (at least one), the diff, warnings, irreversible
+  step indexes, conflicts, journal and eventlog rows of those steps, and `next_offset` for
+  `librenms_plans` to show the rest; the diff's last line says which steps it shows. A page that
+  leaves irreversible steps out says how many there are (`irreversible_count`), and
+  `librenms_plans` shows the latest of a plan's dry-run checks, one recorded per dry run
+  (`check_count`). The operator paths (`/librenms`, `hermes librenms`) are not cut.
 - Hooks (`pre_tool_call`, `pre_llm_call`, `post_approval_response`) are registered unconditionally
   and declared in `provides_hooks`. `pre_llm_call` remembers the user's message per session for the
   actor record ([audit.md](audit.md)).

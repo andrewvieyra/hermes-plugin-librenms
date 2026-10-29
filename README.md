@@ -129,6 +129,7 @@ plugins:
         allow_insecure_transport: false  # http://, LIBRENMS_VERIFY_SSL=false, plain or unverified audit sinks
         max_operations: 100          # cap per plan (at most 1000)
         max_query_results: 500       # cap per librenms_query call (at most 5000)
+        max_result_chars: 60000      # characters per tool result for the model (8000 to 90000)
         max_plan_age_hours: 24       # older plans are refused by librenms_apply
         max_maintenance_hours: 72    # longest maintenance window a plan may schedule
         plan_retention_days: 90      # prune plan files older than this; 0 keeps them forever
@@ -138,6 +139,11 @@ plugins:
         link_eventlog: true          # attach LibreNMS eventlog ids to the journal after apply/rollback
         audit_sinks: []              # optional syslog / HTTP forwarding, see docs/sinks.md
 ```
+
+`max_result_chars` keeps each result the model reads under Hermes' per-result threshold, past which
+Hermes shows the model only a 1,500-character preview: 100,000 characters, or 15% of the context
+window (at four characters a token) on a smaller model. On a model with a window under 100K tokens,
+set it to about half the window's token count (`32000` for 64K tokens).
 
 A value that cannot be read as its setting's type fails closed: a flag takes the value that lets the
 model do least, a number its default (or its upper limit when it is too large), and an unknown
@@ -168,7 +174,7 @@ environment):
 | `librenms_plan` | no | Validate and diff a list of operations; save a plan |
 | `librenms_apply` | yes | Apply a plan with preconditions, verified writes, a journal and auto-rollback; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or partially applied plan |
-| `librenms_plans` | no | List plans or show one with its diff, journal and rollback result |
+| `librenms_plans` | no | List plans or show one with its diff, journal and rollback result, a range of steps at a time; `detail` adds the steps and full journal entries |
 
 The bundled skill `librenms:workflow` (see [SKILL.md](SKILL.md)) tells the model to query first,
 show the diff, ask, and apply only on an explicit yes, never in unattended contexts. The tool
@@ -183,8 +189,25 @@ LibreNMS routes answer an unknown device with every device's rows; `0` is refuse
 A `hostname` filter on a route that ignores it is refused, naming the path that filters by device
 (`logs/eventlog/<hostname>`, `services/<hostname>`) where there is one. A 404 that is not LibreNMS's
 JSON, such as a web server's page for a `LIBRENMS_URL` missing its sub-path, is an error, never zero
-results. Log routes default to newest first and to `max_query_results` rows at most. Credential fields
-are masked and long text is clipped before anything reaches the model.
+results. An unknown hostname is refused naming the hostnames that contain its first label
+(`core-sw1` finds `core-sw1.example.net`). An id that LibreNMS reads as no filter (`faults/0`,
+`rules/0`, `bills/x`, `poller_group/0`, `port_security/port/0`) or as another id (`ports/1abc`) is
+refused, a MAC in `resources/fdb/{mac}` or `resources/nac/{mac}` is sent as the 12 hex digits
+LibreNMS compares it with, `columns` lists are trimmed, and a parameter name PHP would read as
+another (`" limit"`, `hostname[]`) is refused. Log routes default to newest first and
+to `max_query_results` rows at most. Fault and alert-log rows carry `entities`, the ports or sensors
+that alerted, instead of the `details` blob with the alert's contact addresses (`fields:
+["details"]` returns it without them). Credential fields are masked and long text is clipped before
+anything reaches the model.
+
+Every result the model reads stays within `max_result_chars`: a listing past it keeps its first
+rows and says so (`truncated`, and a `note` naming `fields`, or the next `start` on a log route), and
+a plan is shown a range of steps at a time, with `next_offset` for `librenms_plans` to show the
+next range, its irreversible steps among them (`irreversible_count` counts them all) and its latest
+dry-run check. `librenms_plan` returns the diff without the steps (`librenms_plans` with `detail`
+has them). An answer too large to read at all (16 MiB) is refused naming what narrows that route:
+`limit` narrows only the log routes, which LibreNMS pages; elsewhere it applies after every row is
+read.
 [docs/api-coverage.md](docs/api-coverage.md) maps every v0 route to a query, a plan operation, or the
 reason it is refused.
 

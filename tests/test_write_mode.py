@@ -170,7 +170,10 @@ class CompactOutput(PluginTestCase):
         self.assertNotIn("inverse", entry)
         self.assertNotIn("snapshot", json.dumps(out))
         self.assertNotIn(3, self.fake.tables["locations"])
-        full = self.call("librenms_plans", {"plan_id": pid})
+        shown = self.call("librenms_plans", {"plan_id": pid})
+        self.assertNotIn("steps", shown)
+        self.assertNotIn("snapshot", json.dumps(shown))  # the journal in summary, as apply returns it
+        full = self.call("librenms_plans", {"plan_id": pid, "detail": True})
         self.assertIn("snapshot", json.dumps(full["steps"][0]))
         self.assertIsNotNone(full["journal"][0]["inverse"])
         rolled = self.call("librenms_rollback", {"plan_id": pid})

@@ -821,7 +821,7 @@ class LibreNMSClient:
         if more and status < 300:
             raise LibreNMSError(
                 f"{method} {_shown(path_)} -> HTTP {status}: the answer is larger than {max_bytes} bytes and was not "
-                "read; narrow the query (filters, columns, limit)",
+                "read; narrow the query",
                 status=status,
                 method=method,
                 path=path_,

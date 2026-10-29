@@ -10,7 +10,11 @@ it); the no-op traps (an unchanged service edit is a 500, an unchanged group nam
 writes that return no id and rebuild everything the body omits; fault ack and unmute that change every open sibling
 when the rule does not notify per entity (or has more open faults than its limit); ids that are never reused; a device
 added with poller group 0 put in the default group; eventlog paging with an exact ``DESC`` and an id-valued numeric
-``from``; the eventlog rows DeviceObserver writes; and SNMP secrets in clear for an admin token.
+``from``; the eventlog rows DeviceObserver writes; and SNMP secrets in clear for an admin token. The read-only routes
+the report views read answer as their handlers do too: the result key, ``count`` only for a PHP array, 404s for empty
+lists where the handler sends one, an unknown hostname in a filter read as no filter, column lists checked trimmed
+but selected as sent, ``resources/fdb/{mac}`` compared exactly, the alert log's details decoded, and components as
+an object keyed by id. Bills are modelled for CDR bills in the current period only.
 
 Test hooks: :meth:`FakeLibreNMS.fail_on` (a forced answer or exception, optionally after the write took effect),
 :meth:`~FakeLibreNMS.touch` (an edit made outside the plugin), :meth:`~FakeLibreNMS.after` (another client's write
@@ -23,6 +27,7 @@ settings ``default_poller_group`` and ``default_max_entities``.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import re
 from collections.abc import MutableMapping
@@ -36,8 +41,16 @@ TOKEN = "7|hermesFakeToken0123456789abcdefABCDEF"
 SECRETS = ("c0re-Community!", "Auth-S3cret-v3", "Priv-S3cret-v3", "acc3ss-Community", "lab-Community", "Sup3rS3cret!")
 
 _CATCH_ALL = "This API route doesn't exist."
-_TABLES = ("devices", "locations", "device_groups", "services", "rules", "faults", "ports", "eventlog", "poller_groups")
-_ID_KEYS = {"devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id"}
+_TABLES = (
+    "devices", "locations", "device_groups", "services", "rules", "faults", "ports", "eventlog", "poller_groups",
+    "port_groups", "links", "sensors", "transceivers", "components", "bgp_peers", "ospf_nbrs", "alert_log", "syslog",
+    "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills",
+)  # fmt: skip
+_ID_KEYS = {
+    "devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id",
+    "sensors": "sensor_id", "bgp_peers": "bgpPeer_id", "syslog": "seq", "vlans": "vlan_id",
+    "ports_fdb": "ports_fdb_id", "ports_nac": "ports_nac_id", "availability": "availability_id", "bills": "bill_id",
+}  # fmt: skip
 
 # App\Http\Resources\Device, in its key order (dependency_parent_* only where list_devices loads parents).
 _DEVICE_KEYS = (
@@ -79,6 +92,52 @@ _FAULT_COLUMNS = (
     "id", "rule_id", "device_id", "entity_type", "entity_id", "entity_key", "state", "alerted", "open", "severity",
     "note", "info", "details", "first_seen", "last_seen", "timestamp",
 )  # fmt: skip
+# The read-only tables behind the report routes, each a table's columns in schema order (what a toBase() query or a
+# model's toArray() returns; the models behind them hide nothing).
+_LINK_COLUMNS = (
+    "id", "local_port_id", "local_device_id", "remote_port_id", "active", "protocol", "remote_hostname",
+    "remote_device_id", "remote_port", "remote_platform", "remote_version",
+)  # fmt: skip
+_SENSOR_COLUMNS = (
+    "sensor_id", "sensor_deleted", "sensor_class", "device_id", "poller_type", "sensor_oid", "sensor_index",
+    "sensor_type", "sensor_descr", "group", "sensor_divisor", "sensor_multiplier", "sensor_current", "sensor_limit",
+    "sensor_limit_warn", "sensor_limit_low", "sensor_limit_low_warn", "sensor_alert", "sensor_custom",
+    "entPhysicalIndex", "entPhysicalIndex_measured", "lastupdate", "sensor_prev", "user_func", "rrd_type", "category",
+)  # fmt: skip
+_TRANSCEIVER_COLUMNS = (
+    "id", "created_at", "updated_at", "device_id", "port_id", "index", "entity_physical_index", "type", "vendor",
+    "oui", "model", "revision", "serial", "date", "ddm", "encoding", "cable", "distance", "wavelength", "connector",
+    "channels",
+)  # fmt: skip
+_BGP_COLUMNS = (
+    "bgpPeer_id", "device_id", "vrf_id", "astext", "bgpPeerIdentifier", "bgpPeerRemoteAs", "bgpPeerState",
+    "bgpPeerAdminStatus", "bgpPeerLastErrorCode", "bgpPeerLastErrorSubCode", "bgpPeerLastErrorText", "bgpPeerIface",
+    "bgpLocalAddr", "bgpPeerRemoteAddr", "bgpPeerDescr", "bgpPeerInUpdates", "bgpPeerOutUpdates",
+    "bgpPeerInTotalMessages", "bgpPeerOutTotalMessages", "bgpPeerFsmEstablishedTime", "bgpPeerInUpdateElapsedTime",
+    "context_name",
+)  # fmt: skip
+_OSPF_COLUMNS = (
+    "id", "device_id", "port_id", "ospf_nbr_id", "ospfNbrIpAddr", "ospfNbrAddressLessIndex", "ospfNbrRtrId",
+    "ospfNbrOptions", "ospfNbrPriority", "ospfNbrState", "ospfNbrEvents", "ospfNbrLsRetransQLen",
+    "ospfNbmaNbrStatus", "ospfNbmaNbrPermanence", "ospfNbrHelloSuppressed", "context_name",
+)  # fmt: skip
+_ALERT_LOG_COLUMNS = ("id", "rule_id", "device_id", "fault_id", "state", "details", "time_logged")
+_SYSLOG_COLUMNS = ("device_id", "facility", "priority", "level", "tag", "timestamp", "program", "msg", "seq")
+_VLAN_COLUMNS = ("vlan_id", "device_id", "vlan_vlan", "vlan_domain", "vlan_name", "vlan_type", "vlan_state")
+_FDB_COLUMNS = ("ports_fdb_id", "port_id", "mac_address", "vlan_id", "device_id", "created_at", "updated_at")
+_NAC_COLUMNS = (
+    "ports_nac_id", "auth_id", "device_id", "port_id", "domain", "username", "mac_address", "ip_address",
+    "host_mode", "authz_status", "authz_by", "authc_status", "method", "timeout", "time_left", "vlan",
+    "time_elapsed", "created_at", "updated_at", "historical",
+)  # fmt: skip
+_ARP_COLUMNS = ("id", "port_id", "device_id", "mac_address", "ipv4_address", "context_name")
+_BILL_COLUMNS = (
+    "bill_id", "bill_name", "bill_type", "bill_cdr", "bill_day", "bill_quota", "rate_95th_in", "rate_95th_out",
+    "rate_95th", "dir_95th", "total_data", "total_data_in", "total_data_out", "rate_average_in",
+    "rate_average_out", "rate_average", "bill_last_calc", "bill_custid", "bill_ref", "bill_notes", "bill_autoadded",
+)  # fmt: skip
+# Component::getComponents: each component's own columns but its id and device, then its preferences.
+_COMPONENT_COLUMNS = ("type", "label", "status", "ignore", "disabled", "error")
 # AlertRule::toArray, then what list_alert_rules eager-loads (the mapping ids and the alert operation).
 _RULE_KEYS = (
     "id", "severity", "extra", "disabled", "name", "proc", "notes", "query", "builder", "invert_map",
@@ -104,23 +163,50 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
                "note": "", "info": None, "details": None},
     "ports": {**dict.fromkeys(_PORT_COLUMNS), **{"ignore": 0, "disabled": 0, "deleted": 0, "ifMtu": 1500}},
     "eventlog": {"type": "system", "reference": None, "username": None, "severity": 2},
+    "port_groups": {"desc": None, "ports": []},
+    "links": {**dict.fromkeys(_LINK_COLUMNS), "active": 1, "protocol": "lldp", "remote_device_id": 0},
+    "sensors": {**dict.fromkeys(_SENSOR_COLUMNS), "sensor_deleted": 0, "poller_type": "snmp", "sensor_divisor": 1,
+                "sensor_multiplier": 1, "sensor_alert": 1, "sensor_custom": "No", "rrd_type": "GAUGE"},
+    "transceivers": {**dict.fromkeys(_TRANSCEIVER_COLUMNS), "ddm": False, "channels": 1},
+    "components": {"label": "", "status": 0, "ignore": 0, "disabled": 0, "error": "", "prefs": {}},
+    "bgp_peers": {**dict.fromkeys(_BGP_COLUMNS), "bgpPeerAdminStatus": "start", "bgpPeerLastErrorCode": 0,
+                  "bgpPeerLastErrorSubCode": 0, "bgpPeerLastErrorText": "", "context_name": ""},
+    "ospf_nbrs": {**dict.fromkeys(_OSPF_COLUMNS), "ospfNbrAddressLessIndex": 0, "context_name": ""},
+    "alert_log": {"fault_id": None, "details": None},
+    "syslog": {"facility": "local7", "priority": "info", "level": "info", "tag": "", "program": ""},
+    "vlans": {"vlan_domain": 1, "vlan_type": "ethernet", "vlan_state": 0},
+    "ports_fdb": {"vlan_id": 0},
+    "ports_nac": {**dict.fromkeys(_NAC_COLUMNS), "historical": 0},
+    "ipv4_mac": {"context_name": ""},
+    "outages": {"up_again": None},
+    "bills": {**dict.fromkeys(_BILL_COLUMNS), "bill_type": "cdr", "bill_day": 1, "bill_quota": 0, "dir_95th": "in",
+              "bill_autoadded": 0, "ports": []},
 }  # fmt: skip
 
+# The parameter of a route that takes the rest of the path (``->where('search', '.*')``).
+_REST = {"search_ports": "search"}
 # Every route the fake answers, in routes/api.php order: (method, template, route name, handler).
 _ROUTES = (
     ("GET", "", None, "_index"),
     ("GET", "ping", "ping", "_ping"),
     ("GET", "system", "server_info", "_server_info"),
+    ("GET", "bgp", "list_bgp", "_list_bgp"),
+    ("GET", "bgp/{id}", "get_bgp", "_get_bgp"),
+    ("GET", "ospf", "list_ospf", "_list_ospf"),
     ("GET", "devicegroups/{name}", "get_devices_by_group", "_get_devices_by_group"),
     ("GET", "devicegroups", "get_device_groups", "_get_device_groups"),
     ("POST", "devicegroups", "add_device_group", "_add_device_group"),
     ("PATCH", "devicegroups/{name}", "update_device_group", "_update_device_group"),
     ("DELETE", "devicegroups/{name}", "delete_device_group", "_delete_device_group"),
     ("POST", "devicegroups/{name}/maintenance", "maintenance_devicegroup", "_maintenance_devicegroup"),
+    ("GET", "port_groups", "get_port_groups", "_get_port_groups"),
+    ("GET", "port_groups/{name}", "get_ports_by_group", "_get_ports_by_group"),
     ("GET", "faults/{id}", "get_alert", "_list_alerts"),
     ("GET", "faults", "list_alerts", "_list_alerts"),
     ("PUT", "faults/{id}", "ack_alert", "_ack_alert"),
     ("PUT", "faults/unmute/{id}", "unmute_alert", "_unmute_alert"),
+    ("GET", "alerts/{id}", None, "_list_alerts"),  # the legacy aliases have no route name
+    ("GET", "alerts", None, "_list_alerts"),
     ("GET", "rules/{id}", "get_alert_rule", "_list_alert_rules"),
     ("GET", "rules", "list_alert_rules", "_list_alert_rules"),
     ("POST", "rules", "add_rule", "_add_edit_rule"),
@@ -134,7 +220,14 @@ _ROUTES = (
     ("GET", "poller_group/{poller_group_id_or_name?}", "get_poller_group", "_get_poller_group"),
     ("GET", "devices/{hostname}", "get_device", "_get_device"),
     ("GET", "devices/{hostname}/discover", "trigger_device_discovery", "_trigger_device_discovery"),
+    ("GET", "devices/{hostname}/availability", "device_availability", "_device_availability"),
+    ("GET", "devices/{hostname}/outages", "device_outages", "_device_outages"),
+    ("GET", "devices/{hostname}/vlans", "get_vlans", "_get_vlans"),
+    ("GET", "devices/{hostname}/links", "list_links_device", "_list_links"),
+    ("GET", "devices/{hostname}/fdb", "get_fdb", "_get_fdb"),
     ("GET", "devices/{hostname}/ports", "get_device_ports", "_get_device_ports"),
+    ("GET", "devices/{hostname}/transceivers", "get_transceivers", "_get_transceivers"),
+    ("GET", "devices/{hostname}/components", "get_components", "_get_components"),
     ("GET", "devices/{hostname}/maintenance", "device_under_maintenance", "_device_under_maintenance"),
     ("GET", "devices", "list_devices", "_list_devices"),
     ("POST", "devices", "add_device", "_add_device"),
@@ -142,10 +235,27 @@ _ROUTES = (
     ("PATCH", "devices/{hostname}", "update_device_field", "_update_device"),
     ("PATCH", "devices/{hostname}/rename/{new_hostname}", "rename_device", "_rename_device"),
     ("POST", "devices/{hostname}/maintenance", "maintenance_device", "_maintenance_device"),
-    ("GET", "logs/eventlog/{hostname?}", "list_eventlog", "_list_eventlog"),
+    ("GET", "logs/eventlog/{hostname?}", "list_eventlog", "_list_logs"),
+    ("GET", "logs/syslog/{hostname?}", "list_syslog", "_list_logs"),
+    ("GET", "logs/alertlog/{hostname?}", "list_alertlog", "_list_logs"),
     ("GET", "ports/{portid}", "get_port_info", "_get_port_info"),
+    ("GET", "ports/search/{field}/{search?}", "search_ports", "_search_ports"),
+    ("GET", "ports/mac/{search}", "search_mac", "_search_mac"),
+    ("GET", "ports", "get_all_ports", "_get_all_ports"),
     ("GET", "ports/{portid}/description", "get_port_description", "_get_port_description"),
     ("PATCH", "ports/{portid}/description", "update_port_description", "_update_port_description"),
+    ("GET", "bills", "list_bills", "_list_bills"),
+    ("GET", "bills/{bill_id}", "get_bill", "_list_bills"),
+    ("GET", "resources/fdb", "list_fdb", "_list_fdb"),
+    ("GET", "resources/fdb/{mac}", "list_fdb_mac", "_list_fdb"),
+    ("GET", "resources/fdb/{mac}/detail", "list_fdb_detail", "_list_fdb_detail"),
+    ("GET", "resources/ip/arp/{query}/{cidr?}", "list_arp", "_list_arp"),
+    ("GET", "resources/links", "list_links", "_list_links"),
+    ("GET", "resources/links/{id}", "get_link", "_get_link"),
+    ("GET", "resources/nac", "list_nac", "_list_nac"),
+    ("GET", "resources/nac/{mac}", "list_nac_mac", "_list_nac"),
+    ("GET", "resources/sensors", "list_sensors", "_list_sensors"),
+    ("GET", "resources/vlans", "list_vlans", "_list_vlans"),
     ("GET", "resources/locations", "list_locations", "_list_locations"),
     ("POST", "locations", "add_location", "_add_location"),
     ("GET", "location/{location_id_or_name}", "get_location", "_get_location"),
@@ -253,6 +363,7 @@ class _Req:
     body: Any  # the body decoded as JSON; None when absent or not JSON
     headers: Headers
     args: Dict[str, Any] = field(default_factory=dict)
+    name: str | None = None  # the route that matched (list_logs reads it)
 
     def array(self) -> Dict[str, Any] | None:
         """``json_decode($request->getContent(), true)`` as the handlers index it: an object, ``{}`` for a JSON list
@@ -278,8 +389,9 @@ class _Req:
 class FakeLibreNMS:
     """``session``-compatible LibreNMS: ``request(method, url, params=, data=, headers=, ...)`` as ``requests`` takes
     it. Tables are plain dicts keyed by id in ``tables`` (``devices``, ``locations``, ``device_groups``, ``services``,
-    ``rules``, ``faults``, ``ports``, ``eventlog``, ``poller_groups``); a group's members and a rule's mappings are
-    lists in its row. Dynamic groups are not evaluated: their members are whatever the row says."""
+    ``rules``, ``faults``, ``ports``, ``eventlog``, ``poller_groups``, and the read-only ones in :data:`_TABLES`); a
+    group's members, a port group's ports, a bill's ports and a rule's mappings are lists in its row. Dynamic groups
+    are not evaluated: their members are whatever the row says."""
 
     def __init__(self, base_url: str = "https://librenms.test", token: str = TOKEN):
         self.base_url = base_url
@@ -291,6 +403,7 @@ class FakeLibreNMS:
         self.default_max_entities = 20  # config alert_rule.default_max_entities: the limit of a rule that sets none
         self.service_types = ["dns", "http", "icmp", "ping", "snmp", "ssh", "tcp"]  # the check_* plugins installed
         self.missing_routes: Set[str] = set()  # route names an older LibreNMS lacks: not indexed, answered 404
+        self.oui: Dict[str, str] = {}  # the vendor of a MAC prefix (6 hex digits), as LibreNMS's OUI table has it
         self.system = {
             "local_ver": "26.10.0",
             "local_sha": "91b9a40b4cc42b27a06f3289a38b053ca6320218",
@@ -314,7 +427,8 @@ class FakeLibreNMS:
         self.redirect_to: str | None = None
         self.now = datetime(2026, 10, 28, 12, 0, 0)  # the server clock (UTC); each write moves it on a second
         self._routes = [
-            (verb, _compile(tpl), name, tpl, getattr(self, handler)) for verb, tpl, name, handler in _ROUTES
+            (verb, _compile(tpl, _REST.get(name)), name, tpl, getattr(self, handler))
+            for verb, tpl, name, handler in _ROUTES
         ]
 
     # -- fixtures and test hooks ----------------------------------------------------------------
@@ -449,7 +563,7 @@ class FakeLibreNMS:
         for verb, regex, name, _template, handler in self._routes:
             match = regex.fullmatch(path)
             if match is not None and verb == method and name not in self.missing_routes:
-                req.args = match.groupdict()
+                req.args, req.name = match.groupdict(), name
                 response = handler(req)
                 for hook in self.hooks.get(name, ()):
                     hook()
@@ -786,12 +900,9 @@ class FakeLibreNMS:
 
     def _get_device_ports(self, r: _Req) -> FakeResponse:
         d = self._device(r.args["hostname"])
-        columns = (r.params.get("columns") or "ifName").split(",")
-        invalid = [c.strip() for c in columns if c.strip() not in _PORT_COLUMNS]
-        if invalid:
-            return _api_error(400, "Invalid columns: " + ",".join(invalid))
-        if any(c != c.strip() for c in columns):  # validated trimmed, selected as sent
-            return _server_error()
+        columns = _columns(r.params.get("columns"), ("ifName",))
+        if isinstance(columns, FakeResponse):
+            return columns
         device_id = d["device_id"] if d else None
         ports = [p for p in self.tables["ports"].values() if p["device_id"] == device_id and not p["deleted"]]
         if not ports:
@@ -1263,27 +1374,32 @@ class FakeLibreNMS:
         return _api_success(message="Alert has been unmuted" if targets else "No alert by that ID")
 
     # -- eventlog, ports ----------------------------------------------------------------------------
-    def _list_eventlog(self, r: _Req) -> FakeResponse:
+    def _list_logs(self, r: _Req) -> FakeResponse:
+        """``list_logs`` behind eventlog, syslog and alertlog: a path hostname LibreNMS does not know filters
+        nothing, ``from``/``to`` bound the id when numeric and the time otherwise, the order is ascending unless
+        ``sortorder`` is exactly ``DESC``, and ``limit`` is cast with ``(int)`` (a negative one is no limit)."""
+        table, timestamp, id_field = _LOGS[r.name]
         ref, p = r.args["hostname"], r.params
-        found = None if ref is None or _digits(ref) else self._by_hostname(ref)
-        device_id = int(ref) if ref is not None and _digits(ref) else (found or {}).get("device_id")
-        rows = [e for e in self.tables["eventlog"].values() if device_id is None or e["device_id"] == device_id]
+        device_id = self._device_ref(ref)
+        rows = [e for e in self.tables[table].values() if device_id is None or e["device_id"] == device_id]
         for name, keep in (("from", lambda a, b: a >= b), ("to", lambda a, b: a <= b)):
             bound = p.get(name)
-            if _truthy(bound):  # a number bounds event_id, anything else the datetime text
-                key = "event_id" if _numeric(bound) else "datetime"
-                rows = [e for e in rows if keep(e[key], _php_float(bound) if key == "event_id" else bound)]
+            if _truthy(bound):  # a number bounds the id, anything else the time text
+                key = id_field if _numeric(bound) else timestamp
+                rows = [e for e in rows if keep(e[key], _php_float(bound) if key == id_field else bound)]
         total = len(rows)
-        rows.sort(key=lambda e: (e["datetime"], e["event_id"]), reverse=p.get("sortorder") == "DESC")
+        rows.sort(key=lambda e: (e[timestamp], e[id_field]), reverse=p.get("sortorder") == "DESC")
         start, limit = max(0, _php_int(p.get("start", 0))), _php_int(p.get("limit", 50))
         rows = rows[start:] if limit < 0 else rows[start : start + limit]
         devices = self.tables["devices"]
-        out = [
-            {"hostname": devices[e["device_id"]]["hostname"] if e["device_id"] in devices else None,
-             "sysName": devices[e["device_id"]]["sysName"] if e["device_id"] in devices else None,
-             "host": e["device_id"], **{k: e[k] for k in _EVENT_COLUMNS}}
-            for e in rows
-        ]  # fmt: skip
+        out = []
+        for e in rows:
+            d = devices.get(e["device_id"]) or {}
+            row = {"hostname": d.get("hostname"), "sysName": d.get("sysName")}
+            if table == "eventlog":  # "host" for backward compatibility
+                row["host"] = e["device_id"]
+            columns = {"eventlog": _EVENT_COLUMNS, "syslog": _SYSLOG_COLUMNS, "alert_log": _ALERT_LOG_COLUMNS}[table]
+            out.append({**row, **{k: copy.deepcopy(e[k]) for k in columns}})  # alert_log details: decoded
         return _api_success(out, "logs", array=True, extra={"total": total})
 
     def _port(self, ref: str) -> Dict[str, Any] | None:
@@ -1329,6 +1445,297 @@ class FakeLibreNMS:
         )
         return _api_success(message="Port description updated.")
 
+    # -- report routes: read-only tables -----------------------------------------------------------
+    def _device_ref(self, ref: str | None) -> int | None:
+        """``ctype_digit($ref) ? $ref : getidbyname($ref)``: digits as an id (known or not), a hostname's id, else
+        None, which the handlers read as no device filter at all."""
+        if ref is None or ref == "":
+            return None
+        if _digits(ref):
+            return int(ref)
+        d = self._by_hostname(ref)
+        return d["device_id"] if d else None
+
+    def _rows(self, table: str, columns: Tuple[str, ...], **match: Any) -> List[Dict[str, Any]]:
+        """*table*'s rows in id order as *columns*, those whose columns equal *match* (a None value matches all)."""
+        rows = sorted(self.tables[table].values(), key=lambda row: row[_ID_KEYS.get(table, "id")])
+        rows = [row for row in rows if all(row[key] == value for key, value in match.items() if value is not None)]
+        return [{key: copy.deepcopy(row[key]) for key in columns} for row in rows]
+
+    def _list_bgp(self, r: _Req) -> FakeResponse:
+        """Sessions with a state; an unknown ``hostname`` filters nothing. Never a 404."""
+        p = r.params
+        rows = self._rows("bgp_peers", _BGP_COLUMNS, device_id=self._device_ref(p.get("hostname")))
+        rows = [b for b in rows if b["bgpPeerState"] not in (None, "")]
+        if _truthy(p.get("remote_asn")):
+            asn = re.sub(r"[^0-9]", "", p["remote_asn"])
+            rows = [b for b in rows if str(b["bgpPeerRemoteAs"]) == asn]
+        if _truthy(p.get("bgp_descr")):
+            rows = [b for b in rows if _like(b["bgpPeerDescr"], f"%{p['bgp_descr']}%")]
+        for name, column in (("bgp_state", "bgpPeerState"), ("bgp_adminstate", "bgpPeerAdminStatus")):
+            if _truthy(p.get(name)):
+                rows = [b for b in rows if _same(b[column], p[name])]
+        return _api_success(rows, "bgp_sessions", array=True)
+
+    def _get_bgp(self, r: _Req) -> FakeResponse:
+        ref = r.args["id"]
+        if not _numeric(ref):
+            return _api_error(400, "Invalid id has been provided")
+        peer = self.tables["bgp_peers"].get(_php_int(ref)) if _php_float(ref).is_integer() else None
+        if peer is None or peer["bgpPeerState"] in (None, ""):
+            return _api_error(404, f"BGP peer {ref} does not exist")
+        return _api_success([{k: peer[k] for k in _BGP_COLUMNS}], "bgp_session", array=True)
+
+    def _list_ospf(self, r: _Req) -> FakeResponse:
+        rows = self._rows("ospf_nbrs", _OSPF_COLUMNS, device_id=self._device_ref(r.params.get("hostname")))
+        return _api_success([o for o in rows if o["ospfNbrState"] not in (None, "")], "ospf_neighbours", array=True)
+
+    def _get_port_groups(self, r: _Req) -> FakeResponse:
+        groups = sorted(self.tables["port_groups"].values(), key=lambda g: g["name"].lower())
+        if not groups:
+            return _api_error(404, "No port groups found")
+        rows = [{k: g[k] for k in ("id", "name", "desc")} for g in groups]
+        return _api_success(rows, "groups", f"Found {len(rows)} port groups", array=True)
+
+    def _get_ports_by_group(self, r: _Req) -> FakeResponse:
+        ref = r.args["name"]
+        groups = self.tables["port_groups"]
+        group = groups.get(int(ref)) if _digits(ref) else self._named("port_groups", "name", ref)
+        if group is None:
+            return _api_error(404, "Port group not found")
+        ports = [self.tables["ports"][i] for i in sorted(group["ports"]) if i in self.tables["ports"]]
+        if not ports:
+            return _api_error(404, f"No ports found in group {ref}")
+        columns = _PORT_COLUMNS if _truthy(r.params.get("full")) else ("port_id",)
+        return _api_success([{k: port[k] for k in columns} for port in ports], "ports", array=True)
+
+    def _device_availability(self, r: _Req) -> FakeResponse:
+        """An Eloquent collection (no ``count``), shortest period first; an unknown device has none."""
+        device_id = self._device_ref(r.args["hostname"])
+        rows = sorted(self._rows("availability", ("duration", "availability_perc"), device_id=device_id or 0),
+                      key=lambda a: a["duration"])  # fmt: skip
+        return _api_success(rows, "availability")
+
+    def _device_outages(self, r: _Req) -> FakeResponse:
+        """An Eloquent collection (no ``count``), the latest outage first; ``going_down`` and ``up_again`` are unix
+        seconds, ``up_again`` null while the device is down."""
+        device_id = self._device_ref(r.args["hostname"])
+        rows = sorted(self._rows("outages", ("going_down", "up_again"), device_id=device_id or 0),
+                      key=lambda o: o["going_down"], reverse=True)  # fmt: skip
+        return _api_success(rows, "outages")
+
+    def _get_vlans(self, r: _Req) -> FakeResponse:
+        d = self._device(r.args["hostname"])
+        if d is None:
+            return _api_error(404, f"Device {r.args['hostname']} not found")
+        return _api_success(self._rows("vlans", _VLAN_COLUMNS[2:], device_id=d["device_id"]), "vlans", array=True)
+
+    def _list_links(self, r: _Req) -> FakeResponse:
+        """Both link routes; an unknown hostname filters nothing."""
+        device_id = self._device_ref(r.args.get("hostname"))
+        rows = self._rows("links", _LINK_COLUMNS, local_device_id=device_id)
+        if not rows:
+            return _api_error(404, "Links do not exist")
+        return _api_success(rows, "links", array=True)
+
+    def _get_link(self, r: _Req) -> FakeResponse:
+        ref = r.args["id"]
+        if not _numeric(ref):
+            return _api_error(400, "Invalid id has been provided")
+        link = self.tables["links"].get(_php_int(ref)) if _php_float(ref).is_integer() else None
+        if link is None:
+            return _api_error(404, f"Link {ref} does not exist")
+        return _api_success([{k: link[k] for k in _LINK_COLUMNS}], "link", array=True)
+
+    def _get_fdb(self, r: _Req) -> FakeResponse:
+        d = self._device(r.args["hostname"])
+        if d is None:
+            return _api_error(404, f"Device {r.args['hostname']} not found")
+        return _api_success(self._rows("ports_fdb", _FDB_COLUMNS, device_id=d["device_id"]), "ports_fdb")
+
+    def _get_transceivers(self, r: _Req) -> FakeResponse:
+        d = self._device(r.args["hostname"])  # DeviceCache hands an unknown device over empty: no rows, no 404
+        rows = self._rows("transceivers", _TRANSCEIVER_COLUMNS, device_id=d["device_id"] if d else 0)
+        return _api_success(rows, "transceivers")
+
+    def _get_components(self, r: _Req) -> FakeResponse:
+        """``getComponents($device_id)[$device_id]``: an object keyed by component id, each its type, label, status,
+        ignore, disabled and error, then its preferences. Every query param is an equality filter (``label`` a
+        LIKE). A device without components is a missing key, which PHP reads as null: no ``components`` at all."""
+        device_id = self._device_ref(r.args["hostname"])
+        found = {}
+        for c in sorted(self.tables["components"].values(), key=lambda c: c["id"]):
+            row = {**{k: c[k] for k in _COMPONENT_COLUMNS}, **c["prefs"]}
+            wanted = all(
+                _like(row.get(k), v) if k == "label" else _same(str(row.get(k)), v) for k, v in r.params.items()
+            )
+            if c["device_id"] == device_id and wanted:
+                found[str(c["id"])] = row
+        return _api_success(found or None, "components", array=bool(found))
+
+    def _search_ports(self, r: _Req) -> FakeResponse:
+        """``search_ports``: with only ``{field}`` given it is the search term over ifAlias, ifDescr and ifName; else a
+        list of the columns to search. Both lists are checked trimmed and used as sent."""
+        field, search = r.args["field"], r.args.get("search")
+        if _empty(search):
+            field, search = search, field
+        columns = _columns(r.params.get("columns"), ("device_id", "port_id", "ifIndex", "ifName", "ifAlias"))
+        fields = _columns(field, ("ifAlias", "ifDescr", "ifName"))
+        for checked in (columns, fields):
+            if isinstance(checked, FakeResponse):
+                return checked
+        ports = [p for p in self.tables["ports"].values() if not p["deleted"]]
+        ports = [p for p in ports if any(_like(p[f], f"%{search}%") for f in fields)]
+        if not ports:
+            return _api_error(404, "No ports found")
+        ports.sort(key=lambda p: _sort_key(p["ifName"]))
+        return _api_success([{c: p[c] for c in columns} for p in ports], "ports")
+
+    def _search_mac(self, r: _Req) -> FakeResponse:
+        """``search_by_mac``: the ports that learned the MAC, fewest FDB entries first (the likely edge port);
+        ``filter=first`` returns that port alone, as an object."""
+        mac = _mac_hex(r.args["search"])
+        if not re.fullmatch(r"[0-9a-f]{12}", mac):
+            return _api_error(422, {"macAddress": ["The mac address field format is invalid."]})
+        fdb = list(self.tables["ports_fdb"].values())
+        ports = sorted({f["port_id"] for f in fdb if f["mac_address"] == mac} & set(self.tables["ports"]))
+        rows = [
+            {
+                **{k: self.tables["ports"][i][k] for k in _PORT_COLUMNS},
+                "fdb_entries_count": sum(f["port_id"] == i for f in fdb),
+            }
+            for i in ports
+        ]
+        if not rows:
+            return _api_error(404, "mac not found")
+        rows.sort(key=lambda row: row["fdb_entries_count"])
+        if r.params.get("filter") == "first":
+            return _api_success(rows[0], "ports")
+        return _api_success(rows, "ports")
+
+    def _get_all_ports(self, r: _Req) -> FakeResponse:
+        columns = _columns(r.params.get("columns"), ("port_id", "ifName"))
+        if isinstance(columns, FakeResponse):
+            return columns
+        ports = sorted((p for p in self.tables["ports"].values() if not p["deleted"]), key=lambda p: p["port_id"])
+        return _api_success([{c: p[c] for c in columns} for p in ports], "ports")  # no 404 when empty
+
+    def _list_bills(self, r: _Req) -> FakeResponse:
+        """``list_bills`` behind ``bills`` and ``bills/{bill_id}``: ``custid``, then ``ref``, then a numeric id
+        filter; a ``bill_id`` that is not a number filters nothing. CDR bills only, current period only."""
+        ref, p = r.args.get("bill_id"), r.params
+        bills = sorted(self.tables["bills"].values(), key=lambda b: b["bill_name"].lower())
+        if _truthy(p.get("custid")):
+            bills = [b for b in bills if _same(b["bill_custid"], p["custid"])]
+        elif _truthy(p.get("ref")):
+            bills = [b for b in bills if _same(b["bill_ref"], p["ref"])]
+        elif _numeric(ref):
+            bills = [b for b in bills if b["bill_id"] == _php_float(ref)]
+        return _api_success([self._bill_out(b) for b in bills], "bills", array=True)
+
+    def _bill_out(self, b: Dict[str, Any]) -> Dict[str, Any]:
+        out = {k: b[k] for k in _BILL_COLUMNS}
+        cdr, rate = b["bill_cdr"] or 0, b["rate_95th"] or 0
+        over = rate - cdr
+        out.update(
+            bill_allowed=cdr,
+            allowed=_si(cdr) + "bps",
+            used=_si(rate) + "bps",
+            percent=round(rate / cdr * 100, 2) if cdr > 0 else "-",
+            overuse="-" if over <= 0 else _si(over),
+            ports=[
+                {
+                    "device_id": self.tables["ports"][i]["device_id"],
+                    "port_id": i,
+                    "ifName": self.tables["ports"][i]["ifName"],
+                }
+                for i in b["ports"]
+                if i in self.tables["ports"]
+            ],
+        )
+        return out
+
+    def _list_fdb(self, r: _Req) -> FakeResponse:
+        """``list_fdb``: ``{mac}`` is compared with the stored 12 hex digits as given, and an empty one (also
+        ``0``) filters nothing."""
+        mac = r.args.get("mac")
+        rows = [f for f in self._rows("ports_fdb", _FDB_COLUMNS) if _empty(mac) or _same(f["mac_address"], mac)]
+        if not rows:
+            return _api_error(404, "Fdb entry does not exist")
+        return _api_success(rows, "ports_fdb")
+
+    def _list_fdb_detail(self, r: _Req) -> FakeResponse:
+        """``list_fdb_detail``: the MAC parsed in any form, the newest entry first, and the MAC as LibreNMS writes it
+        and its vendor as envelope extras."""
+        mac = _mac_hex(r.args["mac"])
+        if len(mac) != 12:
+            return _api_error(422, "Invalid MAC address")
+        entries = sorted(
+            (f for f in self.tables["ports_fdb"].values() if f["mac_address"] == mac),
+            key=lambda f: f["updated_at"],
+            reverse=True,
+        )
+        if not entries:
+            return _api_error(404, "Fdb entry does not exist")
+        rows = []
+        for f in entries:
+            d, port = self.tables["devices"].get(f["device_id"]) or {}, self.tables["ports"].get(f["port_id"]) or {}
+            seen = datetime.strptime(f["updated_at"], "%Y-%m-%dT%H:%M:%S.000000Z")
+            rows.append({
+                "hostname": d.get("hostname"), "sysName": d.get("sysName"), "ifName": port.get("ifName"),
+                "ifAlias": port.get("ifAlias"), "ifDescr": port.get("ifDescr"), "updated_at": _raw(seen),
+                "last_seen": _ago(self.now - seen),
+            })  # fmt: skip
+        readable = ":".join(mac[i : i + 2] for i in range(0, 12, 2))
+        extra = {"mac": readable, "mac_oui": self.oui.get(mac[:6], "")}
+        return _api_success(rows, "ports_fdb", array=True, extra=extra)
+
+    def _list_nac(self, r: _Req) -> FakeResponse:
+        mac = r.args.get("mac")
+        rows = [n for n in self._rows("ports_nac", _NAC_COLUMNS) if _empty(mac) or _same(n["mac_address"], mac)]
+        if not rows:
+            return _api_error(404, " Nac entry does not exist")  # the leading blank is LibreNMS's
+        return _api_success(rows, "ports_nac")
+
+    def _list_arp(self, r: _Req) -> FakeResponse:
+        """``list_arp``: ``all`` (``device`` narrows it; an unknown device is no rows), a network with ``{cidr}``, a
+        MAC as ``FILTER_VALIDATE_MAC`` takes it, else one IPv4 address exactly."""
+        query, cidr, p = r.args["query"], r.args.get("cidr"), r.params
+        if _empty(query):
+            return _api_error(400, "No valid IP/MAC provided")
+        rows = self._rows("ipv4_mac", _ARP_COLUMNS)
+        if query == "all":
+            if "device" in p:
+                d = self._device(p["device"])
+                if d is None:
+                    return _api_success([], "arp")
+                rows = [a for a in rows if a["device_id"] == d["device_id"]]
+        elif cidr:
+            try:
+                network = ipaddress.IPv4Network(f"{query}/{cidr}", strict=False)
+            except ValueError:
+                return _api_error(400, "Invalid Network Address")
+            rows = [a for a in rows if ipaddress.IPv4Address(a["ipv4_address"]) in network]
+        elif _FILTER_MAC.fullmatch(query):
+            rows = [a for a in rows if a["mac_address"] == _mac_hex(query)]
+        else:
+            rows = [a for a in rows if a["ipv4_address"] == query]
+        return _api_success(rows, "arp")
+
+    def _list_sensors(self, r: _Req) -> FakeResponse:
+        """Every sensor the token may see: LibreNMS reads no filter on this route."""
+        rows = self._rows("sensors", _SENSOR_COLUMNS)
+        if not rows:
+            return _api_error(404, "Sensors do not exist")
+        return _api_success(rows, "sensors")
+
+    def _list_vlans(self, r: _Req) -> FakeResponse:
+        rows = self._rows("vlans", _VLAN_COLUMNS, device_id=self._device_ref(r.params.get("hostname")))
+        rows = [v for v in rows if v["vlan_vlan"] is not None]
+        if not rows:
+            return _api_error(404, "VLANs do not exist")
+        return _api_success(rows, "vlans", array=True)
+
 
 _STATE_FILTERS = {
     "active": lambda d: not d["ignore"] and not d["disabled"],
@@ -1339,18 +1746,74 @@ _STATE_FILTERS = {
 }
 _HOSTNAME = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]{0,251}[A-Za-z0-9])?|[0-9A-Fa-f:.]+")
 _NUMERIC = re.compile(r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*")
+# PHP's FILTER_VALIDATE_MAC: six pairs joined by - or :, or three groups of four joined by dots.
+_FILTER_MAC = re.compile(
+    r"(?:[0-9A-Fa-f]{2}([-:]))(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}"
+)
+# list_logs per route: (table, time column, id column).
+_LOGS = {
+    "list_eventlog": ("eventlog", "datetime", "event_id"),
+    "list_syslog": ("syslog", "timestamp", "seq"),
+    "list_alertlog": ("alert_log", "time_logged", "id"),
+}
 
 
-def _compile(template: str) -> re.Pattern[str]:
-    """A Laravel route template as a regex over the decoded path: ``{x}`` is one segment, ``{x?}`` may be absent."""
+def _compile(template: str, rest: str | None = None) -> re.Pattern[str]:
+    """A Laravel route template as a regex over the decoded path: ``{x}`` is one segment, ``{x?}`` may be absent, and
+    the parameter *rest* (``->where(x, '.*')``) takes the rest of the path, slashes included."""
     pattern = ""
     for segment in template.split("/"):
         param = re.fullmatch(r"\{(\w+)(\??)\}", segment)
+        value = "" if param is None else f"(?P<{param.group(1)}>{'.+' if param.group(1) == rest else '[^/]+'})"
         if param and param.group(2):
-            pattern += f"(?:/(?P<{param.group(1)}>[^/]+))?"
+            pattern += f"(?:/{value})?"
             continue
-        pattern += ("/" if pattern else "") + (f"(?P<{param.group(1)}>[^/]+)" if param else re.escape(segment))
+        pattern += ("/" if pattern else "") + (value if param else re.escape(segment))
     return re.compile(pattern)
+
+
+def _columns(raw: str | None, default: Tuple[str, ...]) -> List[str] | FakeResponse:
+    """``validate_column_list`` over the ports table, then the query that uses the list: the names are checked trimmed
+    (an unknown one is a 400) but selected as sent, so a blank around one fails in SQL (a 500)."""
+    if raw is None or raw == "":
+        return list(default)
+    names = raw.split(",")
+    invalid = [name.strip() for name in names if name.strip() not in _PORT_COLUMNS]
+    if invalid:
+        return _api_error(400, "Invalid columns: " + ",".join(invalid))
+    if any(name != name.strip() for name in names):
+        return _server_error()
+    return names
+
+
+def _mac_hex(text: str) -> str:
+    """``Mac::parse($text)->hex()``: the 12 lowercase hex digits of a MAC in any usual form (groups of one digit
+    padded), or ``""``."""
+    groups = re.split(r"[:-]", text.strip())
+    if len(groups) == 6 and all(re.fullmatch(r"[0-9A-Fa-f]{1,2}", g) for g in groups):
+        return "".join(g.zfill(2) for g in groups).lower()
+    bare = text.strip().replace(".", "")
+    return bare.lower() if re.fullmatch(r"[0-9A-Fa-f]{12}", bare) else ""
+
+
+def _si(value: float) -> str:
+    """``Number::formatSi($value, 2, 0, '')``: the value in steps of 1000 with its prefix."""
+    value, prefix = float(value), ""
+    for unit in ("k", "M", "G", "T"):
+        if value < 1000:
+            break
+        value, prefix = value / 1000, unit
+    return f"{round(value, 2):g} {prefix}"
+
+
+def _ago(delta: timedelta) -> str:
+    """Carbon's ``diffForHumans`` for a time in the past."""
+    seconds = int(delta.total_seconds())
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute"), (1, "second")):
+        if seconds >= size:
+            count = seconds // size
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return "0 seconds ago"
 
 
 def _token(headers: Headers) -> str | None:
@@ -1698,4 +2161,153 @@ def seeded() -> FakeLibreNMS:
         {"device_id": 2, "datetime": "2026-10-27 23:59:59", "message": "version: 17.9.3 -> 17.9.4a", "severity": 3},
     ):  # fmt: skip
         fake.seed("eventlog", row)
+    _seed_reports(fake)
     return fake
+
+
+def _seed_reports(fake: FakeLibreNMS) -> None:
+    """What the read-only report routes show: a port group, LLDP/CDP links (one to an unmonitored neighbour),
+    sensors (one past its limit, an optic), a transceiver, NTP components, BGP sessions (one idle, one without a
+    state), OSPF neighbours, alert-log rows whose details carry contacts, syslog, VLANs, a MAC learned on an access
+    port and on the uplink, a NAC session, ARP entries, outages and availability, and two CDR bills (one over its
+    commit)."""
+    seed = fake.seed
+    seed("port_groups", {"id": 1, "name": "uplinks", "desc": "Core and WAN uplinks", "ports": [1, 5, 6]})
+    seed("port_groups", {"id": 2, "name": "spare"})
+    for row in (
+        {"id": 1, "local_device_id": 1, "local_port_id": 1, "remote_hostname": "edge-rtr1", "protocol": "cdp",
+         "remote_port": "GigabitEthernet0/0/2", "remote_device_id": 2, "remote_platform": "cisco ISR4451-X/K9"},
+        {"id": 2, "local_device_id": 1, "local_port_id": 2, "remote_hostname": "access-sw2.example.net",
+         "remote_port": "Gi1/0/48", "remote_device_id": 3, "remote_port_id": 9, "remote_version": "IOS 15.2(7)E"},
+        {"id": 3, "local_device_id": 3, "local_port_id": 9, "remote_hostname": "core-sw1.example.net",
+         "remote_port": "Gi1/0/2", "remote_device_id": 1, "remote_port_id": 2},
+        {"id": 4, "local_device_id": 2, "local_port_id": 5, "remote_hostname": "transit-a-pe1",
+         "remote_port": "xe-0/0/1", "remote_port_id": 0, "remote_platform": "Juniper MX204"},
+    ):  # fmt: skip
+        seed("links", row)
+    for row in (
+        {"sensor_id": 1, "device_id": 1, "sensor_class": "temperature", "sensor_type": "cisco-entity-sensor",
+         "sensor_oid": ".1.3.6.1.4.1.9.9.91.1.1.1.1.4.1006", "sensor_index": "1006",
+         "sensor_descr": "Chassis Temperature", "sensor_current": 41, "sensor_limit": 60, "sensor_limit_warn": 55,
+         "sensor_limit_low": 0, "sensor_prev": 40, "group": "", "lastupdate": "2026-10-28 11:55:02"},
+        {"sensor_id": 2, "device_id": 1, "sensor_class": "dbm", "sensor_type": "cisco-entity-sensor",
+         "sensor_oid": ".1.3.6.1.4.1.9.9.91.1.1.1.1.4.1011", "sensor_index": "1011",
+         "sensor_descr": "Gi1/0/1 Receive Power Sensor", "sensor_current": -3.2, "sensor_limit": 1,
+         "sensor_limit_low": -14.4, "entPhysicalIndex": 1011, "entPhysicalIndex_measured": "ports",
+         "lastupdate": "2026-10-28 11:55:02"},
+        {"sensor_id": 3, "device_id": 2, "sensor_class": "voltage", "sensor_type": "cisco-entity-sensor",
+         "sensor_oid": ".1.3.6.1.4.1.9.9.91.1.1.1.1.4.2001", "sensor_index": "2001", "sensor_descr": "PSU 1 12V",
+         "sensor_current": 12.1, "sensor_limit": 13.2, "sensor_limit_low": 10.8, "lastupdate": "2026-10-28 11:55:40"},
+        {"sensor_id": 4, "device_id": 3, "sensor_class": "temperature", "sensor_type": "cisco-entity-sensor",
+         "sensor_oid": ".1.3.6.1.4.1.9.9.91.1.1.1.1.4.1006", "sensor_index": "1006",
+         "sensor_descr": "Chassis Temperature", "sensor_current": 71, "sensor_limit": 70, "sensor_limit_warn": 65,
+         "lastupdate": "2026-10-28 11:54:10"},
+    ):  # fmt: skip
+        seed("sensors", row)
+    seed("transceivers", {
+        "id": 1, "device_id": 1, "port_id": 1, "index": "1011", "entity_physical_index": 1011,
+        "type": "1000BASE-LX SFP", "vendor": "CISCO-FINISAR", "oui": "00:90:65", "model": "GLC-LH-SMD",
+        "revision": "A", "serial": "FNS12345ABC", "date": "2021-03-04", "ddm": True, "encoding": "8B10B",
+        "cable": "SM", "distance": 10000, "wavelength": 1310, "connector": "LC",
+        "created_at": "2026-10-01T09:00:00.000000Z", "updated_at": "2026-10-28T06:00:11.000000Z",
+    })  # fmt: skip
+    seed("components", {"id": 7, "device_id": 1, "type": "ntp", "label": "192.0.2.123",
+                        "prefs": {"peer": "192.0.2.123", "stratum": "2"}})  # fmt: skip
+    seed("components", {"id": 8, "device_id": 1, "type": "ntp", "label": "192.0.2.124", "status": 2,
+                        "error": "Peer unreachable", "prefs": {"peer": "192.0.2.124", "stratum": "16"}})  # fmt: skip
+    for row in (
+        {"bgpPeer_id": 1, "device_id": 2, "bgpPeerIdentifier": "203.0.113.1", "bgpPeerRemoteAs": 64500,
+         "astext": "TRANSIT-A", "bgpPeerState": "established", "bgpLocalAddr": "203.0.113.2",
+         "bgpPeerRemoteAddr": "203.0.113.1", "bgpPeerDescr": "transit-a", "bgpPeerFsmEstablishedTime": 864000,
+         "bgpPeerInUpdates": 120332, "bgpPeerOutUpdates": 12, "bgpPeerInTotalMessages": 150201,
+         "bgpPeerOutTotalMessages": 30215, "bgpPeerInUpdateElapsedTime": 3},
+        {"bgpPeer_id": 2, "device_id": 2, "bgpPeerIdentifier": "198.51.100.9", "bgpPeerRemoteAs": 64501,
+         "astext": "TRANSIT-B", "bgpPeerState": "idle", "bgpLocalAddr": "198.51.100.10",
+         "bgpPeerRemoteAddr": "198.51.100.9", "bgpPeerDescr": "transit-b", "bgpPeerFsmEstablishedTime": 0,
+         "bgpPeerLastErrorCode": 6, "bgpPeerLastErrorSubCode": 2, "bgpPeerLastErrorText": "Administrative Shutdown"},
+        {"bgpPeer_id": 3, "device_id": 1, "bgpPeerIdentifier": "192.0.2.2", "bgpPeerRemoteAs": 65000},
+    ):  # fmt: skip
+        seed("bgp_peers", row)
+    for row in (
+        {"id": 1, "device_id": 1, "port_id": 1, "ospf_nbr_id": "198.51.100.2.0", "ospfNbrIpAddr": "198.51.100.2",
+         "ospfNbrRtrId": "198.51.100.2", "ospfNbrOptions": 82, "ospfNbrPriority": 1, "ospfNbrState": "full",
+         "ospfNbrEvents": 6, "ospfNbrLsRetransQLen": 0, "ospfNbmaNbrStatus": "active",
+         "ospfNbmaNbrPermanence": "dynamic", "ospfNbrHelloSuppressed": "false"},
+        {"id": 2, "device_id": 2, "port_id": 0, "ospf_nbr_id": "192.0.2.1.0", "ospfNbrIpAddr": "192.0.2.1",
+         "ospfNbrRtrId": "192.0.2.1", "ospfNbrOptions": 82, "ospfNbrPriority": 1, "ospfNbrState": "full",
+         "ospfNbrEvents": 6, "ospfNbrLsRetransQLen": 0, "ospfNbmaNbrStatus": "active",
+         "ospfNbmaNbrPermanence": "dynamic", "ospfNbrHelloSuppressed": "false"},
+    ):  # fmt: skip
+        seed("ospf_nbrs", row)
+    contacts = {"noc@example.net": "NOC", "jane.doe@example.net": "Jane Doe"}
+    wan = {"device_id": 2, "port_id": 5, "ifName": "Gi0/0/0", "ifAlias": "WAN: transit-a", "ifOperStatus": "down",
+           "hostname": "edge-rtr1.example.net", "sysContact": "noc@example.net"}  # fmt: skip
+    for row in (
+        {"id": 1, "rule_id": 1, "device_id": 2, "fault_id": 1, "state": 1, "time_logged": "2026-10-28 10:02:00",
+         "details": {"contacts": contacts, "rule": [wan]}},
+        {"id": 2, "rule_id": 1, "device_id": 2, "fault_id": 2, "state": 1, "time_logged": "2026-10-28 09:10:00",
+         "details": {"contacts": contacts, "rule": [{**wan, "port_id": 6, "ifName": "Gi0/0/1",
+                                                     "ifAlias": "WAN: transit-b"}]}},
+        {"id": 3, "rule_id": 1, "device_id": 2, "fault_id": 2, "state": 2, "time_logged": "2026-10-28 09:15:00"},
+        {"id": 4, "rule_id": 2, "device_id": 1, "fault_id": 5, "state": 1, "time_logged": "2026-10-27 21:00:00",
+         "details": {"contacts": contacts, "rule": [{"device_id": 1, "processor_descr": "CPU 0",
+                                                     "processor_usage": 97}]}},
+        {"id": 5, "rule_id": 2, "device_id": 1, "fault_id": 5, "state": 0, "time_logged": "2026-10-27 22:00:00"},
+    ):  # fmt: skip
+        seed("alert_log", row)
+    for row in (
+        {"seq": 1, "device_id": 2, "priority": "err", "level": "err", "tag": "LINK-3-UPDOWN",
+         "program": "LINK-3-UPDOWN", "timestamp": "2026-10-20 14:05:00",
+         "msg": "Interface GigabitEthernet0/0/0, changed state to down"},
+        {"seq": 2, "device_id": 1, "priority": "notice", "level": "notice", "tag": "SYS-5-CONFIG_I",
+         "program": "SYS-5-CONFIG_I", "timestamp": "2026-10-28 11:00:00",
+         "msg": "Configured from console by admin on vty0 (192.0.2.200)"},
+        {"seq": 3, "device_id": 2, "priority": "notice", "level": "notice", "tag": "BGP-5-ADJCHANGE",
+         "program": "BGP-5-ADJCHANGE", "timestamp": "2026-10-28 11:30:00",
+         "msg": "neighbor 198.51.100.9 Down BGP Notification sent"},
+    ):  # fmt: skip
+        seed("syslog", row)
+    for row in (
+        {"vlan_id": 1, "device_id": 1, "vlan_vlan": 1, "vlan_name": "default"},
+        {"vlan_id": 2, "device_id": 1, "vlan_vlan": 10, "vlan_name": "users"},
+        {"vlan_id": 3, "device_id": 1, "vlan_vlan": 20, "vlan_name": "voice"},
+        {"vlan_id": 4, "device_id": 3, "vlan_vlan": 10, "vlan_name": "users"},
+    ):
+        seed("vlans", row)
+    for row in (
+        {"ports_fdb_id": 1, "device_id": 3, "port_id": 9, "mac_address": "001122334455", "vlan_id": 4,
+         "created_at": "2026-10-27T08:00:00.000000Z", "updated_at": "2026-10-28T11:00:00.000000Z"},
+        {"ports_fdb_id": 2, "device_id": 1, "port_id": 2, "mac_address": "001122334455", "vlan_id": 2,
+         "created_at": "2026-10-27T08:00:05.000000Z", "updated_at": "2026-10-28T10:00:00.000000Z"},
+        {"ports_fdb_id": 3, "device_id": 1, "port_id": 2, "mac_address": "00000c9ff001", "vlan_id": 2,
+         "created_at": "2026-10-01T09:00:00.000000Z", "updated_at": "2026-10-28T11:50:00.000000Z"},
+    ):  # fmt: skip
+        seed("ports_fdb", row)
+    seed("ports_nac", {
+        "ports_nac_id": 1, "auth_id": "0A00000100000010", "device_id": 3, "port_id": 9, "domain": "data",
+        "username": "00-11-22-33-44-55", "mac_address": "001122334455", "ip_address": "192.0.2.50",
+        "host_mode": "multiAuth", "authz_status": "authorizationSuccess", "authz_by": "Authentication Server",
+        "authc_status": "authcSuccess", "method": "mab", "timeout": 3600, "time_left": 1800, "vlan": 10,
+        "time_elapsed": 1800, "created_at": "2026-10-28T11:00:00.000000Z", "updated_at": "2026-10-28T11:30:00.000000Z",
+    })  # fmt: skip
+    for row in (
+        {"id": 1, "port_id": 9, "device_id": 3, "mac_address": "001122334455", "ipv4_address": "192.0.2.50"},
+        {"id": 2, "port_id": 2, "device_id": 1, "mac_address": "00000c9ff001", "ipv4_address": "192.0.2.254"},
+        {"id": 3, "port_id": 5, "device_id": 2, "mac_address": "0050569a0001", "ipv4_address": "203.0.113.1"},
+    ):
+        seed("ipv4_mac", row)
+    fake.oui = {"001122": "CIMSYS Inc", "00000c": "Cisco Systems, Inc"}
+    seed("outages", {"id": 1, "device_id": 2, "going_down": 1761000000, "up_again": 1761003600})
+    seed("outages", {"id": 2, "device_id": 4, "going_down": 1761600000})
+    for device_id, percentages in ((1, (100.0, 99.98, 99.95, 99.9)), (2, (100.0, 99.4, 99.86, 99.98))):
+        for duration, percent in zip((86400, 604800, 2592000, 31536000), percentages):
+            seed("availability", {"device_id": device_id, "duration": duration, "availability_perc": percent})
+    for row in (
+        {"bill_id": 1, "bill_name": "Transit A", "bill_cdr": 1000000000, "rate_95th": 812000000,
+         "rate_95th_in": 812000000, "rate_95th_out": 400000000, "bill_custid": "CUST-001", "bill_ref": "TRANSIT-A",
+         "bill_last_calc": "2026-10-28 11:50:02", "ports": [5]},
+        {"bill_id": 2, "bill_name": "Transit B", "bill_cdr": 500000000, "rate_95th": 620000000,
+         "rate_95th_in": 620000000, "rate_95th_out": 210000000, "bill_custid": "CUST-002", "bill_ref": "TRANSIT-B",
+         "bill_last_calc": "2026-10-28 11:50:02", "ports": [6]},
+    ):  # fmt: skip
+        seed("bills", row)

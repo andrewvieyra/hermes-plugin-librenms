@@ -8,7 +8,10 @@ configurations, the GET that schedules a rediscovery, the ifName route).
 
 :func:`prepare` also checks device references (hostnames and ids) and resolves them to ids before the query is sent,
 and refuses a ``hostname`` param on a route that does not read it: LibreNMS answers an unknown device in several
-filters, and a param a route ignores, with every device's rows.
+filters, and a param a route ignores, with every device's rows. Likewise it refuses an object id LibreNMS would read
+as no filter (``faults/0``, ``poller_group/0``) or as another id (``ports/1abc``), a params name PHP would read as
+another name (`` limit``, ``hostname[]``), and a MAC that the exact-match MAC routes could never find; and it trims
+the column lists LibreNMS would otherwise fail on.
 """
 
 from __future__ import annotations
@@ -17,9 +20,10 @@ import functools
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from .client import API_PREFIX, LibreNMSClient, LibreNMSError, is_digits, path, seg
+from .redact import clip, one_line
 
 
 class QueryError(Exception):
@@ -38,6 +42,10 @@ class Route:
     query_device_param: bool = False  # ?hostname= is honoured, and silently broadened when unknown
     refused: str | None = None  # why librenms_query does not call it
     rest: str | None = None  # path param that takes the rest of the path (LibreNMS `->where(x, '.*')`)
+    id_params: Tuple[str, ...] = ()  # path params read as no filter (every object) when 0, or as another id when text
+    mac_params: Tuple[str, ...] = ()  # path params compared exactly with the 12 hex digits LibreNMS stores
+    alert_rows: bool = False  # rows carry the alert engine's ``details`` (the rule's query rows and contacts)
+    columns: bool = False  # takes ``params.columns``, the only way to make its answer smaller
 
 
 @dataclass
@@ -52,6 +60,11 @@ class PreparedQuery:
 
 
 _DEVICE = ("hostname",)
+_ID = ("id",)
+_PORT = ("portid",)
+_BILL = ("bill_id",)
+_SENSOR = ("sensor_id",)
+_MAC = ("mac",)
 _GRAPH = (
     "it returns a graph image, which this tool does not fetch; devices/{hostname}/graphs, .../health and "
     ".../wireless list the graphs that exist"
@@ -76,7 +89,7 @@ ROUTES: Tuple[Route, ...] = (
     Route("ping", "ping"),
     Route("server_info", "system", list_key="system"),
     Route("index", ""),
-    Route("get_alert_template", "alert_templates/{id}", list_key="alert_templates"),
+    Route("get_alert_template", "alert_templates/{id}", list_key="alert_templates", id_params=_ID),
     Route("list_alert_templates", "alert_templates", list_key="alert_templates"),
     Route("list_pollers", "pollers", list_key="pollers"),
     Route("list_poller_log", "pollers/log", list_key="log"),
@@ -96,11 +109,11 @@ ROUTES: Tuple[Route, ...] = (
     Route("get_ports_by_group", "port_groups/{name}", list_key="ports"),
     Route("get_graph_by_portgroup_multiport_bits", "portgroups/multiport/bits/{id}", refused=_GRAPH),
     Route("get_graph_by_portgroup", "portgroups/{group}", refused=_GRAPH),
-    Route("get_alert", "faults/{id}", list_key="alerts"),
-    Route("list_alerts", "faults", list_key="alerts"),
-    Route("legacy_get_alert", "alerts/{id}", list_key="alerts"),
-    Route("legacy_list_alerts", "alerts", list_key="alerts"),
-    Route("get_alert_rule", "rules/{id}", list_key="rules"),
+    Route("get_alert", "faults/{id}", list_key="alerts", id_params=_ID, alert_rows=True),
+    Route("list_alerts", "faults", list_key="alerts", alert_rows=True),
+    Route("legacy_get_alert", "alerts/{id}", list_key="alerts", id_params=_ID, alert_rows=True),
+    Route("legacy_list_alerts", "alerts", list_key="alerts", alert_rows=True),
+    Route("get_alert_rule", "rules/{id}", list_key="rules", id_params=_ID),
     Route("list_alert_rules", "rules", list_key="rules"),
     Route("get_vrf", "routing/vrf/{id}", list_key="vrf"),
     Route("list_ipsec", "routing/ipsec/data/{hostname}", device_params=_DEVICE, list_key="ipsec"),
@@ -123,12 +136,14 @@ ROUTES: Tuple[Route, ...] = (
         "devices/{hostname}/health/{type?}/{sensor_id?}",
         device_params=_DEVICE,
         list_key="graphs",
+        id_params=_SENSOR,
     ),
     Route(
         "list_available_wireless_graphs",
         "devices/{hostname}/wireless/{type?}/{sensor_id?}",
         device_params=_DEVICE,
         list_key="graphs",
+        id_params=_SENSOR,
     ),
     Route(
         "get_device_wireless_sensors",
@@ -136,7 +151,7 @@ ROUTES: Tuple[Route, ...] = (
         device_params=_DEVICE,
         list_key="wireless_sensors",
     ),
-    Route("get_device_ports", "devices/{hostname}/ports", device_params=_DEVICE, list_key="ports"),
+    Route("get_device_ports", "devices/{hostname}/ports", device_params=_DEVICE, list_key="ports", columns=True),
     Route("get_ip_addresses", "devices/{hostname}/ip", device_params=_DEVICE, list_key="addresses"),
     Route("get_port_stack", "devices/{hostname}/port_stack", device_params=_DEVICE, list_key="mappings"),
     Route("get_transceivers", "devices/{hostname}/transceivers", device_params=_DEVICE, list_key="transceivers"),
@@ -155,48 +170,56 @@ ROUTES: Tuple[Route, ...] = (
     Route("list_devices", "devices", list_key="devices"),
     Route("list_eventlog", "logs/eventlog/{hostname?}", device_params=_DEVICE, list_key="logs", paginated=True),
     Route("list_syslog", "logs/syslog/{hostname?}", device_params=_DEVICE, list_key="logs", paginated=True),
-    Route("list_alertlog", "logs/alertlog/{hostname?}", device_params=_DEVICE, list_key="logs", paginated=True),
+    Route(
+        "list_alertlog",
+        "logs/alertlog/{hostname?}",
+        device_params=_DEVICE,
+        list_key="logs",
+        paginated=True,
+        alert_rows=True,
+    ),
     Route("list_authlog", "logs/authlog", list_key="logs", paginated=True),
-    Route("get_port_info", "ports/{portid}", list_key="port"),
-    Route("get_port_fdb", "ports/{portid}/fdb", list_key="macs"),
-    Route("get_port_ip_info", "ports/{portid}/ip", list_key="addresses"),
-    Route("get_port_transceiver", "ports/{portid}/transceiver", list_key="transceivers"),
-    Route("search_ports", "ports/search/{field}/{search?}", list_key="ports", rest="search"),
+    Route("get_port_info", "ports/{portid}", list_key="port", id_params=_PORT),
+    Route("get_port_fdb", "ports/{portid}/fdb", list_key="macs", id_params=_PORT),
+    Route("get_port_ip_info", "ports/{portid}/ip", list_key="addresses", id_params=_PORT),
+    Route("get_port_transceiver", "ports/{portid}/transceiver", list_key="transceivers", id_params=_PORT),
+    Route("search_ports", "ports/search/{field}/{search?}", list_key="ports", rest="search", columns=True),
     Route("search_mac", "ports/mac/{search}", list_key="ports"),
-    Route("get_all_ports", "ports", list_key="ports"),
-    Route("get_port_description", "ports/{portid}/description", list_key="port_description"),
+    Route("get_all_ports", "ports", list_key="ports", columns=True),
+    Route("get_port_description", "ports/{portid}/description", list_key="port_description", id_params=_PORT),
     Route("list_bills", "bills", list_key="bills"),
-    Route("get_bill", "bills/{bill_id}", list_key="bills"),
+    Route("get_bill", "bills/{bill_id}", list_key="bills", id_params=_BILL),
     Route("get_bill_graph", "bills/{bill_id}/graphs/{graph_type}", refused=_GRAPH),
-    Route("get_bill_graphdata", "bills/{bill_id}/graphdata/{graph_type}", list_key="graph_data"),
-    Route("get_bill_history", "bills/{bill_id}/history", list_key="bill_history"),
+    Route("get_bill_graphdata", "bills/{bill_id}/graphdata/{graph_type}", list_key="graph_data", id_params=_BILL),
+    Route("get_bill_history", "bills/{bill_id}/history", list_key="bill_history", id_params=_BILL),
     Route("get_bill_history_graph", "bills/{bill_id}/history/{bill_hist_id}/graphs/{graph_type}", refused=_GRAPH),
     Route(
         "get_bill_history_graphdata",
         "bills/{bill_id}/history/{bill_hist_id}/graphdata/{graph_type}",
         list_key="graph_data",
+        id_params=_BILL,
     ),
     Route("list_cbgp", "routing/bgp/cbgp", list_key="bgp_counters", query_device_param=True),
     Route("list_vrf", "routing/vrf", list_key="vrfs", query_device_param=True),
     Route("list_mpls_services", "routing/mpls/services", list_key="mpls_services", query_device_param=True),
     Route("list_mpls_saps", "routing/mpls/saps", list_key="saps", query_device_param=True),
     Route("list_fdb", "resources/fdb", list_key="ports_fdb"),
-    Route("list_fdb_mac", "resources/fdb/{mac}", list_key="ports_fdb"),
+    Route("list_fdb_mac", "resources/fdb/{mac}", list_key="ports_fdb", mac_params=_MAC),
     Route("list_fdb_detail", "resources/fdb/{mac}/detail", list_key="ports_fdb"),
     Route("list_ip_addresses", "resources/ip/addresses/{address_family?}", list_key="ip_addresses"),
     Route("list_arp", "resources/ip/arp/{query}/{cidr?}", list_key="arp"),
     Route("list_ip_networks", "resources/ip/networks/{address_family?}", list_key="ip_networks"),
-    Route("get_network_ip_addresses", "resources/ip/networks/{id}/ip", list_key="addresses"),
+    Route("get_network_ip_addresses", "resources/ip/networks/{id}/ip", list_key="addresses", id_params=_ID),
     Route("list_links", "resources/links", list_key="links"),
     Route("get_link", "resources/links/{id}", list_key="link"),
     Route("list_nac", "resources/nac", list_key="ports_nac"),
-    Route("list_nac_mac", "resources/nac/{mac}", list_key="ports_nac"),
+    Route("list_nac_mac", "resources/nac/{mac}", list_key="ports_nac", mac_params=_MAC),
     Route("list_sensors", "resources/sensors", list_key="sensors"),
     Route("list_vlans", "resources/vlans", list_key="vlans", query_device_param=True),
     Route("list_locations", "resources/locations", list_key="locations"),
     Route("get_inventory", "inventory/{hostname}", device_params=_DEVICE, list_key="inventory"),
     Route("get_inventory_for_device", "inventory/{hostname}/all", device_params=_DEVICE, list_key="inventory"),
-    Route("get_port_security_by_port", "port_security/port/{portid}", list_key="port"),
+    Route("get_port_security_by_port", "port_security/port/{portid}", list_key="port", id_params=_PORT),
     Route("get_port_security_by_hostname", "port_security/device/{hostname}", device_params=_DEVICE, list_key="port"),
     Route("get_port_security", "port_security", list_key="port"),
     Route("get_location", "location/{location_id_or_name}", list_key="get_location"),
@@ -205,8 +228,18 @@ ROUTES: Tuple[Route, ...] = (
 DEFAULT_LIMIT = 50
 _CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 _INTEGER_RE = re.compile(r"^\s*-?\d+\s*$")
-# PHP turns spaces, dots and [ in query parameter names into underscores before Laravel reads them
-_PHP_NAME_RE = re.compile(r"[ .\[]")
+_COLUMN_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# The spellings of a whole MAC address: bare, six groups of one or two hex digits joined by : or -, or Cisco's three
+# groups of four joined by dots.
+_MAC_RE = re.compile(
+    r"^(?:[0-9a-f]{12}|[0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5}|[0-9a-f]{1,2}(?:-[0-9a-f]{1,2}){5}"
+    r"|[0-9a-f]{4}(?:\.[0-9a-f]{4}){2})$",
+    re.IGNORECASE,
+)
+# Names prepare() reads or rewrites itself: written in another letter case, LibreNMS (whose names are
+# case-sensitive) would ignore the param while the plugin's view of the query differs.
+_READ_NAMES = ("hostname", "limit", "start", "sortorder", "columns")
+_CANDIDATES = 5
 _REFUSED_PARAMS = {
     "api_token": "params.api_token is not allowed: the token is sent only in the X-Auth-Token header",
     "_method": "params._method is not allowed: Laravel reads it as an HTTP method override",
@@ -299,11 +332,19 @@ def match(path_: str) -> Tuple[Route, Dict[str, str]]:
     raise QueryError(f"no LibreNMS v0 read route matches {normalised!r}; query the path '' for the route names")
 
 
-def _php_name(key: str) -> str:
-    """The name LibreNMS reads query parameter *key* as: PHP drops the blanks before it and turns spaces, dots and
-    ``[`` into underscores, so ``" hostname"`` reaches Laravel as ``hostname`` and ``"host.name"`` as ``host_name``.
-    Blanks after it are dropped too, which errs towards a match."""
-    return _PHP_NAME_RE.sub("_", key.strip())
+def _php_name(key: str) -> Tuple[str, bool]:
+    """The name LibreNMS reads query parameter *key* as, and whether PHP hands it over as an array. PHP drops the
+    spaces before the name and turns the spaces and dots in it into underscores (``" limit"`` is ``limit``,
+    ``"host.name"`` is ``host_name``); a ``[`` with a ``]`` after it makes an array of the name before it
+    (``hostname[]`` and ``hostname[0]`` are both ``hostname``), and one without becomes an underscore too."""
+    name = key.lstrip(" ")
+    head, bracket, tail = name.partition("[")
+    head = head.replace(" ", "_").replace(".", "_")
+    if bracket and "]" in tail:
+        return head, True
+    if bracket:
+        return head + "_" + re.sub(r"[ .\[]", "_", tail), False
+    return head, False
 
 
 def _scalar(key: str, value: Any) -> str:
@@ -321,7 +362,10 @@ def _scalar(key: str, value: Any) -> str:
 
 
 def _query(params: Any) -> Dict[str, str]:
-    """*params* as the query LibreNMS gets: text values, lists joined with commas (``state=0,1,2``)."""
+    """*params* as the query LibreNMS gets: text values, lists joined with commas (``state=0,1,2``), and the
+    ``columns`` list trimmed. Every name must be one PHP reads as written, so the query the plugin checks and clamps
+    is the query LibreNMS runs: PHP keeps the last of two names it reads alike, so ``{"limit": 5, " limit": -1}``
+    would reach LibreNMS as ``limit=-1``, and ``hostname[]`` as a ``hostname`` the device check never saw."""
     if params is None:
         return {}
     if not isinstance(params, dict):
@@ -330,12 +374,68 @@ def _query(params: Any) -> Dict[str, str]:
     for key, value in params.items():
         if not isinstance(key, str) or not key.strip() or _CONTROL_RE.search(key):
             raise QueryError("params keys must be non-empty text without control characters")
-        refused = _REFUSED_PARAMS.get(_php_name(key).lower())
+        name, array = _php_name(key)
+        refused = _REFUSED_PARAMS.get(name.lower())
         if refused:
             raise QueryError(refused)
+        if array:
+            raise QueryError(
+                f"params key {key[:40]!r} reaches LibreNMS as an array named {name[:40]!r}; use plain names (a list "
+                "value is sent joined with commas)"
+            )
+        if name != key:
+            raise QueryError(
+                f"params key {key[:40]!r} reaches LibreNMS as {name[:40]!r} (PHP drops leading spaces and turns "
+                "spaces, dots and [ into _); write the name LibreNMS reads"
+            )
+        if key.lower() in _READ_NAMES and key != key.lower():
+            raise QueryError(f"params key {key!r}: LibreNMS reads names as written; write it as {key.lower()!r}")
         items = value if isinstance(value, (list, tuple)) else [value]
         query[key] = ",".join(_scalar(key, item) for item in items)
+        if key == "columns":
+            query[key] = _column_list(query[key], "params.columns")
     return query
+
+
+def _column_list(text: str, what: str) -> str:
+    """A comma-separated list of column names with the blanks around each dropped. LibreNMS checks the trimmed names
+    but selects them as sent, so ``"port_id, ifName"`` fails in SQL as an opaque HTTP 500."""
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    for name in names:
+        if not _COLUMN_RE.match(name):
+            raise QueryError(
+                f"{what} takes column names separated by commas, e.g. port_id,ifName,ifAlias; {name[:40]!r} is not one"
+            )
+    return ",".join(names)
+
+
+def _object_id(route: Route, name: str, value: str) -> str:
+    """*value* when it is a positive whole number. Several of LibreNMS's handlers behind these routes filter by id
+    only when it is set (``when($id)``, ``$id > 0``, ``is_numeric``, ``if ($port_id)``, ``$sensor_id ? …``), so
+    ``faults/0`` lists every open fault, ``bills/x`` every bill, ``port_security/port/0`` every port's entries and
+    ``devices/{hostname}/health/{type}/0`` every sensor of the class, under a path that names one; and the others
+    compare the text with an integer column, which MySQL reads as its leading number (``ports/1abc`` is port 1)."""
+    if is_digits(value) and int(value) > 0:
+        return str(int(value))
+    raise QueryError(
+        f"{{{name}}} must be a positive whole number (got {value[:40]!r}): LibreNMS's {route.name} reads 0 or text "
+        "as no filter, or as another id, and would answer with other objects"
+    )
+
+
+def _mac(route: Route, value: str) -> str:
+    """*value* as the 12 lowercase hex digits LibreNMS stores. ``resources/fdb/{mac}`` and ``resources/nac/{mac}``
+    compare the segment with the column exactly, so a MAC written with separators is never found and the empty
+    answer would read as "not on the network"; and ``0`` reads as no filter at all."""
+    text = value.strip()
+    if not _MAC_RE.match(text):
+        raise QueryError(
+            f"{route.template} takes a whole MAC address (00:11:22:33:44:55, 00-11-22-33-44-55, 0011.2233.4455 or "
+            f"001122334455), not {value[:40]!r}"
+        )
+    if ":" in text or "-" in text:  # by the separator, not the length: 0:0:c:7:ac:1 is 12 characters too
+        return "".join(part.zfill(2) for part in re.split("[:-]", text)).lower()
+    return text.replace(".", "").lower()
 
 
 def _integer(name: str, value: Any) -> int:
@@ -377,6 +477,8 @@ def _device_id(client: Any, value: str) -> str:
     try:
         body = client.get(target)
     except LibreNMSError as exc:
+        if exc.kind == "not_found" and not numeric:
+            raise QueryError(_unknown_hostname(client, value)) from None
         if exc.kind == "not_found":
             raise QueryError(f"no LibreNMS device has {what}") from None
         if exc.kind == "forbidden":
@@ -387,6 +489,68 @@ def _device_id(client: Any, value: str) -> str:
     if found is None or not is_digits(str(found)):
         raise QueryError(f"LibreNMS returned no device id for {what}")
     return str(found)
+
+
+def _unknown_hostname(client: Any, value: str) -> str:
+    """The refusal for a hostname LibreNMS does not hold, naming up to :data:`_CANDIDATES` hostnames that contain its
+    first label (``core-sw1`` for ``core-sw1.example.com``), or display names that do, so the model can ask the user
+    instead of guessing. A label shorter than three characters, or one holding ``%`` (a LIKE wildcard), would match
+    half the inventory and is not searched; a failed search only leaves the candidates out."""
+    message = f"no LibreNMS device has hostname '{value}' (hostnames match exactly)"
+    label = value.strip().split(".", 1)[0]
+    found: List[str] = []
+    if len(label) >= 3 and "%" not in label:
+        for kind in ("hostname", "display"):
+            try:
+                rows = LibreNMSClient.result(client.get("devices", {"type": kind, "query": label}), "devices")
+            except Exception:  # only a hint: the refusal stands without it
+                break
+            found = [
+                row["hostname"] for row in rows or [] if isinstance(row, dict) and isinstance(row.get("hostname"), str)
+            ]
+            if found:
+                break
+    if not found:
+        return message + "; find the stored one with the path 'devices' and params type=hostname, query=<part of it>"
+    lowered = label.lower()
+    found.sort(key=lambda name: (not name.lower().startswith(lowered), len(name), name))
+    shown = ", ".join(clip(one_line(name), 100) for name in found[:_CANDIDATES])
+    more = f" and {len(found) - _CANDIDATES} more" if len(found) > _CANDIDATES else ""
+    return f"{message}; devices whose hostname or display name contains '{label}': {shown}{more}"
+
+
+def too_large_hint(route: Route, normalised: str) -> str:
+    """How to get *route*'s answer under the client's size cap. ``limit`` helps only on the logs routes, which LibreNMS
+    pages; everywhere else it sends every row and the limit applies to what was read, so a smaller one fails alike."""
+    if route.paginated:
+        return "ask for fewer rows at a time with a smaller limit, and page with start"
+    hints = []
+    if route.columns:
+        hints.append("select fewer columns with params.columns (e.g. port_id,ifName,ifOperStatus)")
+    if route.name == "list_devices":
+        hints.append("filter with params type and query (e.g. type=location, query=SFO-1)")
+    if route.query_device_param:
+        hints.append("filter by device with params.hostname")
+    where = _device_filter_path(normalised) or _NARROWER.get(route.name)
+    if where:
+        hints.append(f"query the path '{where}' for one device's rows")
+    if not hints:
+        hints.append("read one object's or one device's path instead")
+    return "; ".join(hints) + " (limit does not help here: LibreNMS sends every row and the limit applies after)"
+
+
+# Where a fleet-wide route has a per-device counterpart elsewhere in the tree.
+_NARROWER = {
+    "list_devices": "devices/<hostname>",
+    "get_all_ports": "devices/<hostname>/ports",
+    "search_ports": "devices/<hostname>/ports",
+    "list_fdb": "devices/<hostname>/fdb",
+    "list_nac": "devices/<hostname>/nac",
+    "list_links": "devices/<hostname>/links",
+    "list_sensors": "devices/<hostname>/health",
+    "list_ip_addresses": "devices/<hostname>/ip",
+    "list_vlans": "devices/<hostname>/vlans",
+}
 
 
 def _device_filter_path(normalised: str) -> str | None:
@@ -415,21 +579,36 @@ def _request_path(route: Route, values: Dict[str, str]) -> str:
 
 def prepare(client: Any, path_: Any, params: Any, limit: Any, settings: Any) -> PreparedQuery:
     """Everything between the model's ``path``/``params``/``limit`` and the request: normalise and match the path,
-    check and join the params, apply the logs defaults and every clamp, resolve device references (path params and
-    ``?hostname=``) to ids, and build the request path from encoded segments. A ``hostname`` param on a route that
-    does not read it is refused: LibreNMS would ignore it and return every device's rows. Local checks run before
-    any lookup is sent. Every refusal is a QueryError; a failed lookup other than 403/404 raises the
-    LibreNMSError."""
+    check and join the params, apply the logs defaults and every clamp, check object ids, normalise MACs and column
+    lists, resolve device references (path params and ``?hostname=``) to ids, and build the request path from
+    encoded segments. A ``hostname`` param on a route that does not read it is refused: LibreNMS would ignore it and
+    return every device's rows. Local checks run before any lookup is sent. Every refusal is a QueryError; a failed
+    lookup other than 403/404 raises the LibreNMSError."""
     normalised = normalise(path_)
     route, values = match(normalised)
     query = _query(params)
-    hostname_keys = [key for key in query if _php_name(key) == "hostname"]
-    if hostname_keys and not route.query_device_param:
+    if "hostname" in query and not route.query_device_param:
         where = _device_filter_path(normalised)
         raise QueryError(
             f"LibreNMS's {route.name} does not read params.hostname, so it would return every device's rows"
             + (f"; query the path '{where}' for one device's rows" if where else "")
         )
+    for name in route.id_params:
+        if name in values:
+            values[name] = _object_id(route, name, values[name])
+    for name in route.mac_params:
+        if name in values:
+            values[name] = _mac(route, values[name])
+    if route.name == "get_poller_group" and values.get("poller_group_id_or_name") == "0":  # PHP's empty("0") is true
+        raise QueryError(
+            "poller group 0 is LibreNMS's General group, which has no poller_groups row, and LibreNMS reads "
+            "poller_group/0 as no group at all and answers with every poller group; a device with poller_group 0 is "
+            "in the General group"
+        )
+    if route.name == "search_ports" and "search" in values:  # {field} is a column list only when a search follows
+        values["field"] = _column_list(values["field"], "the {field} of ports/search/{field}/{search}")
+        if not values["field"]:
+            raise QueryError("ports/search/{field}/{search} needs column names in {field}, e.g. ifAlias,ifName")
     cap = settings.max_query_results
     if route.paginated:
         count = _limit(query.get("limit") if limit is None else limit, cap)
@@ -441,6 +620,6 @@ def prepare(client: Any, path_: Any, params: Any, limit: Any, settings: Any) -> 
     for name in route.device_params:
         if name in values:
             values[name] = _device_id(client, values[name])
-    for key in hostname_keys:
-        query[key] = _device_id(client, query[key])
+    if "hostname" in query:
+        query["hostname"] = _device_id(client, query["hostname"])
     return PreparedQuery(route, _request_path(route, values), query, count, normalised)
