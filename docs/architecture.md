@@ -391,6 +391,7 @@ run lock is held.
 | Guarantee | Enforcement |
 |---|---|
 | A plan applies at most once | `planned -> applying` is flipped under `<plans>/.lock` after re-reading the file; a second claim finds `applying` or later and is refused (`refusing to apply twice`) |
+| An approved call runs only the plan the prompt showed | The approval key carries the plan's content digest, and the claim of an apply or rollback that went through the prompt compares the digest of the file it re-read with the prompt's (`approved_digest`) and refuses a difference (see [The approval hook](#the-approval-hook)) |
 | Only against the LibreNMS it was built for | The plan records `librenms_url`; apply and rollback refuse when `LIBRENMS_URL` now names another base URL |
 | Only while fresh | Apply refuses a plan older than `max_plan_age_hours` (default 24) |
 | Only while the operator's gates allow it | `allow_delete`, `allow_device_add` (device creates, and updates that change `hostname` or `overwrite_ip`) and `allow_services` are checked when planning and again for every step when applying |
@@ -507,9 +508,30 @@ human to ask blocks the call.
   were left out. Every line is escaped and kept to one line with `one_line()` and cut to 120
   characters, a label to 40, so no text from LibreNMS or the model can pass for a step or take the
   room the steps need; a line that does not fit is left out and counted, not the lines after it.
-- **Rule key**: `librenms:librenms_apply:<id>:rb|norb` and
-  `librenms:librenms_rollback:<id>:force|safe`. An "always" or "session" answer therefore covers that
-  plan with that choice only.
+- **Rule key**: `librenms:librenms_apply:<id>:rb|norb:<digest>` and
+  `librenms:librenms_rollback:<id>:force|safe:<digest>`, where `<digest>` is `store.content_digest`
+  of the plan as the hook loaded it for the message: the first 32 hex digits of a sha256 of the
+  canonical JSON (sorted keys, ASCII) of its `id`, `version`, `status`, `created_at`, `librenms_url`,
+  `description`, `summary`, `warnings`, `irreversible`, `steps` and `journal`. Who planned it
+  (`requested_by`, `audit`), the dry-run `checks`, the `apply` and `rollback` records and
+  `updated_at` are left out, so a dry run between the prompt and the apply changes nothing. An
+  "always" or "session" answer therefore covers that plan with that choice as it was shown; once its
+  file changes Hermes asks again. Keys of 0.10.x and earlier, without the digest, are never asked
+  again, and `post_approval_response` still reads them.
+- **Bound to the call**: a second `pre_tool_call` callback, `bind_approval`, registered after the
+  first, hands the handler of the same call what its prompt showed, as
+  `_librenms_approval: {"plan_id", "variant", "digest"}` in its arguments by Hermes' `modify`
+  directive, or `null` when no prompt was shown, replacing whatever the model wrote there. Hermes runs
+  each callback on a worker thread of its own, so the first keeps what it showed for the second keyed
+  by the call: the tool, `tool_call_id`, `session_id`, `task_id` and a digest of the arguments. The
+  handler refuses a call whose plan or choice is not the one the prompt showed (another plugin's
+  `modify`, tool middleware), and passes the digest to the executor, which refuses under the claim,
+  after the last load before the run, a plan whose digest differs (`plan <id> changed after the
+  approval prompt showed it`, `executor.PlanChanged`, audited with `approved_digest` and `digest`).
+  So an edit made while the prompt was open, or another plan saved under the same id, never runs on
+  that approval. The value only adds checks: one the model wrote that no hook replaced (a Hermes
+  without `modify`) can make the call refuse, never let it run. An operator's `/librenms` or
+  `hermes librenms` command is never held to it.
 - **Exact ids only**: the hook and the `librenms_apply` / `librenms_rollback` handlers take a plan's
   full id, never a fragment. A `plan_id` that names no saved plan, or only the end of one (the
   refusal names the plan), or several, is blocked with the handler's own refusal
@@ -532,9 +554,10 @@ human to ask blocks the call.
   from their own terminal; in `read_only`, that writes are disabled and queries and plans still work.
   The block is audited as `apply_refused` or `rollback_refused` with `reason: "blocked in the agent's
   terminal/execute_code"`, `tool`, `write_mode` and the plan id it names, never the command text.
-- **Other tools**: the hook returns immediately, without I/O, for every other tool.
-- Every `approve` the hook returns is audited as `approval_requested` (tool, plan id, rule key), and
-  `post_approval_response` records the decision as `approval_decided` (choice, tool, plan id).
+- **Other tools**: both callbacks return immediately, without I/O, for every other tool.
+- Every `approve` the hook returns is audited as `approval_requested` (tool, plan id, rule key,
+  digest), and `post_approval_response` records the decision as `approval_decided` (choice, tool,
+  plan id, digest).
   Hermes decides some requests without a person and without `post_approval_response`, so a request
   with no decision after it shows one passed or blocked by policy.
 
@@ -678,8 +701,9 @@ for the re-read to settle, not a second request.
   `librenms_plans` shows the latest of a plan's dry-run checks, one recorded per dry run
   (`check_count`). The operator paths (`/librenms`, `hermes librenms`) are not cut.
 - Hooks (`pre_tool_call`, `pre_llm_call`, `post_approval_response`) are registered unconditionally
-  and declared in `provides_hooks`. `pre_llm_call` remembers the user's message per session for the
-  actor record ([audit.md](audit.md)).
+  and declared in `provides_hooks`; `pre_tool_call` takes two callbacks, the approval prompt and then
+  `bind_approval` ([The approval hook](#the-approval-hook)). `pre_llm_call` remembers the user's
+  message per session for the actor record ([audit.md](audit.md)).
 - The plan store and the audit file follow the active Hermes profile: `plugins.plugin_storage.
   plugin_data_dir` when available, with a `$HERMES_HOME/plugin-data/librenms` fallback, resolved on
   every use.

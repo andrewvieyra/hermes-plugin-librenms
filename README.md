@@ -572,6 +572,11 @@ error; anything but 0 is printed on stderr. So `hermes librenms check 7dde && he
   and only within `max_plan_age_hours`. The claim is taken under a cross-process file lock, and only
   one plan runs at a time (a failed apply until its automatic rollback ends), so the gateway and the
   CLI cannot interleave writes.
+- **Approvals are bound to what was shown.** The approval prompt's key carries a digest of the plan's
+  content, so a remembered "session" or "always" answer does not cover the plan once its file
+  changes, and the handler of the approved call refuses, under the claim, a plan whose content is
+  not what the prompt showed (an edit made while the prompt was open, another plan saved under the
+  same id). See [Write modes](#write-modes).
 - **No secrets in plans.** The token appears only in the request header. SNMP credentials are
   environment references in the plan and are resolved only while the step runs. Credential fields
   (communities, SNMP passwords, service parameters) are masked in every tool result and audit event;
@@ -590,14 +595,17 @@ With `require_approval` (default on), the plugin also sends every `librenms_appl
 a summary built for the little of it Hermes shows (9 rows of 64 columns in the CLI panel, 300
 characters on Discord, 500 on Slack and Telegram): a header with the counts, the irreversible steps
 and the rollback choice, then one line per step, deletes and irreversible steps first, then the
-field-level diff while room remains. The approval is keyed per plan, so "session" or "always" never
-carries over to another plan. The model's `librenms_apply` and `librenms_rollback` take only the full
-plan id, and one that names no saved plan is refused without asking, so the plan a person approved
-is the plan that runs. Unattended runs follow your Hermes approval policy:
-`approvals.cron_mode` for cron jobs, `approvals.unattended_mode` for webhook and API-server sessions,
-and `approvals.single_query_mode` for `hermes -q`, each `deny` unless you set it to `approve`, which
-lets an apply through without asking, as YOLO mode and `approvals.mode: off` do. `write_mode` adds
-the lock:
+field-level diff while room remains. The approval is keyed per plan, choice and content (a digest of
+the plan as the prompt read it), so "session" or "always" never carries over to another plan, or to
+the same plan once its file has changed: Hermes asks again. The model's `librenms_apply` and
+`librenms_rollback` take only the full plan id, and one that names no saved plan is refused without
+asking; the call then runs only the plan the prompt showed, since a plan whose file changed while
+the prompt was open is refused under the claim (`plan … changed after the approval prompt showed
+it`), so the plan a person approved is the plan that runs. Unattended runs follow your Hermes
+approval policy: `approvals.cron_mode` for cron jobs, `approvals.unattended_mode` for webhook and
+API-server sessions, and `approvals.single_query_mode` for `hermes -q`, each `deny` unless you set
+it to `approve`, which lets an apply through without asking, as YOLO mode and `approvals.mode: off`
+do. `write_mode` adds the lock:
 
 | `write_mode` | Who can write | Use it when |
 |---|---|---|
@@ -699,7 +707,8 @@ background thread that never delays a LibreNMS operation. See [docs/sinks.md](do
   not return what an exact snapshot needs, alert-rule update and delete are refused rather than
   guessed. Each plan records the LibreNMS version and database schema it was built against.
 - Hermes Agent 0.22.3+ (`requires_hermes`). The plugin uses the documented `register(ctx)` surface:
-  `register_tool`, `register_hook` (`pre_tool_call`, `pre_llm_call`, `post_approval_response`),
+  `register_tool`, `register_hook` (`pre_tool_call` twice: the approval prompt, then the `modify`
+  directive that hands its handler what the prompt showed; `pre_llm_call`, `post_approval_response`),
   `register_command`, `register_cli_command`, `register_skill`, `get_config`.
 
 ## Development
@@ -724,7 +733,7 @@ Layout:
 plugin.yaml   manifest (tools, hooks, env, settings schema)
 __init__.py   register(ctx)
 schemas.py    tool schemas the model sees
-handlers.py   tool handlers, the write_mode gate, the approval and request hooks
+handlers.py   tool handlers, the write_mode gate, the approval, approval-binding and request hooks
 commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query

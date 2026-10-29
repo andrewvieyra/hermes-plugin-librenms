@@ -1,7 +1,8 @@
 """hermes-plugin-librenms — LibreNMS change management plugin for Hermes Agent.
 
-Registers six tools (query / report / plan / apply / rollback / plans), three hooks (the approval prompt for apply and
-rollback, the user's request for the audit trail, the approval decision), a ``/librenms`` slash command, a
+Registers six tools (query / report / plan / apply / rollback / plans), four hook callbacks (the approval prompt for
+apply and rollback and the one handing their handler what it showed, the user's request for the audit trail, the
+approval decision), a ``/librenms`` slash command, a
 ``hermes librenms`` CLI subcommand, and two bundled skills: ``librenms:workflow`` (changes: plan, review, apply, roll
 back) and ``librenms:ask`` (questions, over several turns). Registration performs no network I/O; the LibreNMS client
 is created lazily inside each tool call.
@@ -75,7 +76,7 @@ def register(ctx) -> None:
 
     # Not guarded: without pre_tool_call, apply and rollback would run without the approval prompt, so a Hermes
     # that cannot take the hooks must fail the load rather than run the plugin without them.
-    for hook, callback in handlers.HOOKS.items():
+    for hook, callback in handlers.HOOKS:
         ctx.register_hook(hook, callback)
 
     ctx.register_command(

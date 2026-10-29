@@ -9,6 +9,7 @@ holds what rollback needs (service parameters included).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
 import json
 import os
@@ -30,6 +31,25 @@ MIN_FRAGMENT = 4  # hex digits in a plan id's random suffix
 # plan is saved whole and reads back the same.
 _ENCODE_ERRORS = "backslashreplace"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+# The keys of a plan that decide what an apply or a rollback does and what the approval prompt shows of it: what it
+# changes and how (steps, with their snapshots and inverses), what it says about that (summary, irreversible steps,
+# warnings, the description), where and since when (LibreNMS, created_at), and how far it has run (status, journal).
+# Left out: who planned it and from where (requested_by, audit), the dry-run checks and every run's own record
+# (checks, apply, rollback), and updated_at, which a dry run changes without changing what runs.
+CONTENT_KEYS = (
+    "id",
+    "version",
+    "status",
+    "created_at",
+    "librenms_url",
+    "description",
+    "summary",
+    "warnings",
+    "irreversible",
+    "steps",
+    "journal",
+)
+CONTENT_DIGEST_CHARS = 32  # hex: 128 bits, too many to make two plan files that share one
 
 
 def plan_status(plan: Dict[str, Any]) -> str:
@@ -37,6 +57,16 @@ def plan_status(plan: Dict[str, Any]) -> str:
     leaves it out or holds something other than text, so the label an operator reads is one they can filter on."""
     status = plan.get("status")
     return status if isinstance(status, str) and status else UNKNOWN_STATUS
+
+
+def content_digest(plan: Dict[str, Any]) -> str:
+    """A sha256 of the canonical JSON of *plan*'s :data:`CONTENT_KEYS`, cut to :data:`CONTENT_DIGEST_CHARS` hex
+    digits. The approval hook keys a person's answer to it and the executor compares it again under the claim, so
+    an approval covers the plan as it was shown: a file edited after the prompt, or another plan saved under the
+    same id, has another digest (an identical one, the same). Two loads of one file always give the same digest."""
+    content = {key: plan.get(key) for key in CONTENT_KEYS}
+    text = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:CONTENT_DIGEST_CHARS]
 
 
 class RunLockBusy(RuntimeError):

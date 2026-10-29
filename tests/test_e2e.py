@@ -223,8 +223,11 @@ class EndToEnd(PluginTestCase):
         )
         self.assertTrue(approval["message"].split("\n")[1].startswith('[0] maintenance device #3 "access-sw2'))
         self.outputs.append(approval["message"])
+        bound = self.handlers.bind_approval(
+            "librenms_apply", {"plan_id": pid}
+        )  # what the prompt showed, for the handler
 
-        applied = self.call("librenms_apply", plan_id=pid)
+        applied = self.call("librenms_apply", plan_id=pid, **bound["args"])
         self.assertTrue(applied["success"], applied)
         self.assertEqual(self.fake.tables["faults"][3]["state"], 2)
         [schedule] = self.fake.schedules

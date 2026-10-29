@@ -20,18 +20,20 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import logging
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Tuple
 
 from . import audit, listing, reports, sinks
 from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
 from .executor import (
     EVENTLOG_MESSAGE_CHARS,
     ExecutionRefused,
+    PlanChanged,
     apply_plan,
     pending_entries,
     render_journal,
@@ -42,7 +44,7 @@ from .redact import alert_entities, clip, for_model, mark_untrusted, mask, one_l
 from .resources import get_resource
 from .routes import PreparedQuery, QueryError, Route, prepare, too_large_hint
 from .settings import Settings, get_settings
-from .store import PlanStore, get_store, plan_status, profile_key
+from .store import PlanStore, content_digest, get_store, plan_status, profile_key
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -85,11 +87,20 @@ _CLI_WRITE_RE = re.compile(
 )
 _HERMES_RE = re.compile(r"\bhermes\b", re.IGNORECASE)
 _COMMAND_SEPARATORS = "\n;|&"
-# The rule_key pre_tool_call returns, as Hermes reports it back (prefixed "plugin_rule:"). 0.1.1 and earlier also
-# returned "librenms:<tool>:unresolved:<digest>", which a remembered answer can still carry.
+# The rule_key pre_tool_call returns, as Hermes reports it back (prefixed "plugin_rule:"):
+# "librenms:<tool>:<plan_id>:<variant>:<content digest>". 0.10.x and earlier left the digest out, and 0.1.1 and
+# earlier also returned "librenms:<tool>:unresolved:<digest>", which a remembered answer can still carry.
 _RULE_KEY_RE = re.compile(
-    r"(?:^|:)(?P<key>librenms:(?P<tool>librenms_apply|librenms_rollback):(?P<plan>[^:]+):(?P<variant>[^:]+))$"
+    r"(?:^|:)(?P<key>librenms:(?P<tool>librenms_apply|librenms_rollback):(?P<plan>[^:]+):(?P<variant>[^:]+)"
+    r"(?::(?P<digest>[0-9a-f]+))?)$"
 )
+# What a rule key's variant stands for, as the approval prompt's header says it.
+_VARIANT_FLAGS = {
+    "rb": "rollback_on_failure=true",
+    "norb": "rollback_on_failure=false",
+    "force": "force=true",
+    "safe": "force=false",
+}
 _COUNTED = ("create", "update", "delete", "action")
 # Envelope keys that carry no data of their own: LibreNMS's api_success puts them around every result.
 _ENVELOPE_KEYS = frozenset({"status", "message", "count", "total"})
@@ -125,6 +136,28 @@ _prune_lock = threading.Lock()
 _client_factory: Callable[[], LibreNMSClient] | None = None
 
 
+class _Shown(NamedTuple):
+    """What the approval prompt of a write tool call showed: the plan, the variant (``rb``/``norb``,
+    ``force``/``safe``) and the plan's content digest (:func:`store.content_digest`)."""
+
+    plan_id: str
+    variant: str
+    digest: str
+
+
+# The argument through which bind_approval hands the handler of an apply or rollback what that call's approval prompt
+# showed (a _Shown as an object, or null), by Hermes' "modify" directive. The schemas do not offer it, and the hook
+# replaces whatever the model wrote there.
+APPROVAL_ARG = "_librenms_approval"
+# What pre_tool_call made the approval prompt of a write tool call show, until bind_approval, the next pre_tool_call
+# callback of the same call, takes it: keyed by the call (_call_key). Hermes runs the callbacks of a call one after
+# another, each on a worker thread of its own, so nothing per thread lasts from one to the next. At most
+# _PENDING_LIMIT are kept, the oldest dropped first, in case a Hermes runs the first and not the second.
+_PENDING_LIMIT = 256
+_pending: Dict[Tuple[str, ...], _Shown] = {}
+_pending_lock = threading.Lock()
+
+
 def parse_bool(value: Any, default: bool) -> bool:
     """A boolean tool argument: a bool, or true/false, yes/no, on/off, 1/0 as text in any case; anything else is
     *default*. The approval hook and the handlers both read flags through this, so the call a human approved is the
@@ -156,9 +189,12 @@ def make_client(settings: Settings | None = None) -> LibreNMSClient:
 
 
 def reset_state() -> None:
-    """Test seam: forget the last retention sweeps, so the next call that sweeps runs one."""
+    """Test seam: forget the last retention sweeps, so the next call that sweeps runs one, and what approval
+    prompts showed."""
     with _prune_lock:
         _last_prune_at.clear()
+    with _pending_lock:
+        _pending.clear()
 
 
 def check_requirements() -> bool:
@@ -218,6 +254,61 @@ def find_plan(
         plan_id = None
     plan = store.load(plan_id) if plan_id else None
     return (plan_id, plan, candidates) if plan is not None else (None, None, candidates)
+
+
+def _call_key(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Tuple[str, ...]:
+    """A tool call as both of our ``pre_tool_call`` callbacks see it: the tool, the ``tool_call_id``, ``session_id``
+    and ``task_id`` Hermes passes them (``""`` for none) and a digest of its arguments, so two calls Hermes makes at
+    once without a ``tool_call_id`` (``handle_function_call`` called directly) are told apart unless they are the same
+    call."""
+    ids = (str(hook_kwargs.get(name) or "") for name in ("tool_call_id", "session_id", "task_id"))
+    try:
+        text = json.dumps(args, sort_keys=True, ensure_ascii=True, default=repr)
+    except (TypeError, ValueError):  # keys that do not sort, a cycle: never what a model's call holds
+        text = ascii(args)
+    return (tool, *ids, hashlib.sha256(text.encode("ascii")).hexdigest()[:16])
+
+
+def _note_shown(tool: str, args: Any, hook_kwargs: Dict[str, Any], found: re.Match[str] | None) -> None:
+    """Keep for :func:`bind_approval` what the approval prompt of this *tool* call shows, from the rule key
+    :func:`pre_tool_call` returns (*found*), or that it shows none (None: approval off, a dry run, a block)."""
+    key = _call_key(tool, args, hook_kwargs)
+    with _pending_lock:
+        _pending.pop(key, None)  # whatever an earlier call with the same ids left; a new one goes in last
+        if found is not None and found.group("digest"):
+            _pending[key] = _Shown(found.group("plan"), found.group("variant"), found.group("digest"))
+        while len(_pending) > _PENDING_LIMIT:
+            _pending.pop(next(iter(_pending)))
+
+
+def _shown_in(args: Dict[str, Any], kwargs: Dict[str, Any]) -> _Shown | None:
+    """What the approval prompt of this call showed, as :func:`bind_approval` put it in its arguments; None when no
+    prompt was shown, and for an operator's call (``_actor``), which none precedes. It only ever adds a check: a value
+    the model wrote there that no hook replaced (a Hermes without ``modify``) can make the call refuse, never run."""
+    value = args.get(APPROVAL_ARG)
+    if isinstance(kwargs.get("_actor"), dict) or not isinstance(value, dict):
+        return None
+    fields = [value.get(name) for name in _Shown._fields]
+    return _Shown(*fields) if all(isinstance(field, str) and field for field in fields) else None
+
+
+def _not_shown(action: str, shown: _Shown, plan_id: str, variant: str) -> str | None:
+    """Why a call whose prompt showed *shown* may not run as plan *plan_id* with *variant*, or None when it is the
+    call the prompt showed. Only something between the hook and the handler (another plugin's ``modify``, tool
+    middleware) changes the arguments a person approved."""
+    if (shown.plan_id, shown.variant) == (plan_id, variant):
+        return None
+    flag = _VARIANT_FLAGS.get(shown.variant, shown.variant)
+    return (
+        f"{action} refused: this call is not the one the approval prompt showed (plan {shown.plan_id}, {flag}); "
+        f"nothing was {'applied' if action == 'apply' else 'reverted'}. Call librenms_{action} again so the user "
+        "is asked about what runs"
+    )
+
+
+def _changed(exc: ExecutionRefused) -> Dict[str, Any]:
+    """The digests a :class:`PlanChanged` refusal compared, for its audit event."""
+    return {"approved_digest": exc.approved, "digest": exc.found} if isinstance(exc, PlanChanged) else {}
 
 
 def _unknown(raw: Any, candidates: List[str]) -> str:
@@ -953,8 +1044,9 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
 def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
-    _plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
-    if plan is None:
+    shown = _shown_in(args, kwargs)
+    plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
+    if plan_id is None or plan is None:
         reason = _unknown(args.get("plan_id"), candidates)
         audit.emit("apply_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
         return _fail(reason)
@@ -972,10 +1064,33 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
             write_mode=settings.write_mode,
         )
         return _fail(refusal, refused=True, write_mode=settings.write_mode)
-    client = make_client(settings)
     rollback = parse_bool(args.get("rollback_on_failure"), True)
+    approved = None
+    if shown is not None and not dry_run:  # a dry run writes nothing, whatever the prompt showed
+        refusal = _not_shown("apply", shown, plan_id, "rb" if rollback else "norb")
+        if refusal:
+            audit.emit(
+                "apply_refused",
+                plan_id=plan["id"],
+                actor=actor,
+                librenms_url=plan.get("librenms_url"),
+                reason=refusal,
+                dry_run=dry_run,
+            )
+            return _fail(refusal, refused=True)
+        approved = shown.digest
+    client = make_client(settings)
     try:
-        plan = apply_plan(client, plan, store, settings, rollback_on_failure=rollback, dry_run=dry_run, actor=actor)
+        plan = apply_plan(
+            client,
+            plan,
+            store,
+            settings,
+            rollback_on_failure=rollback,
+            dry_run=dry_run,
+            actor=actor,
+            approved_digest=approved,
+        )
     except ExecutionRefused as exc:
         audit.emit(
             "apply_refused",
@@ -984,6 +1099,7 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
             librenms_url=plan.get("librenms_url"),
             reason=str(exc),
             dry_run=dry_run,
+            **_changed(exc),
         )
         raise
     budget = _budget(settings, kwargs)
@@ -1020,8 +1136,9 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
 def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
-    _plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
-    if plan is None:
+    shown = _shown_in(args, kwargs)
+    plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
+    if plan_id is None or plan is None:
         reason = _unknown(args.get("plan_id"), candidates)
         audit.emit("rollback_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
         return _fail(reason)
@@ -1039,9 +1156,29 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
             write_mode=settings.write_mode,
         )
         return _fail(refusal, refused=True, write_mode=settings.write_mode)
+    refusal = _not_shown("rollback", shown, plan_id, "force" if force else "safe") if shown is not None else None
+    if refusal:
+        audit.emit(
+            "rollback_refused",
+            plan_id=plan["id"],
+            actor=actor,
+            librenms_url=plan.get("librenms_url"),
+            reason=refusal,
+            force=force,
+        )
+        return _fail(refusal, refused=True)
     client = make_client(settings)
     try:
-        plan = rollback_plan(client, plan, store, settings, force=force, reason="requested", actor=actor)
+        plan = rollback_plan(
+            client,
+            plan,
+            store,
+            settings,
+            force=force,
+            reason="requested",
+            actor=actor,
+            approved_digest=shown.digest if shown is not None else None,
+        )
     except ExecutionRefused as exc:
         audit.emit(
             "rollback_refused",
@@ -1050,6 +1187,7 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
             librenms_url=plan.get("librenms_url"),
             reason=str(exc),
             force=force,
+            **_changed(exc),
         )
         raise
 
@@ -1136,22 +1274,42 @@ def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dic
     tools returns at once, without reading settings or plans. A callback that raises would block the call it was
     asked about, so neither branch raises; when in doubt they block. An approval asked for is audited as
     ``approval_requested``: Hermes may refuse it (cron, unattended platforms) without a ``post_approval_response``,
-    and the attempt must still show in the trail. A block is audited as the refusal it is."""
+    and the attempt must still show in the trail. A block is audited as the refusal it is. For every apply and
+    rollback it also keeps what the prompt shows, or that none is shown, for :func:`bind_approval` to hand the
+    handler."""
     if not isinstance(tool_name, str) or tool_name not in _HOOKED_TOOLS:
         return None
     if tool_name not in WRITE_TOOLS:
         return _terminal_guard(tool_name, args, kwargs)
     directive = _approval(tool_name, args)
+    approve = directive is not None and directive["action"] == "approve"
+    found = _RULE_KEY_RE.search(directive["rule_key"]) if approve else None
+    _note_shown(tool_name, args, kwargs, found)
     if directive is None:
         return None
-    if directive["action"] == "approve":
-        found = _RULE_KEY_RE.search(directive["rule_key"])
-        plan_id = found.group("plan") if found is not None else None
-        _audit_hook("approval_requested", kwargs, plan_id, None, tool=tool_name, rule_key=directive["rule_key"])
+    if approve:
+        plan_id, digest = (found.group("plan"), found.group("digest")) if found is not None else (None, None)
+        _audit_hook(
+            "approval_requested", kwargs, plan_id, None, tool=tool_name, rule_key=directive["rule_key"], digest=digest
+        )
     else:
         event = "apply_refused" if tool_name == "librenms_apply" else "rollback_refused"
         _audit_hook(event, kwargs, None, None, reason=directive["message"], tool=tool_name)
     return directive
+
+
+def bind_approval(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dict[str, Any] | None:
+    """Hermes ``pre_tool_call``, registered after :func:`pre_tool_call`: hand the handler of an apply or rollback what
+    that call's approval prompt showed (plan, variant, content digest), or null when it showed none, in
+    :data:`APPROVAL_ARG` by a ``modify`` directive, replacing whatever the model wrote there. The handler refuses a
+    call that is not the one the prompt showed, and the claim a plan whose content digest is not the one the prompt
+    showed. Nothing for every other tool; never raises."""
+    if not isinstance(tool_name, str) or tool_name not in WRITE_TOOLS:
+        return None
+    key = _call_key(tool_name, args, kwargs)
+    with _pending_lock:
+        shown = _pending.pop(key, None)
+    return {"action": "modify", "args": {APPROVAL_ARG: shown._asdict() if shown is not None else None}}
 
 
 def _audit_hook(
@@ -1168,11 +1326,12 @@ def _audit_hook(
 
 def _approval(tool: str, args: Any) -> Dict[str, Any] | None:
     """``approve`` with a summary of the plan (apply) or of what its rollback reverts, when ``require_approval`` is
-    on in ``full`` mode; in the other modes the handler refuses the model and audits it. The rule_key names the plan
-    and the flag that changes what runs, so an "always" answer never carries over to another plan or variant.
-    A ``plan_id`` that is not a saved plan's exact id is blocked with the handler's own refusal, and so is any
-    failure to load the plan: asking about a plan nobody can be shown would let one that comes to match while the
-    prompt is open run unseen."""
+    on in ``full`` mode; in the other modes the handler refuses the model and audits it. The rule_key names the plan,
+    the flag that changes what runs and the content digest of the plan as loaded for the message
+    (:func:`store.content_digest`), so a "session" or "always" answer never carries over to another plan, variant
+    or content: a plan edited after the answer is asked about again. A ``plan_id`` that is not a saved plan's exact
+    id is blocked with the handler's own refusal, and so is any failure to load the plan: asking about a plan nobody
+    can be shown would let one that comes to match while the prompt is open run unseen."""
     action = "apply" if tool == "librenms_apply" else "rollback"
     try:
         settings = get_settings()
@@ -1184,13 +1343,14 @@ def _approval(tool: str, args: Any) -> Dict[str, Any] | None:
         plan_id, plan, candidates = find_plan(get_store(), args.get("plan_id"), exact=True)
         if plan_id is None or plan is None:
             return {"action": "block", "message": _unknown(args.get("plan_id"), candidates)}
+        digest = content_digest(plan)  # of the one load the message is made from
         if tool == "librenms_apply":
             rollback = parse_bool(args.get("rollback_on_failure"), True)
             message, variant = _apply_approval(plan, plan_id, rollback), "rb" if rollback else "norb"
         else:
             force = parse_bool(args.get("force"), False)
             message, variant = _rollback_approval(plan, plan_id, force), "force" if force else "safe"
-        return {"action": "approve", "message": message, "rule_key": f"librenms:{tool}:{plan_id}:{variant}"}
+        return {"action": "approve", "message": message, "rule_key": f"librenms:{tool}:{plan_id}:{variant}:{digest}"}
     except Exception as exc:
         error_id = new_error_id()
         logger.warning("librenms approval hook: plan not loaded (%s)", error_id, exc_info=exc)
@@ -1396,8 +1556,8 @@ def pre_llm_call(**kwargs: Any) -> None:
 
 def post_approval_response(**kwargs: Any) -> None:
     """Hermes ``post_approval_response``: audit the human's answer to an approval about LibreNMS (our rule keys, or a
-    command that mentions librenms) as ``approval_decided``. Records the choice, tool and plan id, never the command
-    text."""
+    command that mentions librenms) as ``approval_decided``. Records the choice, tool, plan id and the content digest
+    the answer covers, never the command text."""
     try:
         keys = [str(key) for key in [kwargs.get("pattern_key"), *(kwargs.get("pattern_keys") or [])] if key]
         ours = next((found for found in map(_RULE_KEY_RE.search, keys) if found), None)
@@ -1405,7 +1565,9 @@ def post_approval_response(**kwargs: Any) -> None:
         if ours is None and not mentioned:
             return None
         plan_id = ours.group("plan") if ours is not None and ours.group("plan") != "unresolved" else None
-        where = {"rule_key": ours.group("key")} if ours is not None else {"pattern_key": keys[0] if keys else None}
+        where: Dict[str, Any] = {"pattern_key": keys[0] if keys else None}
+        if ours is not None:
+            where = {"rule_key": ours.group("key"), "digest": ours.group("digest")}
         audit.emit(
             "approval_decided",
             plan_id=plan_id,
@@ -1422,8 +1584,11 @@ def post_approval_response(**kwargs: Any) -> None:
     return None
 
 
-HOOKS = {
-    "pre_tool_call": pre_tool_call,
-    "pre_llm_call": pre_llm_call,
-    "post_approval_response": post_approval_response,
-}
+# (hook, callback) in the order they are registered: bind_approval after pre_tool_call, whose prompt it binds the
+# handler to.
+HOOKS = (
+    ("pre_tool_call", pre_tool_call),
+    ("pre_tool_call", bind_approval),
+    ("pre_llm_call", pre_llm_call),
+    ("post_approval_response", post_approval_response),
+)

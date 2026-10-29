@@ -393,6 +393,50 @@ class Files(StoreTestCase):
         self.store.save(plan)
         self.assertEqual(self.store.load(plan["id"]), plan)
 
+    def test_the_content_digest_is_what_runs_and_what_was_shown(self):
+        # the approval hook keys a person's answer to it, and the claim compares it again: every key that decides what
+        # an apply or rollback does changes it, a save, a dry-run check or who planned it does not
+        plan = _plan(
+            "lnp-20261028T190000Z-d1d1",
+            version=1,
+            description="move sw1",
+            librenms_url="https://librenms.test",
+            summary={"update": 1},
+            warnings=["[0] note"],
+            irreversible=[],
+            steps=[{"index": 0, "action": "update", "changes": {"purpose": {"from": "core", "to": "spine"}}}],
+            requested_by={"kind": "model"},
+            audit={"plugin_version": "0.10.2"},
+        )
+        self.store.create(plan)
+        digest = store_mod.content_digest(self.store.load(plan["id"]))
+        self.assertRegex(digest, r"^[0-9a-f]{32}$")
+        self.assertEqual(store_mod.content_digest(plan), digest)  # the same from memory as from the file
+        loaded = self.store.load(plan["id"])
+        loaded.update(requested_by={"kind": "operator"}, audit={}, checks=[{"conflicts": []}], apply=None)
+        self.store.save(loaded)  # a new updated_at too
+        self.assertEqual(store_mod.content_digest(self.store.load(plan["id"])), digest)
+        changes = {
+            "id": "lnp-20261028T190000Z-d2d2",
+            "version": 2,
+            "status": "applied",
+            "created_at": "2026-10-28T19:00:01Z",
+            "librenms_url": "https://other.test",
+            "description": "move sw2",
+            "summary": {"update": 2},
+            "warnings": [],
+            "irreversible": [0],
+            "steps": [{"index": 0, "action": "update", "changes": {"purpose": {"from": "core", "to": "edge"}}}],
+            "journal": [{"index": 0, "status": "done"}],
+        }
+        self.assertEqual(set(changes), set(store_mod.CONTENT_KEYS))
+        for key, value in changes.items():
+            self.assertNotEqual(store_mod.content_digest({**plan, key: value}), digest, key)
+        # key order does not matter, and a lone surrogate (which UTF-8 cannot encode) is digested like other text
+        self.assertEqual(store_mod.content_digest(dict(reversed(list(plan.items())))), digest)
+        odd = {**plan, "description": "x\ud800"}
+        self.assertNotEqual(store_mod.content_digest(odd), store_mod.content_digest({**plan, "description": "x"}))
+
     def test_ids_that_could_escape_the_directory_are_refused(self):
         for bad in ("", "../etc/passwd", "a/b", "a\\b", "lnp-..-x"):
             with self.assertRaises(ValueError):

@@ -1,6 +1,7 @@
 """The hook callbacks (design §16.8, §16.9): the approval directive for librenms_apply / librenms_rollback (dry_run
-parsing, rule keys per plan and variant, the message laid out for what each Hermes surface shows, escaping and
-clipping, exact plan ids, blocking what does not resolve and failing closed), the terminal guard against ``hermes
+parsing, rule keys per plan, variant and content, the message laid out for what each Hermes surface shows, escaping
+and clipping, exact plan ids, blocking what does not resolve and failing closed), what bind_approval hands the
+handler and the handler's refusal of a call or plan other than the prompt showed, the terminal guard against ``hermes
 librenms apply|rollback`` in a command, code or a background shell's input (in linear time), no work for unrelated
 tools, the request cache behind ``pre_llm_call``, and ``approval_decided`` from ``post_approval_response``."""
 
@@ -9,6 +10,7 @@ import json
 import os
 import re
 import textwrap
+import threading
 import time
 import unittest
 
@@ -16,6 +18,8 @@ from .base import PluginTestCase, _restore_env
 from .fake_librenms import TOKEN
 
 HOOK_KWARGS = {"task_id": "t1", "session_id": "s1", "tool_call_id": "call-1", "turn_id": "turn-1"}
+CALL_KWARGS = {"task_id": "t1", "session_id": "s1"}  # what Hermes then passes the handler of the same call
+SPINE = {"op": "update", "resource": "device", "id": 1, "data": {"purpose": "spine"}}
 
 
 def unresolved_key(tool, raw):
@@ -36,6 +40,10 @@ class HookCase(PluginTestCase):
         pid = self.planned()
         self.assertTrue(json.loads(self.handlers.librenms_apply({"plan_id": pid}))["success"])
         return pid
+
+    def key(self, tool, pid, variant):
+        """The rule key the hook returns for *pid* as it is saved now."""
+        return f"librenms:{tool}:{pid}:{variant}:{self.store_mod.content_digest(self.store.load(pid))}"
 
     def stub(self, name, replacement):
         """Replace the handlers module's *name* for this test (a hand-written double)."""
@@ -59,7 +67,7 @@ class ApplyApproval(HookCase):
     def test_rule_key_and_message_name_the_plan_and_the_variant(self):
         pid = self.planned()
         directive = self.hook("librenms_apply", {"plan_id": pid})
-        self.assertEqual(directive["rule_key"], f"librenms:librenms_apply:{pid}:rb")
+        self.assertEqual(directive["rule_key"], self.key("librenms_apply", pid, "rb"))
         self.assertEqual(
             directive["message"].split("\n"),
             [
@@ -72,7 +80,7 @@ class ApplyApproval(HookCase):
         )
         for value, variant in ((False, "norb"), ("no", "norb"), ("off", "norb"), (True, "rb"), ("maybe", "rb")):
             directive = self.hook("librenms_apply", {"plan_id": pid, "rollback_on_failure": value})
-            self.assertEqual(directive["rule_key"], f"librenms:librenms_apply:{pid}:{variant}", repr(value))
+            self.assertEqual(directive["rule_key"], self.key("librenms_apply", pid, variant), repr(value))
             self.assertIn(f"rollback_on_failure={'true' if variant == 'rb' else 'false'}", directive["message"])
 
     def test_a_fragment_is_refused_naming_the_full_id(self):
@@ -87,7 +95,7 @@ class ApplyApproval(HookCase):
             },
         )
         self.assertEqual(
-            self.hook("librenms_apply", {"plan_id": f"  {pid} "})["rule_key"], f"librenms:librenms_apply:{pid}:rb"
+            self.hook("librenms_apply", {"plan_id": f"  {pid} "})["rule_key"], self.key("librenms_apply", pid, "rb")
         )
 
     def test_irreversible_steps_are_named_in_the_header_and_marked(self):
@@ -299,6 +307,209 @@ class ApplyApproval(HookCase):
         self.assertTrue(lines[-2].endswith("…"))
 
 
+class ApprovalBoundToContent(HookCase):
+    """What a person approves is the plan as the prompt showed it: the rule key carries the plan's content digest, so
+    a "session" or "always" answer covers that content only, and bind_approval hands the handler of the same call what
+    the prompt showed, which it holds the call and the plan under the claim to."""
+
+    def ask(self, tool, args, **ids):
+        """Our two pre_tool_call callbacks as Hermes runs them for one call (HOOK_KWARGS, *ids* replacing some): the
+        first's directive, and the arguments the handler is then given (the second's modify)."""
+        hook_kwargs = {**HOOK_KWARGS, **ids}
+        directive = self.handlers.pre_tool_call(tool_name=tool, args=args, **hook_kwargs)
+        return directive, self.bound(tool, args, **ids)
+
+    def bound(self, tool, args, **ids):
+        modify = self.handlers.bind_approval(tool_name=tool, args=args, **{**HOOK_KWARGS, **ids})
+        self.assertEqual(modify["action"], "modify")
+        return {**args, **modify["args"]}
+
+    def handle(self, tool, args, **kwargs):
+        """The handler as Hermes then calls it."""
+        return json.loads(self.handlers.HANDLERS[tool](args, **{**CALL_KWARGS, **kwargs}))
+
+    def decommission(self, pid):
+        """Change the saved plan as a file tool could: its step now sets purpose decommissioned."""
+        plan = self.store.load(pid)
+        plan["steps"][0]["changes"]["purpose"]["to"] = "decommissioned"
+        plan["steps"][0]["payload"]["data"] = ["decommissioned"]
+        self.store.save(plan)
+
+    def digest(self, pid):
+        return self.store_mod.content_digest(self.store.load(pid))
+
+    def test_a_remembered_answer_does_not_cover_an_edited_plan(self):
+        pid = self.planned()
+        first = self.hook("librenms_apply", {"plan_id": pid})
+        self.decommission(pid)
+        second = self.hook("librenms_apply", {"plan_id": pid})
+        # Hermes remembers "session" and "always" by rule key: the edited plan is asked about again, and shown
+        self.assertNotEqual(first["rule_key"], second["rule_key"])
+        self.assertEqual(second["rule_key"], f"librenms:librenms_apply:{pid}:rb:{self.digest(pid)}")
+        self.assertIn('[0] purpose: "core" -> "decommissioned"', second["message"])
+        # what does not change what runs leaves the key as it was: a dry run's check, a new updated_at
+        self.handle("librenms_apply", {"plan_id": pid, "dry_run": True})
+        self.assertEqual(self.hook("librenms_apply", {"plan_id": pid})["rule_key"], second["rule_key"])
+        # another plan with the same steps has its own key (its id and stamp differ)
+        twin = self.planned("decommissioned")
+        self.assertNotEqual(self.hook("librenms_apply", {"plan_id": twin})["rule_key"][-32:], self.digest(pid))
+        self.assertEqual(
+            [(event["plan_id"], event["digest"]) for event in self.events("approval_requested")],
+            [
+                (pid, first["rule_key"][-32:]),
+                (pid, self.digest(pid)),
+                (pid, self.digest(pid)),
+                (twin, self.digest(twin)),
+            ],
+        )
+
+    def test_the_handler_is_handed_what_the_prompt_showed(self):
+        pid = self.planned()
+        directive, args = self.ask("librenms_apply", {"plan_id": pid, "rollback_on_failure": "no"})
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(
+            args,
+            {
+                "plan_id": pid,
+                "rollback_on_failure": "no",
+                self.handlers.APPROVAL_ARG: {"plan_id": pid, "variant": "norb", "digest": self.digest(pid)},
+            },
+        )
+        # no prompt (a dry run, approval off, a block): null, also over what the model wrote there itself
+        forged = {"plan_id": pid, "variant": "rb", "digest": "0" * 32}
+        for args in (
+            {"plan_id": pid, "dry_run": True, self.handlers.APPROVAL_ARG: forged},
+            {"plan_id": "lnp-nope", self.handlers.APPROVAL_ARG: forged},
+        ):
+            self.assertIsNone(self.ask("librenms_apply", args)[1][self.handlers.APPROVAL_ARG], args)
+        self.configure(require_approval=False)
+        self.assertIsNone(self.ask("librenms_rollback", {"plan_id": pid})[1][self.handlers.APPROVAL_ARG])
+        # taken once, by the call it was made for: a call with other ids finds none
+        self.configure()
+        self.hook("librenms_apply", {"plan_id": pid})
+        self.assertIsNone(
+            self.bound("librenms_apply", {"plan_id": pid}, tool_call_id="call-2")[self.handlers.APPROVAL_ARG]
+        )
+        self.assertIsNone(self.bound("librenms_rollback", {"plan_id": pid})[self.handlers.APPROVAL_ARG])
+        self.assertIsNotNone(self.bound("librenms_apply", {"plan_id": pid})[self.handlers.APPROVAL_ARG])
+        self.assertIsNone(self.bound("librenms_apply", {"plan_id": pid})[self.handlers.APPROVAL_ARG])
+        # every other tool is left alone, without a lock or a read
+        self.assertIsNone(self.handlers.bind_approval(tool_name="terminal", args={"command": "ls"}, **HOOK_KWARGS))
+        self.assertIsNone(self.handlers.bind_approval(tool_name=None, args=None))
+
+    def test_a_plan_edited_while_the_prompt_is_open_is_refused_at_apply(self):
+        pid = self.planned()
+        shown, args = self.ask("librenms_apply", {"plan_id": pid})
+        self.decommission(pid)  # the person reads "spine" and says yes
+        out = self.handle("librenms_apply", args)
+        self.assertEqual((out["success"], out["refused"]), (False, True))
+        self.assertTrue(out["error"].startswith(f"plan {pid} changed after the approval prompt showed it"), out)
+        self.assertEqual((self.fake.writes(), self.store.load(pid)["status"]), ([], "planned"))
+        [refused] = self.events("apply_refused")
+        self.assertEqual(
+            (refused["reason"], refused["approved_digest"], refused["digest"]),
+            (out["error"], shown["rule_key"][-32:], self.digest(pid)),
+        )
+        # asked again, the person sees what would run now, and it runs
+        again, args = self.ask("librenms_apply", {"plan_id": pid})
+        self.assertIn('[0] purpose: "core" -> "decommissioned"', again["message"])
+        self.assertTrue(self.handle("librenms_apply", args)["success"])
+        self.assertEqual(self.fake.tables["devices"][1]["purpose"], "decommissioned")
+
+    def test_the_plan_as_shown_applies_and_rolls_back(self):
+        pid = self.planned()
+        _directive, args = self.ask("librenms_apply", {"plan_id": pid, "rollback_on_failure": "false"})
+        self.handle("librenms_apply", {"plan_id": pid, "dry_run": True}, _actor={"kind": "operator"})  # in between
+        out = self.handle("librenms_apply", args)
+        self.assertTrue(out["success"], out)
+        self.assertEqual(self.store.load(pid)["apply"]["rollback_on_failure"], False)
+        _directive, args = self.ask("librenms_rollback", {"plan_id": pid})
+        self.assertTrue(self.handle("librenms_rollback", args)["success"])
+        self.assertEqual(self.fake.tables["devices"][1]["purpose"], "core")
+
+    def test_a_rollback_whose_journal_changed_while_the_prompt_was_open_is_refused(self):
+        pid = self.applied()
+        _directive, args = self.ask("librenms_rollback", {"plan_id": pid, "force": True})
+        plan = self.store.load(pid)
+        plan["journal"][0]["inverse"]["data"]["purpose"] = "decommissioned"  # what the revert would write
+        self.store.save(plan)
+        out = self.handle("librenms_rollback", args)
+        self.assertEqual((out["success"], out["refused"]), (False, True))
+        self.assertTrue(out["error"].startswith(f"plan {pid} changed after the approval prompt showed it"), out)
+        self.assertIn("nothing was reverted", out["error"])
+        self.assertEqual(
+            (self.store.load(pid)["status"], self.fake.tables["devices"][1]["purpose"]), ("applied", "spine")
+        )
+        [refused] = self.events("rollback_refused")
+        self.assertEqual((refused["force"], refused["digest"]), (True, self.digest(pid)))
+
+    def test_a_call_changed_between_the_prompt_and_the_handler_is_refused(self):
+        # another plugin's modify directive, or tool middleware, could hand the handler other arguments
+        pid, other = self.planned(), self.planned("leaf")
+        for shown, called, said in (
+            ({"plan_id": pid}, {"plan_id": other}, f"(plan {pid}, rollback_on_failure=true)"),
+            ({"plan_id": pid}, {"plan_id": pid, "rollback_on_failure": False}, "rollback_on_failure=true"),
+            ({"plan_id": pid, "rollback_on_failure": "no"}, {"rollback_on_failure": True}, "rollback_on_failure=false"),
+        ):
+            _directive, args = self.ask("librenms_apply", shown)
+            out = self.handle("librenms_apply", {**args, **called})
+            self.assertEqual((out["success"], out["refused"]), (False, True), called)
+            self.assertTrue(
+                out["error"].startswith("apply refused: this call is not the one the approval prompt showed"), out
+            )
+            self.assertIn(said, out["error"])
+            self.assertTrue(out["error"].endswith("Call librenms_apply again so the user is asked about what runs"))
+        applied = self.applied()
+        _directive, args = self.ask("librenms_rollback", {"plan_id": applied})
+        out = self.handle("librenms_rollback", {**args, "force": True})
+        self.assertIn(f"(plan {applied}, force=false); nothing was reverted", out["error"])
+        self.assertEqual(len(self.events("apply_refused")) + len(self.events("rollback_refused")), 4)
+        self.assertEqual(len(self.fake.writes()), 1)  # applied()'s own
+        # a dry run writes nothing, so it is not held to a prompt
+        _directive, args = self.ask("librenms_apply", {"plan_id": pid})
+        self.assertTrue(self.handle("librenms_apply", {**args, "dry_run": True})["dry_run"])
+
+    def test_concurrent_calls_each_get_what_their_own_prompt_showed(self):
+        # Hermes may run two calls' hooks before either handler; each callback on a worker thread of its own
+        pid, other = self.planned(), self.plan([{**SPINE, "id": 2}])["id"]
+        first = {"plan_id": pid}
+        second = {"plan_id": other, "rollback_on_failure": False}
+        worker = threading.Thread(target=self.hook, args=("librenms_apply", first))
+        worker.start()
+        worker.join(10)
+        self.handlers.pre_tool_call(tool_name="librenms_apply", args=second, **{**HOOK_KWARGS, "tool_call_id": "c2"})
+        bound_second = self.bound("librenms_apply", second, tool_call_id="c2")
+        bound_first = self.bound("librenms_apply", first)
+        self.assertEqual(bound_first[self.handlers.APPROVAL_ARG]["plan_id"], pid)
+        self.assertEqual(bound_second[self.handlers.APPROVAL_ARG]["variant"], "norb")
+        self.decommission(pid)
+        self.assertIn("changed after the approval prompt", self.handle("librenms_apply", bound_first)["error"])
+        self.assertTrue(self.handle("librenms_apply", bound_second)["success"])
+        # without a tool_call_id (handle_function_call called directly) the arguments tell two calls apart
+        third = self.plan([{**SPINE, "id": 3}])["id"]
+        for args in ({"plan_id": pid}, {"plan_id": third}):
+            self.handlers.pre_tool_call(tool_name="librenms_apply", args=args, **CALL_KWARGS)
+        for plan_id in (third, pid):
+            modify = self.handlers.bind_approval(tool_name="librenms_apply", args={"plan_id": plan_id}, **CALL_KWARGS)
+            self.assertEqual(modify["args"][self.handlers.APPROVAL_ARG]["plan_id"], plan_id)
+
+    def test_what_the_model_writes_there_can_only_refuse(self):
+        # a Hermes without modify would hand the handler the model's own value: it adds a check, never removes one
+        pid = self.planned()
+        forged = {"plan_id": pid, "variant": "rb", "digest": "0" * 32}
+        out = self.handle("librenms_apply", {"plan_id": pid, self.handlers.APPROVAL_ARG: forged})
+        self.assertIn("changed after the approval prompt showed it", out["error"])
+        for junk in ("x", ["a"], {"plan_id": pid}, {"plan_id": pid, "variant": "rb", "digest": 5}):
+            self.assertEqual(self.store.load(pid)["status"], "planned")
+            args = {"plan_id": pid, "dry_run": True, self.handlers.APPROVAL_ARG: junk}
+            self.assertTrue(self.handle("librenms_apply", args)["success"], junk)
+        # an operator's command is not held to it either way
+        out = self.handle(
+            "librenms_apply", {"plan_id": pid, self.handlers.APPROVAL_ARG: forged}, _actor={"kind": "operator"}
+        )
+        self.assertTrue(out["success"], out)
+
+
 class ApprovalRequested(HookCase):
     """Hermes may refuse an approval without asking anyone (cron, unattended platforms), and then no
     post_approval_response follows: the request itself is audited."""
@@ -336,7 +547,7 @@ class ApprovalRequested(HookCase):
         self.addCleanup(setattr, self.audit, "capture_actor", original)
         with self.assertLogs(self.handlers.logger, "WARNING"):
             self.assertEqual(
-                self.hook("librenms_apply", {"plan_id": pid})["rule_key"], f"librenms:librenms_apply:{pid}:rb"
+                self.hook("librenms_apply", {"plan_id": pid})["rule_key"], self.key("librenms_apply", pid, "rb")
             )
         with self.assertLogs(self.handlers.logger, "WARNING"):
             directive = self.hook("terminal", {"command": f"hermes librenms apply {pid}"})
@@ -350,7 +561,7 @@ class RollbackApproval(HookCase):
     def test_rule_key_force_and_safe(self):
         pid = self.applied()
         directive = self.hook("librenms_rollback", {"plan_id": pid})
-        self.assertEqual(directive["rule_key"], f"librenms:librenms_rollback:{pid}:safe")
+        self.assertEqual(directive["rule_key"], self.key("librenms_rollback", pid, "safe"))
         lines = directive["message"].split("\n")
         self.assertEqual(
             lines[:2],
@@ -360,7 +571,7 @@ class RollbackApproval(HookCase):
         self.assertEqual(lines[-1], f"Full plan: /librenms show {pid}")
         for value, variant in ((True, "force"), ("1", "force"), ("on", "force"), (1, "safe"), ("no", "safe")):
             directive = self.hook("librenms_rollback", {"plan_id": pid, "force": value})
-            self.assertEqual(directive["rule_key"], f"librenms:librenms_rollback:{pid}:{variant}", repr(value))
+            self.assertEqual(directive["rule_key"], self.key("librenms_rollback", pid, variant), repr(value))
             forced = "FORCE: overwrites edits made after the apply" in directive["message"].split("\n")[0]
             self.assertEqual(forced, variant == "force")
         self.assertNotIn("dry_run", self.hook("librenms_rollback", {"plan_id": pid, "dry_run": True}))
@@ -582,6 +793,7 @@ class UnrelatedTools(HookCase):
             (["terminal"], {}),
         ):
             self.assertIsNone(self.handlers.pre_tool_call(tool_name=tool, args=args, **HOOK_KWARGS), tool)
+            self.assertIsNone(self.handlers.bind_approval(tool_name=tool, args=args, **HOOK_KWARGS), tool)
         self.assertEqual(touched, [])
         self.assertEqual(self.events(), [])
 
@@ -648,17 +860,22 @@ class ApprovalDecided(HookCase):
             (event["plan_id"], event["tool"], event["choice"], event["rule_key"], event["surface"]),
             (pid, "librenms_apply", "once", directive["rule_key"], "cli"),
         )
+        self.assertEqual(event["digest"], self.store_mod.content_digest(self.store.load(pid)))  # what "once" covered
         self.assertNotIn("purpose", json.dumps(event))
         self.assertNotIn("plugin approval rule", json.dumps(event))
 
-    def test_unresolved_and_mentioned_approvals(self):
+    def test_unresolved_older_and_mentioned_approvals(self):
         key = unresolved_key("librenms_rollback", "nope")
         self.respond(pattern_key=f"plugin_rule:{key}", choice="deny")
+        older = "librenms:librenms_apply:lnp-20261028T190000Z-ab12:rb"  # 0.10.x keyed no content digest
+        self.respond(pattern_key=f"plugin_rule:{older}", choice="always")
         self.respond(pattern_key="recursive delete", command="rm -rf ~/.hermes/plugin-data/librenms", choice="always")
-        unresolved, mentioned = self.events("approval_decided")
+        unresolved, old, mentioned = self.events("approval_decided")
         self.assertEqual(
-            (unresolved["plan_id"], unresolved["tool"], unresolved["rule_key"]), (None, "librenms_rollback", key)
+            (unresolved["plan_id"], unresolved["tool"], unresolved["rule_key"], unresolved["digest"]),
+            (None, "librenms_rollback", key, None),
         )
+        self.assertEqual((old["plan_id"], old["rule_key"], old["digest"]), ("lnp-20261028T190000Z-ab12", older, None))
         self.assertEqual(
             (mentioned["tool"], mentioned["pattern_key"], mentioned["choice"]), (None, "recursive delete", "always")
         )

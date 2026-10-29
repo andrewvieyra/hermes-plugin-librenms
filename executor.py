@@ -4,6 +4,8 @@ Guarantees the executor enforces on every run:
 
 * A plan applies at most once, only against the LibreNMS it was built for, only while it is fresh and only while the
   operator's gates still allow every step: ``planned -> applying`` is flipped under the store lock.
+* A call a person approved runs only the plan they were shown: under the claim, the plan's content digest must be
+  the one the approval prompt showed (``approved_digest``), for an apply and a rollback alike.
 * One run at a time. A run holds its plan's run lock from the claim to its last save, and no apply or rollback
   starts while another plan's run is alive. A refused claim drops the run lock it took before the store lock. A plan left ``applying`` or ``rolling_back`` whose run lock is free
   belongs to a run that died; rollback recovers it.
@@ -33,7 +35,7 @@ from .planner import gate_errors
 from .redact import clip, one_line
 from .resources import PartialWrite, Resource, StepError, get_resource, settles_at
 from .settings import Settings, get_settings
-from .store import IN_FLIGHT, PlanStore, RunLockBusy, now_iso
+from .store import IN_FLIGHT, PlanStore, RunLockBusy, content_digest, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,16 @@ EVENTLOG_MESSAGE_CHARS = 300  # as escaped (redact.clip): what the model reads o
 class ExecutionRefused(Exception):
     """Preflight or the claim rejected the request (wrong status, stale plan, other LibreNMS, a gate, a run in
     progress ...). Nothing was written."""
+
+
+class PlanChanged(ExecutionRefused):
+    """The plan under the claim is not the one the approval prompt showed: its :func:`store.content_digest` is
+    *found*, the prompt's was *approved*."""
+
+    def __init__(self, message: str, approved: str, found: str) -> None:
+        super().__init__(message)
+        self.approved = approved
+        self.found = found
 
 
 def _emit(event: str, plan: Dict[str, Any], actor: Dict[str, Any] | None, **details: Any) -> None:
@@ -207,6 +219,25 @@ def _hold_run_lock(store: PlanStore, plan_id: str, claim: contextlib.ExitStack) 
         raise ExecutionRefused(
             f"plan {plan_id} is still being applied by another process; try again when it finishes"
         ) from exc
+
+
+def _refuse_changed(plan: Dict[str, Any], approved_digest: str | None, action: str) -> None:
+    """Refuse when *plan*, as loaded under the claim, is not the plan the approval prompt showed: its content digest
+    is not *approved_digest* (none when no prompt was shown for this call). Checked under the store lock, after the
+    last load before the run, so nothing can change the file between this check and the run's first save."""
+    if approved_digest is None:
+        return
+    found = content_digest(plan)
+    if found == approved_digest:
+        return
+    shows = "the plan" if action == "apply" else "what its rollback reverts"
+    raise PlanChanged(
+        f"plan {plan.get('id')} changed after the approval prompt showed it, so the approval does not cover it; "
+        f"nothing was {'applied' if action == 'apply' else 'reverted'}. Show the user {shows} as it is now "
+        f"(librenms_plans with this plan_id) and call librenms_{action} again only if they say yes to it",
+        approved_digest,
+        found,
+    )
 
 
 def _refuse_concurrent(store: PlanStore, plan_id: str) -> None:
@@ -422,9 +453,12 @@ def apply_plan(
     rollback_on_failure: bool = True,
     dry_run: bool = False,
     actor: Dict[str, Any] | None = None,
+    approved_digest: str | None = None,
 ) -> Dict[str, Any]:
     """Apply *plan* in order. Mutates and persists *plan*; returns it. Raises ExecutionRefused when preflight or
-    the claim refuses; every LibreNMS error during the run is journaled instead."""
+    the claim refuses; every LibreNMS error during the run is journaled instead. *approved_digest* is the content
+    digest of the plan the approval prompt showed for this call: the claim refuses (:class:`PlanChanged`) a plan
+    that no longer has it."""
     preflight_apply(plan, client, settings)
     if dry_run:
         return _dry_run(client, plan, store, actor)
@@ -437,6 +471,7 @@ def apply_plan(
             current = store.load(plan["id"]) or plan
             if current.get("status") not in APPLYABLE:
                 raise ExecutionRefused(f"plan {plan['id']} is {current.get('status')}; refusing to apply twice")
+            _refuse_changed(current, approved_digest, "apply")
             _refuse_concurrent(store, plan["id"])
             plan.update(current)
             plan["status"] = "applying"
@@ -578,9 +613,13 @@ def rollback_plan(
     force: bool = False,
     reason: str = "",
     actor: Dict[str, Any] | None = None,
+    approved_digest: str | None = None,
 ) -> Dict[str, Any]:
     """Revert every entry that wrote and is not settled yet, in reverse order. Mutates and persists *plan*; returns
-    it. A plan left in flight by a dead run is recovered first. Raises ExecutionRefused when the claim refuses."""
+    it. A plan left in flight by a dead run is recovered first. Raises ExecutionRefused when the claim refuses, and
+    :class:`PlanChanged` when the plan under the claim no longer has *approved_digest*, the content digest of the
+    plan the approval prompt showed for this call (its journal included: an apply that went on writing after the
+    prompt leaves more to revert than it showed)."""
     settings = settings if settings is not None else get_settings()
     if plan.get("status") not in ROLLBACKABLE + IN_FLIGHT:
         raise _not_rollbackable(plan["id"], plan.get("status"))
@@ -599,6 +638,7 @@ def rollback_plan(
                 )
             if not recovering and previous not in ROLLBACKABLE:
                 raise _not_rollbackable(plan["id"], previous)
+            _refuse_changed(current, approved_digest, "rollback")
             _refuse_concurrent(store, plan["id"])
             plan.update(current)
             dangling = _recover(plan) if recovering else []

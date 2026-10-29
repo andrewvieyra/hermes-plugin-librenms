@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Plan, review, apply and roll back LibreNMS changes with the librenms_* tools: devices, locations, device groups, services, alert rules, port descriptions, alert acknowledgements and maintenance windows, each written only through a plan the user has seen and said yes to. Load when the user wants to change something in LibreNMS; for questions that change nothing, load librenms:ask.
-version: 0.10.2
+version: 0.11.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -89,8 +89,11 @@ for changes; looking up what a change touches is step 1 below.
 5. **Apply.** `librenms_apply` with the full `plan_id` that `librenms_plan` returned (a fragment such as
    the last four characters is refused; `librenms_plans` finds the full id). Hermes may show its own
    approval prompt with the plan summary; that is a second check, not a substitute for step 4. If the user
-   denies it, stop and ask what they want. If the apply fails, report the failed step, the error and the
-   rollback outcome from the result. Do not retry blindly: re-query, re-plan, re-confirm.
+   denies it, stop and ask what they want. If the result says the plan changed after the approval prompt
+   showed it (an apply or a rollback), nothing ran and the plan file is no longer what the user approved:
+   tell them, show it as it is now (`librenms_plans` with the `plan_id`) and call again only on a new yes;
+   never edit a plan file yourself. If the apply fails, report the failed step, the error and the rollback
+   outcome from the result. Do not retry blindly: re-query, re-plan, re-confirm.
 6. **Verify.** Query the touched objects again and confirm the result matches the intent.
 7. **Rollback on request.** `librenms_rollback` with the full `plan_id`. Objects someone changed
    after the apply come back as conflicts; use `force: true` only if the user explicitly accepts overwriting

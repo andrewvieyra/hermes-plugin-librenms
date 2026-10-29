@@ -1,5 +1,5 @@
 name: librenms
-version: 0.10.2
+version: 0.11.0
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"
@@ -43,7 +43,7 @@ config_schema:
   require_approval:
     type: bool
     default: true
-    description: "In full mode, send every librenms_apply and librenms_rollback call to Hermes' approval prompt with the plan summary, one approval key per plan, and block `hermes librenms apply|rollback` run through the agent's terminal. Unattended runs follow Hermes' own approval policy (approvals.cron_mode, unattended_mode, single_query_mode)."
+    description: "In full mode, send every librenms_apply and librenms_rollback call to Hermes' approval prompt with the plan summary, one approval key per plan, choice and plan content (an answer never covers the plan once its file changes), and block `hermes librenms apply|rollback` run through the agent's terminal. Unattended runs follow Hermes' own approval policy (approvals.cron_mode, unattended_mode, single_query_mode)."
   allow_delete:
     type: bool
     default: false

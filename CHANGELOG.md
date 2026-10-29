@@ -6,6 +6,61 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-29
+
+Approvals bound to plan content (finding sec-approval-not-bound-to-plan-content).
+
+### Security
+- An approval covers the plan as the approval prompt showed it. The rule key named only the plan and the choice
+  (`librenms:librenms_apply:<id>:rb`), so a "session" or "always" answer for plan X let the next `librenms_apply` of
+  X through without a prompt after its file had been edited (by a `write_file` or `patch` call of the model, or
+  anything else running as the account), and nothing compared what ran with what was shown: the hook rendered the
+  prompt from one load of the file, the handler and the claim loaded it again. The rule key now ends with the plan's
+  content digest (`librenms:librenms_apply:<id>:rb:<digest>`, `librenms:librenms_rollback:<id>:safe:<digest>`), the
+  first 32 hex digits of a sha256 of the canonical JSON of the plan's `id`, `version`, `status`, `created_at`,
+  `librenms_url`, `description`, `summary`, `warnings`, `irreversible`, `steps` and `journal`
+  (`store.content_digest`); who planned it, the dry-run checks, the run records and `updated_at` are left out, so a
+  dry run between the prompt and the apply changes nothing. Once the file changes, Hermes asks again, showing what
+  would run now.
+- The handler of the approved call holds the plan it claims to what its prompt showed. A second `pre_tool_call`
+  callback, `bind_approval`, registered after the approval prompt's, hands the handler of the same call the plan,
+  choice and digest its prompt showed in the argument `_librenms_approval`, by Hermes' `modify` directive (`null`
+  when no prompt was shown, replacing whatever the model wrote there). Hermes runs each `pre_tool_call` callback on
+  a worker thread of its own, so the first keeps what it showed for the second keyed by the call (the tool,
+  `tool_call_id`, `session_id`, `task_id` and a digest of the arguments). The handler refuses a call whose plan or
+  choice is not the one the prompt showed (`apply refused: this call is not the one the approval prompt showed`:
+  another plugin's `modify`, tool middleware), and `apply_plan` and `rollback_plan` take `approved_digest` and
+  refuse, under the claim, after the last load before the run, a plan whose digest differs (`plan <id> changed after
+  the approval prompt showed it, so the approval does not cover it; nothing was applied`, `executor.PlanChanged`).
+  An edit made while the prompt was open, a rollback asked about while an apply was still journaling, and another
+  plan saved under the same id therefore never run on that approval; the file and status stay as they were, and the
+  run lock is let go as for any refused claim. The flock, single-apply and age checks are unchanged and still come
+  first. The value can only add checks: one the model wrote that no hook replaced (a Hermes without `modify`) can
+  make the call refuse, never let it run, and an operator's `/librenms` or `hermes librenms` command is not held to
+  it.
+
+### Added
+- Audit fields: `approval_requested` and `approval_decided` carry `digest` (the content the prompt showed or the
+  answer covers; `null` on `approval_decided` for a key of 0.10.x or earlier, which it still reads), and an
+  `apply_refused` or `rollback_refused` for a plan that changed carries `approved_digest` and `digest`.
+
+### Changed
+- `handlers.HOOKS` is a sequence of `(hook, callback)` pairs, registered in order: `pre_tool_call` twice
+  (`pre_tool_call`, then `bind_approval`), `pre_llm_call`, `post_approval_response`. `provides_hooks` is unchanged.
+- An "always" or "session" answer given before this release no longer lets a call through: its key, without a
+  digest, is never asked about again, so Hermes asks once more.
+- README (Safety model, Write modes, Compatibility), SECURITY.md (the approval row, "an earlier answer for the same
+  plan, choice and content", and what an edit made before the prompt still does), docs/architecture.md (the rule
+  key, binding the call, the guarantee), docs/audit.md (the fields, the refusals, a search for changed plans),
+  SKILL.md (what to do when the plan changed after the prompt) and plugin.yaml (`require_approval`) say so.
+- Tests: the digest (each content key changes it, nothing else does, two loads agree); the claim refusing a changed
+  plan for apply and rollback with nothing written and the run lock let go, another plan under the same id, and a
+  journal that grew after the prompt; the rule key per content; `bind_approval` handing over what was shown, null
+  for no prompt, once, per call (`tool_call_id`, or the arguments without one), concurrent calls apart; the handler
+  refusing a changed plan or a changed call, and a model-written value only refusing; the end-to-end scenario
+  through `bind_approval`; and, through Hermes' real dispatch (`make test-hermes`), a "session" answer not covering
+  the edited plan and an edit made while the prompt was open refused, then approved and applied when asked again.
+
 ## [0.10.2] - 2026-10-29
 
 What the review of 0.10.1 found in its own changes, each confirmed against the 0.10.1 code first.

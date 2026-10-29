@@ -18,7 +18,7 @@ from .helpers import load_plugin, submodule
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ("librenms_query", "librenms_report", "librenms_plan", "librenms_apply", "librenms_rollback", "librenms_plans")
-HOOKS = ("pre_tool_call", "pre_llm_call", "post_approval_response")
+HOOKS = ("pre_tool_call", "pre_tool_call", "pre_llm_call", "post_approval_response")
 SKILLS = {"workflow": REPO_ROOT / "SKILL.md", "ask": REPO_ROOT / "skills" / "ask" / "SKILL.md"}
 ENV = {"LIBRENMS_URL": "https://librenms.test", "LIBRENMS_TOKEN": "0123456789abcdef"}
 
@@ -107,7 +107,13 @@ class RegisterWithAFakeContext(PluginTestCase):
             write = schema["name"] in self.handlers.WRITE_TOOLS
             expected = self.handlers.check_write_requirements if write else self.handlers.check_requirements
             self.assertIs(tool["check_fn"], expected)
-        self.assertEqual(ctx.hooks, [(name, self.handlers.HOOKS[name]) for name in HOOKS])
+        self.assertEqual(ctx.hooks, list(self.handlers.HOOKS))
+        self.assertEqual([name for name, _callback in ctx.hooks], list(HOOKS))
+        # the approval prompt's callback first, then the one handing its handler what the prompt showed
+        self.assertEqual(
+            ctx.hooks[:2],
+            [("pre_tool_call", self.handlers.pre_tool_call), ("pre_tool_call", self.handlers.bind_approval)],
+        )
         command = ctx.commands["librenms"]
         self.assertIs(command["handler"], self.commands.slash_handler)
         for word in ("status", "plans", "show", "check", "apply", "rollback", "prune"):
@@ -191,7 +197,7 @@ class RegisterWithAFakeContext(PluginTestCase):
         ctx = self.register(FakeContext(old=True))
         self.assertEqual(len(ctx.tools), 6)
         self.assertIn("librenms", ctx.commands)
-        self.assertEqual((ctx.cli, ctx.skills, len(ctx.hooks)), ([], [], 3))
+        self.assertEqual((ctx.cli, ctx.skills, len(ctx.hooks)), ([], [], 4))
 
     def test_a_hermes_that_cannot_take_the_hooks_fails_the_load(self):
         # without pre_tool_call nothing would ask before apply or rollback; better no plugin than that
@@ -289,7 +295,7 @@ class LoadThroughPluginManager(unittest.TestCase):
         loaded = {p["name"]: p for p in mgr.list_plugins()}
         self.assertIn("librenms", loaded, loaded)
         self.assertIsNone(loaded["librenms"]["error"])
-        self.assertEqual((loaded["librenms"]["tools"], loaded["librenms"]["hooks"]), (6, 3))
+        self.assertEqual((loaded["librenms"]["tools"], loaded["librenms"]["hooks"]), (6, 4))
         self.assertGreaterEqual(loaded["librenms"]["commands"], 1)
         for name in TOOLS:
             self.assertIsNotNone(registry.get_schema(name), name)
@@ -312,12 +318,18 @@ class LoadThroughPluginManager(unittest.TestCase):
         self.assertTrue(out["success"])
         self.assertEqual(out["count"], 0)
 
-        # the approval hook as Hermes invokes it: ours blocks an unknown plan with the handler's refusal, and stays
-        # out of other tools
-        [directive] = mgr.invoke_hook(
+        # the approval hooks as Hermes invokes them: ours blocks an unknown plan with the handler's refusal (and hands
+        # the handler no prompt), and stays out of other tools
+        directives = mgr.invoke_hook(
             "pre_tool_call", tool_name="librenms_apply", args={"plan_id": "lnp-nope"}, task_id="t", session_id="s"
         )
-        self.assertEqual(directive, {"action": "block", "message": "unknown plan_id 'lnp-nope'"})
+        self.assertEqual(
+            directives,
+            [
+                {"action": "block", "message": "unknown plan_id 'lnp-nope'"},
+                {"action": "modify", "args": {"_librenms_approval": None}},
+            ],
+        )
         self.assertEqual(mgr.invoke_hook("pre_tool_call", tool_name="web_search", args={"query": "x"}), [])
 
     def test_under_the_default_tool_search_the_tools_are_deferred_yet_found_and_approved(self):
@@ -362,12 +374,104 @@ class LoadThroughPluginManager(unittest.TestCase):
         call = {"calls": [{"name": "librenms_apply", "arguments": {"plan_id": plan_id}}]}
         unwrapped = _unwrap_tool_search_call(agent, "tool_call", call)
         self.assertEqual(unwrapped, ("librenms_apply", {"plan_id": plan_id}, None))
-        [directive] = self.mgr.invoke_hook(
+        directive, bound = self.mgr.invoke_hook(
             "pre_tool_call", tool_name=unwrapped[0], args=unwrapped[1], task_id="t", session_id="s"
         )
         self.assertEqual(directive["action"], "approve")
         self.assertIn(f"librenms:librenms_apply:{plan_id}:", directive["rule_key"])
+        self.assertEqual(bound["args"]["_librenms_approval"]["plan_id"], plan_id)
         self.assertEqual(fake.writes(), [])
+
+    def _dispatching_plugin(self):
+        """The plugin loaded into the profile's own manager, its handlers on a fake LibreNMS, and a planned change
+        (device 1's purpose to spine): ``(plugin, fake, plan_id)``. (Tests using it are named to run after
+        test_registration_through_real_loader, as test_the_second_skill... says why.)"""
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        from tools.registry import registry
+
+        discover_plugins()
+        self.discovered = True
+        self.mgr = get_plugin_manager()
+        plugin = sys.modules[registry.get_entry("librenms_plan").handler.__module__.rpartition(".")[0]]
+        fake = seeded()
+        client = plugin.client.LibreNMSClient(fake.base_url, TOKEN, session=fake)
+        plugin.handlers.set_client_factory(lambda: client)
+        self.addCleanup(plugin.handlers.set_client_factory, None)
+        operation = {"op": "update", "resource": "device", "id": 1, "data": {"purpose": "spine"}}
+        planned = json.loads(registry.dispatch("librenms_plan", {"description": "t", "operations": [operation]}))
+        return plugin, fake, planned["plan_id"]
+
+    @staticmethod
+    def _decommission(plugin, plan_id):
+        """Change the saved plan as a file tool could: its step now sets purpose decommissioned."""
+        store = plugin.store.get_store()
+        plan = store.load(plan_id)
+        plan["steps"][0]["changes"]["purpose"]["to"] = "decommissioned"
+        plan["steps"][0]["payload"]["data"] = ["decommissioned"]
+        store.save(plan)
+
+    def test_the_session_answer_does_not_cover_the_plan_once_it_changed(self):
+        # Hermes' own gate, as it runs for a model's tool call: a "session" answer is remembered by rule key, and
+        # with nobody to ask (no interactive terminal here) whatever it does not cover is blocked
+        import model_tools
+        from tools import approval
+        from tools.approval_context import get_current_session_key
+
+        plugin, fake, plan_id = self._dispatching_plugin()
+        directive, _bound = self.mgr.invoke_hook("pre_tool_call", tool_name="librenms_apply", args={"plan_id": plan_id})
+        session_key = get_current_session_key()
+        approval.approve_session(session_key, f"plugin_rule:{directive['rule_key']}")
+        self.addCleanup(approval.clear_session, session_key)
+        self._decommission(plugin, plan_id)
+        call = {"task_id": "t", "session_id": "s", "tool_call_id": "call-1"}
+        out = json.loads(model_tools.handle_function_call("librenms_apply", {"plan_id": plan_id}, **call))
+        self.assertIn("BLOCKED", out["error"])
+        self.assertEqual(fake.writes(), [])
+        # the plan as it was when the person answered is still covered, and applies without a prompt
+        store = plugin.store.get_store()
+        plan = store.load(plan_id)
+        plan["steps"][0]["changes"]["purpose"]["to"] = "spine"
+        plan["steps"][0]["payload"]["data"] = ["spine"]
+        store.save(plan)
+        out = json.loads(model_tools.handle_function_call("librenms_apply", {"plan_id": plan_id}, **call))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(fake.tables["devices"][1]["purpose"], "spine")
+
+    def test_the_plan_changed_while_its_prompt_is_open_is_refused(self):
+        # through Hermes' own dispatch: both pre_tool_call callbacks (each on a worker thread of Hermes'), the gate,
+        # answered here after the file changed under it, and the handler, which bind_approval's modify directive
+        # tells what the prompt showed
+        import model_tools
+        from tools import approval
+
+        plugin, fake, plan_id = self._dispatching_plugin()
+        asked = []
+
+        def gate(tool_name, reason, *, rule_key="", approval_callback=None):
+            asked.append((tool_name, reason.split("\n")[2], rule_key))
+            if len(asked) == 1:
+                self._decommission(plugin, plan_id)  # while the person reads "spine"
+            return {"approved": True, "message": None}
+
+        original = approval.request_tool_approval
+        approval.request_tool_approval = gate
+        self.addCleanup(setattr, approval, "request_tool_approval", original)
+        call = {"task_id": "t", "session_id": "s"}
+        first = json.loads(
+            model_tools.handle_function_call("librenms_apply", {"plan_id": plan_id}, **call, tool_call_id="call-1")
+        )
+        self.assertTrue(first["error"].startswith(f"plan {plan_id} changed after the approval prompt showed it"))
+        self.assertEqual(fake.writes(), [])
+        second = json.loads(
+            model_tools.handle_function_call("librenms_apply", {"plan_id": plan_id}, **call, tool_call_id="call-2")
+        )
+        self.assertTrue(second["success"], second)
+        self.assertEqual(fake.tables["devices"][1]["purpose"], "decommissioned")
+        (_tool, shown, first_key), (_tool, shown_again, second_key) = asked
+        self.assertEqual(
+            (shown, shown_again), ('  [0] purpose: "core" -> "spine"', '  [0] purpose: "core" -> "decommissioned"')
+        )
+        self.assertNotEqual(first_key, second_key)
 
     def test_the_second_skill_is_offered_viewed_and_invoked_like_the_first(self):
         # the question skill reaches the model as the workflow does: a line in <available_skills>, skill_view by its

@@ -1,6 +1,7 @@
 """The executor: preflight, apply with a write-ahead journal, conflicts and failures with automatic rollback (under
 the apply's own run lock), PartialWrite, manual rollback statuses and counts, crash recovery and the one-run-at-a-time
-rule across processes, dry runs, eventlog linking, the audit event sequence, and the rendered journal.
+rule across processes, the approved content digest under the claim, dry runs, eventlog linking, the audit event
+sequence, and the rendered journal.
 
 Every step runs through the widget stub of ``test_planner`` (an in-memory resource behind the plugin's real client),
 so these tests do not depend on any of the seven LibreNMS resources."""
@@ -758,6 +759,86 @@ class Preflight(ExecutorCase):
                 setattr(self.settings, key, True)
         self.assertEqual(self.backend.writes(), [])
         self.assertEqual(self.events("apply_started"), [])
+
+
+class Approved(ExecutorCase):
+    """``approved_digest``: the plan under the claim must be the plan the approval prompt showed, whatever the
+    handler loaded before it."""
+
+    def digest(self, plan_id: str) -> str:
+        return self.store_mod.content_digest(self.store.load(plan_id))
+
+    def edit(self, plan_id: str, change: Callable[[Dict[str, Any]], Any]) -> None:
+        plan = self.store.load(plan_id)
+        change(plan)
+        self.store.save(plan)
+
+    def changed(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        with self.assertRaises(self.executor.PlanChanged) as caught:
+            function(*args, **kwargs)
+        return caught.exception
+
+    def test_an_apply_runs_only_the_plan_the_prompt_showed(self):
+        plan = self.plan([update(1, size=4)])
+        shown = self.digest(plan["id"])
+        loaded = self.store.load(plan["id"])  # what the handler loads once the person said yes
+        self.edit(plan["id"], lambda p: p["steps"][0]["payload"].update(size=99))  # and then the file changes
+        refused = self.changed(self.apply, loaded, approved_digest=shown)
+        self.assertEqual(
+            str(refused),
+            f"plan {plan['id']} changed after the approval prompt showed it, so the approval does not cover it; "
+            "nothing was applied. Show the user the plan as it is now (librenms_plans with this plan_id) and call "
+            "librenms_apply again only if they say yes to it",
+        )
+        self.assertIsInstance(refused, self.executor.ExecutionRefused)
+        self.assertEqual((refused.approved, refused.found), (shown, self.digest(plan["id"])))
+        self.assertEqual((self.backend.writes(), self.events("apply_started")), ([], []))
+        self.assertEqual(self.store.load(plan["id"])["status"], "planned")
+        self.assertTrue(self.store.run_lock_free(plan["id"]))  # the refused claim let go of the run lock
+        # as it was shown, it applies: a dry run in between (a check, a new updated_at) changes nothing that runs
+        self.edit(plan["id"], lambda p: p["steps"][0]["payload"].update(size=4))
+        self.apply(self.store.load(plan["id"]), dry_run=True)
+        self.assertEqual(self.apply(loaded, approved_digest=shown)["status"], "applied")
+        self.assertEqual(self.backend.rows[1]["size"], 4)
+        # applied once, it is refused as before, whatever digest is given
+        self.assertEqual(
+            self.refusal(self.apply, loaded, approved_digest=shown),
+            f"plan {plan['id']} is applied; only a 'planned' plan can be applied (build a new plan with librenms_plan)",
+        )
+
+    def test_another_plan_saved_under_the_same_id_is_refused(self):
+        plan = self.plan([update(1, size=4)])
+        shown = self.digest(plan["id"])
+        (self.store.directory / f"{plan['id']}.json").unlink()
+        again = self.build([update(1, size=5)])
+        again["id"] = plan["id"]
+        self.store.create(again)
+        self.changed(self.apply, self.store.load(plan["id"]), approved_digest=shown)
+        self.assertEqual(self.backend.writes(), [])
+
+    def test_a_rollback_runs_only_the_journal_the_prompt_showed(self):
+        plan = self.apply(self.plan([update(1, color="green"), update(2, size=9)]))
+        shown = self.digest(plan["id"])
+        # what an entry's rollback writes, changed after the prompt: the colour it restores
+        self.edit(plan["id"], lambda p: p["journal"][0]["inverse"]["data"].update(color="black"))
+        refused = self.changed(self.rollback, plan["id"], approved_digest=shown)
+        self.assertIn("nothing was reverted. Show the user what its rollback reverts as it is now", str(refused))
+        self.assertEqual(self.store.load(plan["id"])["status"], "applied")
+        self.assertEqual(self.backend.writes(), ["PATCH widgets/1", "PATCH widgets/2"])  # the apply's own
+        self.assertEqual(self.events("rollback_started"), [])
+        self.assertTrue(self.store.run_lock_free(plan["id"]))
+        self.edit(plan["id"], lambda p: p["journal"][0]["inverse"]["data"].update(color="red"))
+        self.assertEqual(self.rollback(plan["id"], approved_digest=shown)["status"], "rolled_back")
+        self.assertEqual((self.backend.rows[1]["color"], self.backend.rows[2]["size"]), ("red", 2))
+
+    def test_a_rollback_asked_about_while_the_apply_ran_is_refused_once_it_wrote_more(self):
+        plan = self.apply(self.plan([update(1, color="green"), update(2, size=9)]))
+        self.edit(plan["id"], lambda p: p.update(status="applying", journal=p["journal"][:1]))
+        shown = self.digest(plan["id"])  # the prompt showed the one entry a run still going had journaled
+        self.store.save(plan)  # the run journaled the second and finished
+        self.changed(self.rollback, plan["id"], approved_digest=shown)
+        self.assertEqual(self.store.load(plan["id"])["status"], "applied")
+        self.assertEqual((self.backend.rows[1]["color"], self.backend.rows[2]["size"]), ("green", 9))
 
 
 class DryRun(ExecutorCase):
