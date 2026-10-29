@@ -68,8 +68,10 @@ comma was an HTTP 500) and must hold column names only.
 | `neighbours` | #64 for each device of a scope of at most 10 devices, else #128 once; then the ports of the devices at both ends (every local device, and each monitored neighbour whose port LibreNMS matched) as `ports` reads them: #71 per device up to 10, the local devices first, else #105, and when that is too large to read #71 per device within the request budget, the local devices first (a failed read, or a neighbour the budget leaves out, leaves those links without their figures, partial) |
 | `locate` | a MAC: #104, #122 (its 12 hex digits) and #125 (the MAC with colons); an IPv4 address: #125, then #104 and #122 for each MAC found (at most 3); then #133 (`?hostname=`, at most 5 devices, else once), #64 for the devices that learned it (at most 10, else #128) and #99 for the router interfaces of the ARP entries (at most 5), each of which may fail and leave the answer partial |
 | `vlans` | #63 for each device of a scope of at most 10 devices, else #133 once; with `filter.vlan`, #71 with `with=vlans` for each device that has it, when they are at most 10 |
-| `alerts` | #36 once (per severity when the answer is too large to read); #71 (`columns=port_id,ifName,ifDescr,ifAlias`) for each device, at most 10, with a port fault whose details hold no label, each of which may fail and leave the answer partial |
+| `alerts` | #36 once (per severity when the answer is too large to read); #71 (`columns=port_id,ifIndex,ifName,ifDescr,ifAlias`) for each device, at most 10, with a port fault whose details hold no label, each of which may fail and leave the answer partial |
 | `alert_history` | #44 once (a failure leaves the rules unnamed, partial); #97 from the window's start, newest first, paged: by device id for a scope of at most 10 devices, else every device's |
+| `health` | #132 once (not when `filter.class` names only processors, memory pools or storage); when it is too large to read, #68 per device of the scope within the budget (the classes, each class's ids, each sensor); #68 for processors, memory pools (by default) or storage (asked for) of at most 5 devices, a listing and at most 8 of each; for the sensors of the page on a port, #71 (`columns=port_id,ifIndex,ifName,ifDescr,ifAlias`, at most 10 devices) and #74 where the ifIndex names no port; each by device id, each of which may fail and leave the answer partial |
+| `routing` | #10, #13 and #15 once each, the protocols asked for (`?hostname=` the device id for a scope of one device; #10 `?remote_asn=` for `filter.remote_as`, alone); #71 (as `health`) for the devices of the page's OSPF neighbours |
 | `help` | none: answered by the plugin |
 
 ## System
@@ -97,12 +99,12 @@ comma was an HTTP 500) and must hold column names only.
 
 | # | Route | Coverage |
 |---|---|---|
-| 10 | `GET bgp` | query (`?hostname=` resolved) |
+| 10 | `GET bgp` | query (`?hostname=` resolved); report: `routing` |
 | 11 | `GET bgp/{id}` | query |
 | 12 | `POST bgp/{id}` (`edit_bgp_descr`) | not in 0.1.0: the API cannot clear a description (so setting one where there was none has no inverse), longer values are silently truncated, and LibreNMS defines no permission for it, so by default only an admin may |
-| 13 | `GET ospf` | query (`?hostname=` resolved) |
+| 13 | `GET ospf` | query (`?hostname=` resolved); report: `routing` |
 | 14 | `GET ospf_ports` | query |
-| 15 | `GET ospfv3` | query (`?hostname=` resolved) |
+| 15 | `GET ospfv3` | query (`?hostname=` resolved). LibreNMS answers HTTP 500 `Error retrieving ospfv3_nbrs` when it holds no OSPFv3 neighbour (for the device asked for, or at all); report: `routing`, which reads that answer as none, and the 404 of a LibreNMS without this route as none with a note |
 | 16 | `GET ospfv3_ports` | query (`?hostname=` resolved) |
 | 48 | `GET routing/vrf/{id}` | query |
 | 49 | `GET routing/ipsec/data/{hostname}` | query |
@@ -196,13 +198,13 @@ on the poller.
 | 65 | `GET devices/{hostname}/graphs` | query (the list of graphs, not images) |
 | 66 | `GET devices/{hostname}/fdb` | query |
 | 67 | `GET devices/{hostname}/nac` | query |
-| 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (`0` lists every sensor of the class) |
+| 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (`0` lists every sensor of the class). Without a type the sensor classes and `device_processor`, `device_storage`, `device_mempool`; with one (`device_` optional) each one's `{sensor_id, desc}`; with an id its full row; report: `health` (processors, memory pools, storage; every sensor when #132 is too large to read) |
 | 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query; `{sensor_id}` must be a positive number (MySQL reads `1abc` as 1) |
 | 70 | `GET devices/{hostname}/wireless-sensors` | query |
-| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; `neighbours` for the devices at both ends of the links (as `ports` reads them); `vlans` with `with=vlans` for the devices of one VLAN (at most 10); `alerts` to name a port fault whose details hold no label (at most 10 devices); always by device id with a `columns` list |
+| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`); report: `ports` and `capacity` for a scope of at most 10 devices, and when #105 is too large to read; `port` to find a port by name on `scope.device`; `neighbours` for the devices at both ends of the links (as `ports` reads them); `vlans` with `with=vlans` for the devices of one VLAN (at most 10); `alerts`, `health` and `routing` for the port names of the rows of a page (a port fault whose details hold no label, a sensor on a port, an OSPF neighbour's interface; at most 10 devices); always by device id with a `columns` list |
 | 72 | `GET devices/{hostname}/ip` | query |
 | 73 | `GET devices/{hostname}/port_stack` | query |
-| 74 | `GET devices/{hostname}/transceivers` | query |
+| 74 | `GET devices/{hostname}/transceivers` | query; report: `health` (by device id, to tie a sensor to a port through its transceiver's entity) |
 | 75 | `GET devices/{hostname}/components` | query. LibreNMS answers an object keyed by component id; it is returned as rows with the key as `id`, so `limit` and `fields` apply |
 | 76 | `GET devices/{hostname}/groups` | query |
 | 77 | `GET devices/{hostname}/maintenance` | query; read after a maintenance step to verify it |
@@ -276,7 +278,7 @@ on the poller.
 | 129 | `GET resources/links/{id}` | query |
 | 130 | `GET resources/nac` | query |
 | 131 | `GET resources/nac/{mac}` | query; `{mac}` normalised as #122 |
-| 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device; report: `port` (the dBm sensors on the port, filtered in the plugin) |
+| 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device; report: `port` (the dBm sensors on the port, filtered in the plugin), `health` (every sensor, kept to the scope and filtered in the plugin) |
 | 133 | `GET resources/vlans` | query (`?hostname=` resolved); report: `vlans` for a scope of more than 10 devices, `locate` (`?hostname=` a device id, for each of at most 5 devices that learned the MAC, else once) to number a forwarding entry's VLAN |
 | 134 | `GET resources/locations` | query; planning reads (lookup by name); report: `find`, `scope.location` when no device is at the location named |
 

@@ -120,7 +120,7 @@ class Help(AlertCase):
             self.assertFalse(out["success"], args)
             self.assertIn(said, out["error"])
         self.assertIn("view must be one of find, devices, ports, port, capacity, neighbours, locate, vlans, alerts, "
-                      "alert_history, help", self.report(view="graphs")["error"])  # fmt: skip
+                      "alert_history, health, routing, help", self.report(view="graphs")["error"])  # fmt: skip
 
 
 class Window(AlertCase):
@@ -172,10 +172,10 @@ class Alerts(AlertCase):
              "acked": False, "entity_type": "port", "port_id": 5, "entity": "Gi0/0/0",
              "procedure": "https://wiki.example.net/runbooks/port-down"},
         )  # fmt: skip
-        # fault 3 holds no details: its port is named from its device's ports, three columns of them
+        # fault 3 holds no details: its port is named from its device's port names, never every column
         self.assertEqual(out["rows"][2]["entity"], "Gi1/0/48 (to core-sw1)")
         [ports] = self.reads("devices/3/ports")
-        self.assertEqual(ports["params"], {"columns": "port_id,ifName,ifDescr,ifAlias"})
+        self.assertEqual(ports["params"], {"columns": "port_id,ifIndex,ifName,ifDescr,ifAlias"})
         self.assertEqual(self.reads("faults")[0]["params"], {"state": "1,2,3,4,5"})
         self.assertEqual(
             out["summary"],

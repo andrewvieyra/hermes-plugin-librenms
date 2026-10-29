@@ -1,6 +1,7 @@
 """The report views' shared pieces that need no LibreNMS: units and times (reports/units.py), the ranking of names
 and phrases (reports/fuzzy.py), with the near misses that decide whether a phrase names one device or several, and
-what a port row means (reports/ports.py: speeds, utilisation, errors, staleness and the age of its last change)."""
+what a port row means (reports/ports.py: speeds, utilisation, errors, staleness and the age of its last change), and
+sensor readings in their units, their status and the port a sensor is on (reports/units.py, reports/context.py)."""
 
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -365,6 +366,33 @@ class PortFacts(unittest.TestCase):
                                 (None, None), ("-3.2", "ok")):  # fmt: skip
             self.assertEqual(context.sensor_status({**sensor, "sensor_current": current}), status, current)
         self.assertEqual(context.sensor_status({"sensor_current": 99}), "ok")  # no limit set never trips
+        # a state sensor's number means what its state translations say, which the API does not return
+        self.assertIsNone(context.sensor_status({"sensor_class": "state", "sensor_current": 1, "sensor_limit": 0}))
+
+    def test_a_sensor_on_a_port(self):
+        port = {"port_id": 9, "ifIndex": 48}
+        on_index = {"entPhysicalIndex": "48", "entPhysicalIndex_measured": "ports"}
+        self.assertTrue(context.measured_on(on_index, port, set()))
+        self.assertFalse(context.measured_on({**on_index, "entPhysicalIndex_measured": None}, port, set()))
+        self.assertTrue(context.measured_on({"entPhysicalIndex": 1011}, port, {"1011"}))  # its transceiver's entity
+        self.assertFalse(context.measured_on({}, port, {""}))
+
+
+class SensorReadings(unittest.TestCase):
+    def test_a_reading_in_its_class_unit(self):
+        for value, kind, shown in (
+            (41, "temperature", "41 °C"), (-3.2, "dbm", "-3.2 dBm"), ("12.1", "voltage", "12.1 V"),
+            (4520, "fanspeed", "4520 RPM"), (2400, "power", "2.4 kW"), (12.5, "current", "12.5 A"),
+            (90, "runtime", "1h 30m"), (1, "state", "1"), (0.333333, "power_factor", "0.333"),
+            (45, "humidity", "45 %"), (5, "a_class_added_since", "5"), (None, "temperature", None),
+        ):  # fmt: skip
+            self.assertEqual(units.sensor_reading(value, kind), shown, (value, kind))
+        self.assertEqual(set(units.SENSOR_UNITS) & {"processor", "mempool", "storage"}, set())
+
+    def test_sizes_with_binary_prefixes(self):
+        for value, shown in ((4294967296, "4 GiB"), (1761607680, "1.64 GiB"), (1073636966, "1024 MiB"), (512, "512 B"),
+                             (None, None), (-1, None)):  # fmt: skip
+            self.assertEqual(units.size(value), shown, value)
 
 
 if __name__ == "__main__":

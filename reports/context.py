@@ -5,7 +5,8 @@ and result envelope.
   ids (each percent-encoded, :func:`client.path`), checks it against the read-route allow-list as librenms_query
   does (:func:`routes.match`, so a refused route stays unreachable), counts it against :data:`CALL_BUDGET`, reads
   LibreNMS's 404-for-an-empty-list as no rows and takes the rows from the route's result key. The devices,
-  locations and group listings are read at most once per report; nothing is kept between calls.
+  locations and group listings, and the port names of a device a view names ports on
+  (:meth:`ReportContext.ports_by_device`), are read at most once per report; nothing is kept between calls.
 - Scope: :meth:`ReportContext.scope` turns ``scope`` into a set of device ids (and a port group into its port ids).
   A device given by a phrase rather than its id or hostname is ranked (:mod:`.fuzzy`) and resolves only when one
   device matches exactly, or only one matches every word; otherwise the report answers ``ambiguous`` with the
@@ -33,6 +34,9 @@ from . import fuzzy, units
 
 CALL_BUDGET = 30  # requests one report may send
 LABEL_CHARS = 200  # the longest string from LibreNMS a report shows, counted as escaped
+# What names a device's ports, and ties a sensor to one (its ifIndex), when a view names the ports its rows are about.
+PORT_NAME_COLUMNS = "port_id,ifIndex,ifName,ifDescr,ifAlias"
+PORT_MAP_READS = 10  # devices whose ports a report reads to name the ports its rows are about
 DEFAULT_LIMIT = 20
 MAX_CANDIDATES = 10
 MIN_SCORE = 20  # a candidate scoring less matched too little to show
@@ -204,7 +208,7 @@ def _http_date(value: Any) -> datetime | None:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
-def _failure(exc: LibreNMSError) -> str:
+def failure(exc: LibreNMSError) -> str:
     """How a read failed, without LibreNMS's text: the status and kind."""
     return f"HTTP {exc.status} ({exc.kind})" if exc.status else f"no answer ({exc.kind})"
 
@@ -472,7 +476,7 @@ class ReportContext:
         except LibreNMSError as exc:
             if exc.kind == "auth" or exc.kind in raising:
                 raise
-            self.partial(f"{what} not read: LibreNMS answered {_failure(exc)}")
+            self.partial(f"{what} not read: LibreNMS answered {failure(exc)}")
         return None
 
     def partial(self, reason: str) -> None:
@@ -521,6 +525,32 @@ class ReportContext:
             rows = self.get(*segments) if what is None else self.optional(what, *segments)
             self._memo[key] = rows_of(rows)
         return self._memo[key]
+
+    def ports_by_device(
+        self, device_ids: Iterable[Any], what: str, rest: str, advice: str = ""
+    ) -> Dict[Any, List[Dict[str, Any]]]:
+        """The ports of each of *device_ids*, in that order, by name (:data:`PORT_NAME_COLUMNS`, never every column),
+        for at most :data:`PORT_MAP_READS` devices, each read once per report. A read that fails or is past the
+        budget leaves that device out and the answer partial, *what* naming what was not read (``{}``: the device's
+        id); a note counts the devices past the cap in *rest*'s words (``{}``: how many), then *advice*."""
+        ids = list(dict.fromkeys(device_ids))
+        out: Dict[Any, List[Dict[str, Any]]] = {}
+        for number, device_id in enumerate(ids):
+            if number >= PORT_MAP_READS:
+                self.notes.append(
+                    f"{rest.format(len(ids) - PORT_MAP_READS)} (a report reads the ports of at most {PORT_MAP_READS} "
+                    "devices for it)" + (f": {advice}" if advice else "")
+                )
+                break
+            key = f"ports_of:{device_id}"
+            if key not in self._memo:
+                found = self.optional(
+                    what.format(device_id), "devices", device_id, "ports", params={"columns": PORT_NAME_COLUMNS}
+                )
+                self._memo[key] = None if found is None else rows_of(found)
+            if self._memo[key] is not None:
+                out[device_id] = self._memo[key]
+        return out
 
     # -- candidates -------------------------------------------------------------------------------------------------
     def rank_devices(self, term: fuzzy.Term) -> List[Tuple[fuzzy.Match, int]]:
@@ -828,9 +858,10 @@ def port_candidate(port: Dict[str, Any], device: Dict[str, Any] | None, found: f
 def sensor_status(sensor: Dict[str, Any]) -> str | None:
     """``critical``, ``warning`` or ``ok`` as LibreNMS's Sensor scopes decide it: past ``sensor_limit`` or below
     ``sensor_limit_low`` is critical, past the ``_warn`` limits a warning (a limit not set never trips); None
-    without a current value."""
+    without a current value, and for a ``state`` sensor, whose number means what LibreNMS's state translations say
+    (none of its read routes returns them)."""
     current = units.number(sensor.get("sensor_current"))
-    if current is None:
+    if current is None or sensor.get("sensor_class") == "state":
         return None
 
     def past(high: str, low: str) -> bool:
@@ -840,6 +871,17 @@ def sensor_status(sensor: Dict[str, Any]) -> str | None:
     if past("sensor_limit", "sensor_limit_low"):
         return "critical"
     return "warning" if past("sensor_limit_warn", "sensor_limit_low_warn") else "ok"
+
+
+def measured_on(sensor: Dict[str, Any], port: Dict[str, Any], entities: Set[str]) -> bool:
+    """Whether LibreNMS ties *sensor* to *port* (both of one device): measured on the port's ifIndex
+    (``entPhysicalIndex_measured`` ``ports``), or on the inventory entity of one of its transceivers (*entities*,
+    their ``entity_physical_index``), as an optic's dBm, temperature and bias sensors are."""
+    index = str(sensor.get("entPhysicalIndex") or "")
+    if not index:
+        return False
+    on_port = sensor.get("entPhysicalIndex_measured") == "ports" and index == str(port.get("ifIndex"))
+    return on_port or index in entities
 
 
 def rows_of(value: Any) -> List[Dict[str, Any]]:

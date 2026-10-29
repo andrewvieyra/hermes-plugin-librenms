@@ -25,10 +25,10 @@ v0 route to what the plugin does with it.
 | `redact` | Credential masking by key, error-text scrubbing, clipping that counts escapes, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals, `visible()` and `for_model()` for what the model reads, the untrusted-data marker (`untrusted()`, `mark_untrusted()`) | none |
 | `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` or `start` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; `offset` sent as `start` on the logs routes, which refuse `where` and `sort`; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
 | `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused. Its natural order also orders reports | `redact` |
-| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings, partial reasons), scope resolution with ambiguity, argument checks, the result envelope | `client`, `routes`, `listing`, `redact`, `settings` |
+| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings and of the port names a view names ports from, partial reasons), scope resolution with ambiguity, argument checks, the result envelope, and how LibreNMS decides a sensor's status and ties it to a port | `client`, `routes`, `listing`, `redact`, `settings` |
 | `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
-| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; zone-safe times, and server-local times read in `librenms_timezone` | none |
-| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context`, `redact` (`alert_entities`) |
+| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; sensor units and readings per class, sizes in bytes; zone-safe times, and server-local times read in `librenms_timezone` | none |
+| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts`, `reports/health`, `reports/routing` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness; whether a device's figures are current) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context`, `redact` (`alert_entities`) |
 | `reports/help` | View `help`: what each view answers, its filters (with what they take, read from the view), sorts, row and summary keys and examples, answered without a LibreNMS call | `reports/context` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
@@ -128,7 +128,24 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   while an answer is too large to read) up to 2,000 entries, per device for a scope of up to 10;
   it counts alerts raised, cleared and raised again (`flaps`, per fault) per rule, device or
   event. Neither view puts any other part of a fault's or entry's `details` (every column of
-  every table the rule joins, and the alert's contacts) in a row or a summary.
+  every table the rule joins, and the alert's contacts) in a row or a summary. `health` reads
+  `resources/sensors` once (it takes no filter) and keeps the scope's sensors that LibreNMS has not
+  deleted; their status is LibreNMS's (`Sensor::scopeIsCritical`/`IsWarning`: strictly past a
+  limit; a limit not set never trips; a `state` sensor's meaning is in state translations no read
+  route returns, so it is unknown), and the margins are how far the reading is from the first limit
+  it would cross each way. When that listing is too large to read, the sensors are read one device
+  and one sensor at a time (`devices/{id}/health`, `.../device_<class>`, `.../device_<class>/{id}`)
+  within the budget, partial otherwise. Processors, memory pools and storage (the same routes, one
+  request each) are read for at most 5 devices, 8 of a kind each. For the page, a sensor is tied to
+  a port as the `port` view ties an optic (measured on the port's ifIndex, or on one of its
+  transceivers' entities) or, for a dBm sensor, by the port name its description starts with.
+  `routing` reads `bgp`, `ospf` and `ospfv3` once each (by device id for one device, `remote_asn`
+  for a remote AS) and keeps the scope's; `not_established` is LibreNMS's `BgpPeer::inAlarm` (admin
+  `start`/`running` and not established) and an OSPF neighbour not `full`; a BGP session's up or
+  down time is its established timer at the last poll plus the time since. LibreNMS's `ospfv3`
+  route answers HTTP 500 `Error retrieving ospfv3_nbrs` for no neighbour, read as none (as is the
+  404 of a LibreNMS without the route, with a note); any other failure of a protocol leaves it out,
+  partial, unless it is the one asked for.
 - **Help.** The tool's schema names the views and the contract they share; each view's filters,
   sorts, row keys and examples are view `help`'s (`reports/help`), answered in the handler before a
   client is made. A filter's line says what it takes from the view's own definition, and a test

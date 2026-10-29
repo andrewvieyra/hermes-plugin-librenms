@@ -16,8 +16,9 @@ in clear for an admin token. The read-only routes the report views read answer a
 as no filter (and an unknown ``devices`` ``type`` as none), the ``ipv4``, ``ipv6`` and ``mac`` device filters, column
 lists checked trimmed but selected as sent, ``with=vlans`` on a device's ports and on one port (each port's ports_vlans
 rows, ``untagged`` as PortVlan reads it, and on one port the port it lazy-loads to do so), ``resources/fdb/{mac}``
-compared exactly, the alert log's details decoded, and components as an object keyed by id. Bills are modelled for CDR
-bills in the current period only.
+compared exactly, the alert log's details decoded, components as an object keyed by id, a device's health classes,
+ids and single sensors, processors, memory pools and storage volumes, and ``ospfv3``'s HTTP 500 for no neighbour. Bills
+are modelled for CDR bills in the current period only.
 
 Test hooks: :meth:`FakeLibreNMS.fail_on` (a forced answer or exception, optionally after the write took effect),
 :meth:`~FakeLibreNMS.touch` (an edit made outside the plugin), :meth:`~FakeLibreNMS.after` (another client's write
@@ -49,14 +50,14 @@ _TABLES = (
     "devices", "locations", "device_groups", "services", "rules", "faults", "ports", "eventlog", "poller_groups",
     "port_groups", "links", "sensors", "transceivers", "components", "bgp_peers", "ospf_nbrs", "alert_log", "syslog",
     "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills", "ipv4_addresses",
-    "ipv6_addresses", "ports_statistics", "ports_vlans",
+    "ipv6_addresses", "ports_statistics", "ports_vlans", "processors", "mempools", "storage", "ospfv3_nbrs",
 )  # fmt: skip
 _ID_KEYS = {
     "devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id",
     "sensors": "sensor_id", "bgp_peers": "bgpPeer_id", "syslog": "seq", "vlans": "vlan_id",
     "ports_fdb": "ports_fdb_id", "ports_nac": "ports_nac_id", "availability": "availability_id", "bills": "bill_id",
     "ipv4_addresses": "ipv4_address_id", "ipv6_addresses": "ipv6_address_id", "ports_statistics": "port_id",
-    "ports_vlans": "port_vlan_id",
+    "ports_vlans": "port_vlan_id", "processors": "processor_id", "mempools": "mempool_id", "storage": "storage_id",
 }  # fmt: skip
 
 # App\Http\Resources\Device, in its key order (dependency_parent_* only where list_devices loads parents).
@@ -148,6 +149,35 @@ _OSPF_COLUMNS = (
     "ospfNbrOptions", "ospfNbrPriority", "ospfNbrState", "ospfNbrEvents", "ospfNbrLsRetransQLen",
     "ospfNbmaNbrStatus", "ospfNbmaNbrPermanence", "ospfNbrHelloSuppressed", "context_name",
 )  # fmt: skip
+_OSPFV3_COLUMNS = (
+    "id", "device_id", "ospfv3_instance_id", "port_id", "router_id", "ospfv3NbrIfIndex", "ospfv3NbrIfInstId",
+    "ospfv3NbrRtrId", "ospfv3NbrAddressType", "ospfv3NbrAddress", "ospfv3NbrOptions", "ospfv3NbrPriority",
+    "ospfv3NbrState", "ospfv3NbrEvents", "ospfv3NbrLsRetransQLen", "ospfv3NbmaNbrStatus", "ospfv3NbmaNbrPermanence",
+    "ospfv3NbrHelloSuppressed", "ospfv3NbrIfId", "ospfv3NbrRestartHelperStatus", "ospfv3NbrRestartHelperAge",
+    "ospfv3NbrRestartHelperExitReason", "context_name",
+)  # fmt: skip
+# processors, mempools and storage: what devices/{hostname}/health/device_<kind>/{id} returns of one (toArray()).
+_PROCESSOR_COLUMNS = (
+    "processor_id", "entPhysicalIndex", "hrDeviceIndex", "device_id", "processor_oid", "processor_index",
+    "processor_type", "processor_usage", "processor_descr", "processor_precision", "processor_perc_warn",
+)  # fmt: skip
+_MEMPOOL_COLUMNS = (
+    "mempool_id", "mempool_index", "entPhysicalIndex", "mempool_type", "mempool_class", "mempool_precision",
+    "mempool_descr", "device_id", "mempool_perc", "mempool_perc_oid", "mempool_used", "mempool_used_oid",
+    "mempool_free", "mempool_free_oid", "mempool_total", "mempool_total_oid", "mempool_largestfree",
+    "mempool_lowestfree", "mempool_deleted", "mempool_perc_warn", "polling_method",
+)  # fmt: skip
+_STORAGE_COLUMNS = (
+    "storage_id", "device_id", "type", "storage_index", "storage_type", "storage_descr", "storage_size",
+    "storage_size_oid", "storage_units", "storage_used", "storage_used_oid", "storage_free", "storage_free_oid",
+    "storage_perc", "storage_perc_oid", "storage_perc_warn", "storage_deleted",
+)  # fmt: skip
+# list_available_health_graphs: per kind its table, columns, id and description column (a sensor class otherwise).
+_HEALTH_KINDS = {
+    "processor": ("processors", _PROCESSOR_COLUMNS, "processor_id", "processor_descr"),
+    "storage": ("storage", _STORAGE_COLUMNS, "storage_id", "storage_descr"),
+    "mempool": ("mempools", _MEMPOOL_COLUMNS, "mempool_id", "mempool_descr"),
+}
 _ALERT_LOG_COLUMNS = ("id", "rule_id", "device_id", "fault_id", "state", "details", "time_logged")
 _SYSLOG_COLUMNS = ("device_id", "facility", "priority", "level", "tag", "timestamp", "program", "msg", "seq")
 _VLAN_COLUMNS = ("vlan_id", "device_id", "vlan_vlan", "vlan_domain", "vlan_name", "vlan_type", "vlan_state")
@@ -205,6 +235,12 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
     "bgp_peers": {**dict.fromkeys(_BGP_COLUMNS), "bgpPeerAdminStatus": "start", "bgpPeerLastErrorCode": 0,
                   "bgpPeerLastErrorSubCode": 0, "bgpPeerLastErrorText": "", "context_name": ""},
     "ospf_nbrs": {**dict.fromkeys(_OSPF_COLUMNS), "ospfNbrAddressLessIndex": 0, "context_name": ""},
+    "ospfv3_nbrs": {**dict.fromkeys(_OSPFV3_COLUMNS), "ospfv3NbrAddressType": "ipv6", "context_name": ""},
+    "processors": {**dict.fromkeys(_PROCESSOR_COLUMNS), "processor_precision": 1, "processor_perc_warn": 75},
+    "mempools": {**dict.fromkeys(_MEMPOOL_COLUMNS), "mempool_precision": 1, "mempool_deleted": 0,
+                 "mempool_perc_warn": 90, "mempool_class": "system", "polling_method": "snmp"},
+    "storage": {**dict.fromkeys(_STORAGE_COLUMNS), "type": "hrstorage", "storage_units": 4096, "storage_deleted": 0,
+                "storage_perc_warn": 60},
     "alert_log": {"fault_id": None, "details": None},
     "syslog": {"facility": "local7", "priority": "info", "level": "info", "tag": "", "program": ""},
     "vlans": {"vlan_domain": 1, "vlan_type": "ethernet", "vlan_state": 0},
@@ -227,6 +263,7 @@ _ROUTES = (
     ("GET", "bgp", "list_bgp", "_list_bgp"),
     ("GET", "bgp/{id}", "get_bgp", "_get_bgp"),
     ("GET", "ospf", "list_ospf", "_list_ospf"),
+    ("GET", "ospfv3", "list_ospfv3", "_list_ospfv3"),
     ("GET", "devicegroups/{name}", "get_devices_by_group", "_get_devices_by_group"),
     ("GET", "devicegroups", "get_device_groups", "_get_device_groups"),
     ("POST", "devicegroups", "add_device_group", "_add_device_group"),
@@ -259,6 +296,7 @@ _ROUTES = (
     ("GET", "devices/{hostname}/vlans", "get_vlans", "_get_vlans"),
     ("GET", "devices/{hostname}/links", "list_links_device", "_list_links"),
     ("GET", "devices/{hostname}/fdb", "get_fdb", "_get_fdb"),
+    ("GET", "devices/{hostname}/health/{type?}/{sensor_id?}", "list_available_health_graphs", "_list_health"),
     ("GET", "devices/{hostname}/ports", "get_device_ports", "_get_device_ports"),
     ("GET", "devices/{hostname}/transceivers", "get_transceivers", "_get_transceivers"),
     ("GET", "devices/{hostname}/components", "get_components", "_get_components"),
@@ -1585,6 +1623,43 @@ class FakeLibreNMS:
         rows = self._rows("ospf_nbrs", _OSPF_COLUMNS, device_id=self._device_ref(r.params.get("hostname")))
         return _api_success([o for o in rows if o["ospfNbrState"] not in (None, "")], "ospf_neighbours", array=True)
 
+    def _list_ospfv3(self, r: _Req) -> FakeResponse:
+        """``DeviceCache::get($hostname)->device_id``: a device by id or hostname filters, one LibreNMS does not
+        know (by id too) filters nothing; no neighbour with a state at all is LibreNMS's HTTP 500."""
+        d = self._device(r.params.get("hostname"))
+        rows = self._rows("ospfv3_nbrs", _OSPFV3_COLUMNS, device_id=d["device_id"] if d else None)
+        rows = [o for o in rows if o["ospfv3NbrState"] not in (None, "")]
+        if not rows:
+            return _api_error(500, "Error retrieving ospfv3_nbrs")
+        return _api_success(rows, "ospfv3_neighbours", array=True)
+
+    def _list_health(self, r: _Req) -> FakeResponse:
+        """``list_available_health_graphs``: without a type the device's sensor classes (of sensors not deleted, in
+        sensor order) as ``device_<class>``, then processors, storage and memory pools when it has any; with a type
+        (``device_`` stripped) the ``{sensor_id, desc}`` of each processor, storage volume, memory pool or sensor of
+        that class not deleted; with a sensor_id that one's full row. An unknown device has none (no 404)."""
+        d = self._device(r.args["hostname"]) or {"device_id": 0}
+        kind = re.sub(r"^device_", "", r.args.get("type") or "") if r.args.get("type") is not None else None
+        sensors = [row for row in self._rows("sensors", _SENSOR_COLUMNS, device_id=d["device_id"])
+                   if not row["sensor_deleted"]]  # fmt: skip
+        if kind is None:
+            classes = list(dict.fromkeys(row["sensor_class"] for row in sensors))
+            graphs = [{"desc": name[:1].upper() + name[1:], "name": f"device_{name}"} for name in classes]
+            for name, label in (("processor", "Processors"), ("storage", "Storage"), ("mempool", "Memory Pools")):
+                if self._rows(_HEALTH_KINDS[name][0], ("device_id",), device_id=d["device_id"]):
+                    graphs.append({"desc": label, "name": f"device_{name}"})
+            return _api_success(graphs, "graphs", array=True)
+        if kind in _HEALTH_KINDS:
+            table, columns, id_key, descr_key = _HEALTH_KINDS[kind]
+            rows = self._rows(table, columns, device_id=d["device_id"])
+        else:
+            columns, id_key, descr_key = _SENSOR_COLUMNS, "sensor_id", "sensor_descr"
+            rows = [row for row in sensors if row["sensor_class"] == kind]
+        sensor_id = r.args.get("sensor_id")
+        if sensor_id not in (None, "", "0"):  # PHP's truthiness
+            return _api_success([row for row in rows if str(row[id_key]) == sensor_id], "graphs", array=True)
+        return _api_success([{"sensor_id": row[id_key], "desc": row[descr_key]} for row in rows], "graphs", array=True)
+
     def _get_port_groups(self, r: _Req) -> FakeResponse:
         groups = sorted(self.tables["port_groups"].values(), key=lambda g: g["name"].lower())
         if not groups:
@@ -2264,8 +2339,9 @@ def seeded() -> FakeLibreNMS:
 def _seed_reports(fake: FakeLibreNMS) -> None:
     """What the read-only report routes show: interface addresses (IPv4 and IPv6, for ``devices?type=ipv4|ipv6``), a
     port group, the uplink's discards (ports_statistics), LLDP/CDP links (one to an unmonitored neighbour), sensors
-    (one past its limit, an optic), a transceiver, NTP components, BGP sessions (one idle, one without a state), OSPF
-    neighbours, alert-log rows whose details carry contacts, syslog, VLANs and the trunk that carries them, a MAC
+    (one past its limit, an optic), a transceiver, processors (one past its warning limit), a memory pool and a flash
+    volume, NTP components, BGP sessions (one idle, one without a state), OSPF neighbours (no OSPFv3 ones),
+    alert-log rows whose details carry contacts, syslog, VLANs and the trunk that carries them, a MAC
     learned on an access port and on the uplink, a NAC session, ARP entries, outages and availability, and two CDR
     bills (one over its commit)."""
     seed = fake.seed
@@ -2310,6 +2386,21 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
         "revision": "A", "serial": "FNS12345ABC", "date": "2021-03-04", "ddm": True, "encoding": "8B10B",
         "cable": "SM", "distance": 10000, "wavelength": 1310, "connector": "LC",
         "created_at": "2026-10-01T09:00:00.000000Z", "updated_at": "2026-10-28T06:00:11.000000Z",
+    })  # fmt: skip
+    for row in (
+        {"processor_id": 1, "device_id": 1, "processor_index": "1", "processor_type": "cpm", "processor_usage": 97,
+         "processor_descr": "CPU 0", "processor_oid": ".1.3.6.1.4.1.9.9.109.1.1.1.1.8.1", "entPhysicalIndex": 1000},
+        {"processor_id": 2, "device_id": 2, "processor_index": "7000", "processor_type": "qfp", "processor_usage": 12,
+         "processor_descr": "QFP 0", "processor_oid": ".1.3.6.1.4.1.9.9.715.1.1.6.1.14.7000"},
+    ):  # fmt: skip
+        seed("processors", row)
+    seed("mempools", {
+        "mempool_id": 1, "device_id": 1, "mempool_index": "1", "mempool_type": "cemp", "mempool_descr": "Processor",
+        "mempool_perc": 41, "mempool_used": 1761607680, "mempool_free": 2533359616, "mempool_total": 4294967296,
+    })  # fmt: skip
+    seed("storage", {
+        "storage_id": 1, "device_id": 1, "storage_index": "1", "storage_type": "flash", "storage_descr": "flash:",
+        "storage_size": 1621966848, "storage_used": 908328960, "storage_free": 713637888, "storage_perc": 56,
     })  # fmt: skip
     seed("components", {"id": 7, "device_id": 1, "type": "ntp", "label": "192.0.2.123",
                         "prefs": {"peer": "192.0.2.123", "stratum": "2"}})  # fmt: skip

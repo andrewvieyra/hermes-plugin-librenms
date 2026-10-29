@@ -6,7 +6,9 @@ port row holds, and what it means: ``ifInOctets_rate`` and ``ifOutOctets_rate`` 
 last poll (``poll_period``, about 300 s), so eight times that is the bit rate; ``ifSpeed`` is bit/s (``ifHighSpeed``,
 which older LibreNMS releases also kept, is Mbit/s); ``port_descr_speed`` is the circuit speed parsed from the port's
 description, ``egress/ingress`` when it differs by direction (:func:`circuit_speeds`); ``ifLastChange`` is the
-device's sysUpTime, in hundredths of a second, when the port last went up or down.
+device's sysUpTime, in hundredths of a second, when the port last went up or down. A sensor's ``sensor_current`` and
+its four limits are in the unit of its class (:data:`SENSOR_UNITS`: °C, dBm, V, ...); memory and storage sizes are
+bytes, shown with binary prefixes (:func:`size`).
 
 LibreNMS stamps times two ways: the device API in ISO-8601 UTC (``2026-10-28T11:55:02.000000Z``) and unix seconds
 (outages, port poll times), which are exact anywhere; the fault, alert-log, eventlog and syslog tables as the
@@ -33,6 +35,19 @@ _SI_POWERS = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6, "Z": 7, "Y"
 # Most seconds a duration argument may name (a year), and most a duration may show as a value (a century).
 MAX_DURATION_S = 366 * 86400
 PLAUSIBLE_S = 100 * 366 * 86400
+_IEC = (("TiB", 2**40), ("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10))
+# The unit of each of LibreNMS's sensor classes (its sensors translations), as it stores the reading: temperature in
+# degrees Celsius whatever a user's display preference, runtime in minutes, power_consumed in kWh; "" for a ratio or
+# a count, and none for a class LibreNMS has added since.
+SENSOR_UNITS = {
+    "airflow": "cfm", "ber": "", "bitrate": "bit/s", "charge": "%", "chromatic_dispersion": "ps/nm", "cooling": "W",
+    "count": "", "current": "A", "dbm": "dBm", "delay": "s", "eer": "", "fanspeed": "RPM", "frequency": "Hz",
+    "humidity": "%", "load": "%", "loss": "%", "percent": "%", "power": "W", "power_consumed": "kWh",
+    "power_factor": "", "pressure": "kPa", "quality_factor": "dB", "runtime": "min", "signal": "dBm",
+    "signal_loss": "dB", "snr": "dB", "state": "", "temperature": "°C", "tv_signal": "dBmV", "voltage": "V",
+    "waterflow": "l/min",
+}  # fmt: skip
+_SI_CLASSES = frozenset({"current", "power", "frequency", "bitrate"})  # shown with a prefix, as LibreNMS does
 
 
 def number(value: Any) -> float | None:
@@ -80,6 +95,35 @@ def speed(value: Any) -> str | None:
     if not found or found < 0:
         return None
     return _scaled(found, "", compact=True)
+
+
+def sensor_reading(value: Any, sensor_class: Any) -> str | None:
+    """A sensor's reading as LibreNMS shows it: ``41 °C``, ``-3.2 dBm``, ``2.4 kW`` (current, power, frequency and
+    bit rates with a prefix), ``1h 30m`` for a runtime (minutes); a state or a class without a unit as the bare
+    number. None when *value* is not a number."""
+    found = number(value)
+    if found is None:
+        return None
+    unit = SENSOR_UNITS.get(sensor_class, "") if isinstance(sensor_class, str) else ""
+    if sensor_class == "runtime":
+        return duration(found * 60)
+    if sensor_class in _SI_CLASSES and abs(found) >= 1000:
+        return _scaled(found, unit)
+    text = f"{round(found, 3):g}" if abs(found) < 1e6 else f"{found:.0f}"
+    return f"{text} {unit}" if unit else text
+
+
+def size(value: Any) -> str | None:
+    """A size in bytes with a binary prefix, as LibreNMS shows memory and storage: ``7.45 GiB``; None for no number
+    or a negative one."""
+    found = number(value)
+    if found is None or found < 0:
+        return None
+    for name, factor in _IEC:
+        if found >= factor:
+            shown = found / factor
+            return f"{shown:.3g} {name}" if shown < 1000 else f"{shown:.0f} {name}"  # 1023.9 MiB, never 1.02e+03
+    return f"{found:.0f} B"
 
 
 def parse_speed(text: Any) -> int | None:

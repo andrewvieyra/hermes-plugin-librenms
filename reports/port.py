@@ -35,6 +35,7 @@ from .context import (
     abbreviates,
     brief,
     folded,
+    measured_on,
     port_candidate,
     rows_of,
     sensor_status,
@@ -276,11 +277,7 @@ def _optics(ctx: ReportContext, port: Dict[str, Any], entities: Set[str]) -> Lis
     for sensor in rows_of(sensors):
         if str(sensor.get("device_id")) != str(port.get("device_id")) or sensor.get("sensor_class") != "dbm":
             continue
-        if truthy(sensor.get("sensor_deleted")):
-            continue
-        index = str(sensor.get("entPhysicalIndex") or "")
-        on_port = sensor.get("entPhysicalIndex_measured") == "ports" and index == str(port.get("ifIndex"))
-        if not (on_port or (index and index in entities)):
+        if truthy(sensor.get("sensor_deleted")) or not measured_on(sensor, port, entities):
             continue
         out.append({
             "sensor_id": sensor.get("sensor_id"),

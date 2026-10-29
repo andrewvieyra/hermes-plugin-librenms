@@ -6,6 +6,65 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-29
+
+### Added
+- View `health` of `librenms_report`: what each sensor reads against its limits, from one `resources/sensors`
+  read (LibreNMS's only route that holds every sensor's reading and limits; it takes no filter, so the scope and
+  filters apply in the plugin, and deleted sensors are left out). A row: the device, `sensor_id`, `class`,
+  `descr`, `value` in the class's `unit` (°C, dBm, V, RPM, ...; LibreNMS's units per class) with a `reading`
+  (`41 °C`, `-3.2 dBm`, `2.4 kW`; a counter sensor as its rate over the last poll, as LibreNMS shows it), the four
+  limits, `status` as LibreNMS's Sensor scopes decide it (`critical` strictly past `limit` or below `limit_low`,
+  `warning` past a warning limit, a limit not set never trips; `unknown` without a reading and for a `state`
+  sensor, whose number means what LibreNMS's state translations say, which no read route returns), `low_margin`
+  and `high_margin` (how far from the first limit the reading would cross going down or up, in its unit, negative
+  past it), `margin` and `nearest`, `alerting` (`sensor_alert`), and `stale` when the device was not polled for
+  two poll periods. For the rows of the page, a sensor on a port is named with it (`port_id`, `port`): measured on
+  the port's ifIndex or on one of its transceivers' inventory entities (as the `port` view ties its optics, now one
+  shared rule), or for a dBm sensor the port its description starts with; a dBm sensor carries its `direction`
+  (`rx`, `tx`) as the description says. Processors, memory pools and storage, which have no fleet-wide route, are
+  read per device (`devices/{id}/health/device_<kind>`, then a request each) for at most 5 devices and 8 of a kind
+  each: processors and memory pools when `filter.class` names none, else the kinds it names; a percentage against
+  LibreNMS's `*_perc_warn`, memory and storage with bytes used of their size. When the sensor listing is too large
+  to read (16 MiB) the sensors are read one device and one sensor at a time within the request budget, partial
+  when that leaves some unread. Filters `class` (the sensor classes, `processor`, `mempool`, `storage`), `status`,
+  `margin_below`, `direction`, `text`; sorts `status` (critical first, nearest a limit first), `margin`,
+  `low_margin`, `high_margin`, `value`, `name`. `summary`: `in_scope`, `by_status`, `by_class`, `devices`,
+  `hottest`, `nearest_limit` (the reading nearest a limit it has not crossed), `without_limits`, `alerting_off`,
+  `stale`; notes for state sensors, sensors without limits when filtering on status or margin, and stale readings.
+  Finding conv-health-sensors-optics.
+- View `routing`: BGP sessions and OSPF and OSPFv3 neighbours from `bgp`, `ospf` and `ospfv3`, one read each (by
+  device id for a scope of one device; `remote_asn` for `filter.remote_as`, which reads BGP alone), kept to the
+  scope. BGP rows: `session_id`, `peer` and `local_address` (IPv6 written short), `remote_as`, `as_name`,
+  `description`, `state`, `admin_status`, `enabled` (`start` or `running`), `established`, `up_for_s`/`up_for` or
+  `down_for_s`/`down_for` (`bgpPeerFsmEstablishedTime` at the last poll plus the time since; no `down_for` for a
+  session never established since the router booted), `last_error` (LibreNMS's text, else the name of the BGP
+  error code and Cease subcode, with the codes), `vrf_id` and `context` when set. OSPF and OSPFv3 rows:
+  `neighbour_id`, `peer`, `router_id`, `state`, `established` (`full`), the port it is on (named for the page from
+  its device's port names), `priority`, `events`, `retransmit_queue`. `not_established` keeps what LibreNMS
+  alarms on (`BgpPeer::inAlarm`: enabled and not established; an OSPF neighbour not full); a note says `twoWay` is
+  the steady state between two routers that are neither DR nor BDR. LibreNMS's HTTP 500 `Error retrieving
+  ospfv3_nbrs` (no OSPFv3 neighbour) is read as none, and so, with a note, is the 404 of a LibreNMS too old to have
+  the route; any other failure of a protocol leaves it out, partial, unless it is the only one read. Filters `protocol`, `not_established`, `enabled`, `state`, `remote_as` (`65001`,
+  `AS65001`, asdot `1.10`), `text`; sorts `state` (down first, then shut down, then up), `name`, `up_for`
+  (shortest first), `remote_as`. `summary`: `by_protocol`, `not_established`, `devices`, `by_state`, `stale`.
+- View `help` explains both views (filters, sorts, rows, summary, examples, which the tests run), and its `units`
+  line says a health reading's value is in its row's `unit`.
+- The operator questions of the conversational audit about device health and routing, each answered in one call
+  and tested as such (tests/test_report_health.py): sensors over threshold (39), whether anything runs hot, the
+  temperature and CPU of one device (40), optics near their low Rx threshold (41), BGP sessions that are down
+  (50), how long the session to an AS has been up (51) and OSPF neighbours that are not full (52).
+- The fake LibreNMS answers `devices/{hostname}/health/{type?}/{sensor_id?}` (the classes, the ids, one row) with
+  processors, memory pools and storage, and `ospfv3` (with LibreNMS's HTTP 500 when there is no neighbour).
+
+### Changed
+- The port names a view joins to its rows come from one shared helper (`ReportContext.ports_by_device`: each
+  device's ports with `port_id,ifIndex,ifName,ifDescr,ifAlias`, read once per report, at most 10 devices), which
+  `alerts` now uses too (it read four columns: `ifIndex` is added, for `health`).
+- `sensor_status` gives no status for a `state` sensor (its number is not a measurement against limits).
+- The tool description names `health` and `routing`; the six schemas take 14,411 of their 16,384 bytes, leaving
+  1,973 for 0.9.0.
+
 ## [0.7.0] - 2026-10-29
 
 ### Added

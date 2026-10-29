@@ -7,7 +7,7 @@ asks for them. A row names the device, the rule and its severity, the state (``a
 seen and what alerted: ``entity_type`` (``port`` for LibreNMS's ``interface``, ``sensor``, ...), its id
 (``port_id``, ``sensor_id``, else ``entity_id``) and ``entity``, its label, taken from the rows the rule matched
 through the label allow-list of :func:`redact.alert_entities` (a port as ``ifName (ifAlias)``). A port whose fault
-holds no label is named from its device's ports (four columns, for at most :data:`PORT_MAP_READS` devices). Faults
+holds no label is named from its device's port names (:meth:`.context.ReportContext.ports_by_device`). Faults
 come with LibreNMS's ``details`` (every column of every table the rule joins, and the alert's contacts): no row and
 no summary carries any of it but those labels. An answer too large to read is read again one severity at a time.
 
@@ -63,8 +63,6 @@ LOG_STATES = {0: "recovered", 1: "alerted", 2: "acknowledged", 3: "worse", 4: "b
 HISTORY_STATES = ("alerted", "recovered", "acknowledged", "worse", "better", "changed")
 BY = One(("rule", "device", "event"))
 PORT_ENTITIES = frozenset({"interface", "port"})  # LibreNMS's morph name for a Port is "interface"
-PORT_COLUMNS = "port_id,ifName,ifDescr,ifAlias"
-PORT_MAP_READS = 10  # devices whose ports are read to name the port faults that hold no label
 TOP = 5  # rules and devices a history summary names
 RULES_SHOWN = 10  # rules the alerts summary counts by name
 PAGE = 250  # alert-log entries one request asks for
@@ -262,23 +260,21 @@ def _alert(ctx: ReportContext, devices: Dict[int, Dict[str, Any]], fault: Dict[s
 
 
 def _name_ports(ctx: ReportContext, alerts: List[_Alert]) -> None:
-    """Name the ports of the faults among *alerts* on a port whose details hold no label, from their devices' ports
-    (:data:`PORT_COLUMNS`), at most :data:`PORT_MAP_READS` devices; a read that fails or is past the budget leaves
+    """Name the ports of the faults among *alerts* on a port whose details hold no label, from their devices' port
+    names (:meth:`ReportContext.ports_by_device`: at most 10 devices); a read that fails or is past the budget leaves
     them unnamed and the answer partial."""
     by_device: Dict[Any, List[_Alert]] = {}
     for item in alerts:
         if item.port_id is not None and item.row["device_id"] is not None:
             by_device.setdefault(item.row["device_id"], []).append(item)
-    for number, (device_id, items) in enumerate(by_device.items()):
-        if number >= PORT_MAP_READS:
-            ctx.notes.append(
-                f"the ports of {len(by_device) - PORT_MAP_READS} more devices' alerts were not named (a report reads "
-                f"the ports of at most {PORT_MAP_READS} devices for it): view port names one by its port_id"
-            )
-            break
-        what = f"the names of device {device_id}'s alerting ports"
-        ports = ctx.optional(what, "devices", device_id, "ports", params={"columns": PORT_COLUMNS})
-        names = {str(port.get("port_id")): port_label(port) for port in rows_of(ports)}
+    ports = ctx.ports_by_device(
+        by_device,
+        "the names of device {}'s alerting ports",
+        "the ports of {} more devices' alerts were not named",
+        "view port names one by its port_id",
+    )
+    for device_id, items in by_device.items():
+        names = {str(port.get("port_id")): port_label(port) for port in ports.get(device_id, ())}
         for item in items:
             item.row["entity"] = names.get(str(item.port_id))
 

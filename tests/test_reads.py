@@ -126,6 +126,30 @@ class ReportRoutes(HandlerCase):
         out = self.query("ospf", params={"hostname": "core-sw1.example.net"}, fields=["ospfNbrRtrId", "ospfNbrState"])
         self.assertEqual(out["results"], [{"ospfNbrRtrId": "198.51.100.2", "ospfNbrState": "full"}])
 
+    def test_health_classes_ids_and_one_of_them(self):
+        out = self.query("devices/core-sw1.example.net/health")
+        self.assertEqual(
+            [row["name"] for row in out["results"]],
+            ["device_temperature", "device_dbm", "device_processor", "device_storage", "device_mempool"],
+        )
+        out = self.query("devices/core-sw1.example.net/health/device_processor")
+        self.assertEqual(out["results"], [{"sensor_id": 1, "desc": "CPU 0"}])
+        out = self.query("devices/1/health/processor/1", fields=["processor_usage", "processor_perc_warn"])
+        self.assertEqual(out["results"], [{"processor_usage": 97, "processor_perc_warn": 75}])
+        out = self.query("devices/1/health/device_temperature/1", fields=["sensor_current", "sensor_limit"])
+        self.assertEqual(out["results"], [{"sensor_current": 41, "sensor_limit": 60}])
+        self.assertEqual(self.query("devices/1/health/device_temperature/2")["count"], 0)  # sensor 2 is an optic
+        self.assertEqual(self.query("devices/lab-fw1.example.net/health")["count"], 0)
+
+    def test_ospfv3_answers_500_without_a_neighbour(self):
+        out = self.query("ospfv3")
+        self.assertFalse(out["success"])
+        self.assertEqual((out["librenms"]["status"], out["librenms"]["body"]["message"]),
+                         (500, "Error retrieving ospfv3_nbrs"))  # fmt: skip
+        self.fake.seed("ospfv3_nbrs", {"device_id": 1, "ospfv3NbrRtrId": "198.51.100.2", "ospfv3NbrState": "full"})
+        out = self.query("ospfv3", params={"hostname": "core-sw1.example.net"}, fields=["ospfv3NbrRtrId"])
+        self.assertEqual(out["results"], [{"ospfv3NbrRtrId": "198.51.100.2"}])
+
     def test_syslog_and_the_alert_log_page_with_a_total(self):
         out = self.query("logs/syslog/edge-rtr1.example.net", limit=1, fields=["seq", "msg"])
         self.assertEqual((out["count"], out["total"], out["truncated"]), (1, 2, True))

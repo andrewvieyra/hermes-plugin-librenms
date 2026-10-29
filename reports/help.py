@@ -28,8 +28,8 @@ CONTRACT = {
     "count counts every row that passed the filter and summary is over all of them; truncated: more rows follow, "
     "read on with next_offset as offset. partial: the data itself is incomplete (partial_reason): say so, never "
     "present it as complete.",
-    "units": "In key names: *_s seconds, *_bps bit/s, *_pct percent, each with a readable twin (uptime, in). Times "
-    "ending Z are UTC. Ages count to data_as_of, LibreNMS's clock. LibreNMS writes fault and log times in its "
+    "units": "In key names: *_s seconds, *_bps bit/s, *_pct percent, each with a readable twin (uptime, in); a health "
+    "reading's value is in its row's unit. Times ending Z are UTC. Ages count to data_as_of, LibreNMS's clock. LibreNMS writes fault and log times in its "
     "server's zone, which only librenms_timezone names: timezone unknown means those times are shown as written, "
     "with no age.",
     "window": "Views over a span of time (alert_history): 1h, 24h, 7d, 30d, another duration up to a year, or today "
@@ -262,6 +262,80 @@ TOPICS: Dict[str, Dict[str, Any]] = {
             {"view": "alert_history", "window": "7d", "filter": {"by": "device"}, "sort": "flaps"},
             {"view": "alert_history", "filter": {"disabled": True}},
             {"view": "alert_history", "filter": {"notifies": False}},
+        ],
+    },
+    "health": {
+        "line": "Sensors, optics, CPU, memory and storage against their limits.",
+        "answers": "What each sensor reads against its limits (temperature, optic dBm, voltage, fans, power, ...), as "
+        "LibreNMS decides its status, how near a limit it is, the port an optic is on; and for at most 5 devices "
+        "their processors and memory pools (when filter.class names none) or storage, in percent. Readings are the "
+        "last poll's: the API keeps no history of them.",
+        "rows": "device_id, hostname, sensor_id (processor_id, mempool_id, storage_id), class, descr, value with "
+        "unit and reading (41 °C, -3.2 dBm; a percentage for processors, memory and storage), status (critical, "
+        "warning, ok; unknown without a reading and for class state, whose meaning the API does not give), "
+        "limit_low, limit_low_warn, limit_warn, limit, low_margin and high_margin (how far from the first limit "
+        "below and above, in the reading's unit, negative past it), margin (the nearer) and nearest (low, high), "
+        "direction (rx, tx: dBm), port_id and port (the port a sensor is on, named for the page), alerting "
+        "(LibreNMS alerts on its limits), used/size and their *_bytes (memory, storage), stale (device not polled "
+        "lately: the last reading).",
+        "summary": "in_scope, by_status, by_class, devices, hottest (the highest temperature), nearest_limit (the "
+        "reading nearest a limit it has not crossed), without_limits, alerting_off, stale.",
+        "filters": {
+            "class": "Sensor classes (temperature, dbm, voltage, fanspeed, ...) or processor, mempool, storage.",
+            "status": "Readings in these states: warning and critical are past a limit.",
+            "margin_below": "Within this much of a limit, in the reading's unit (3 for 3 dB), or past it.",
+            "direction": "Optic power received (rx) or sent (tx), as the description says.",
+            "text": "In the description or the device's name.",
+        },
+        "sorts": {
+            "status": "Critical first, then warning, ok, unknown; nearest a limit first.",
+            "margin": "Nearest a limit (or furthest past) first.",
+            "low_margin": "Nearest the low limit first (an optic's received power falling).",
+            "high_margin": "Nearest the high limit first (running hot).",
+            "value": "Highest reading first.",
+            "name": "By device, class, description.",
+        },
+        "examples": [
+            {"view": "health", "filter": {"status": ["warning", "critical"]}},
+            {"view": "health", "scope": {"device": "core-sw1"}, "filter": {"class": ["temperature", "processor"]}},
+            {"view": "health", "filter": {"class": "dbm", "direction": "rx"}, "sort": "low_margin", "limit": 10},
+            {"view": "health", "filter": {"class": "temperature"}, "sort": "value", "limit": 10},
+        ],
+    },
+    "routing": {
+        "line": "BGP sessions and OSPF/OSPFv3 neighbours: up or not, for how long.",
+        "answers": "Per BGP session and OSPF or OSPFv3 neighbour of the devices in scope: its state, whether it is "
+        "established (OSPF: full), whether a BGP session is enabled, for how long it has been up or down, its last "
+        "error. not_established is what LibreNMS alarms on: an enabled BGP session not established, an OSPF "
+        "neighbour not full.",
+        "rows": "device_id, hostname, protocol (bgp, ospf, ospfv3); BGP: session_id, peer, remote_as, as_name, "
+        "description, local_address, state, admin_status, enabled, established, up_for_s/up_for or down_for_s/"
+        "down_for (since it was last established; null when it never was since the router booted), last_error (it "
+        "may predate the current session), vrf_id, context; OSPF: neighbour_id, peer, router_id, state, "
+        "established (full), port_id and port (named for the page), priority, events (state changes), "
+        "retransmit_queue; stale (device not polled lately).",
+        "summary": "by_protocol (BGP: sessions, established, not_established, disabled; OSPF: neighbours, full, "
+        "not_full), not_established, devices, by_state, stale.",
+        "filters": {
+            "protocol": "Only these protocols.",
+            "not_established": "What LibreNMS alarms on (true): enabled BGP sessions not established, OSPF "
+            "neighbours not full; or the rest.",
+            "enabled": "BGP sessions administratively enabled (true) or shut down; OSPF neighbours count as enabled.",
+            "state": "In these states (BGP: idle ... established; OSPF: down ... twoWay ... full).",
+            "remote_as": "BGP sessions to this AS: 65001, AS65001 or asdot 1.10.",
+            "text": "In the peer's address, router id, AS name or description, or the device's name.",
+        },
+        "sorts": {
+            "state": "Not established first, then shut down, then up.",
+            "name": "By device, protocol, peer.",
+            "up_for": "Up the shortest time first (recently reset), then those not up.",
+            "remote_as": "By remote AS.",
+        },
+        "examples": [
+            {"view": "routing", "filter": {"not_established": True}},
+            {"view": "routing", "filter": {"remote_as": "AS64500"}},
+            {"view": "routing", "scope": {"device": "core-sw1"}, "filter": {"protocol": "ospf"}},
+            {"view": "routing", "filter": {"protocol": "bgp"}, "sort": "up_for"},
         ],
     },
 }

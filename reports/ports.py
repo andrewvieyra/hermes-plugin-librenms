@@ -265,6 +265,13 @@ def last_change(port: Dict[str, Any], device: Dict[str, Any], now: datetime) -> 
     return int(uptime - ticks / 100) + since_poll, False
 
 
+def device_stale(device: Dict[str, Any], now: datetime) -> bool:
+    """Whether what LibreNMS holds of *device* from polling (sensor readings, sessions) is not current: its last poll
+    is more than :data:`STALE_POLLS` polls (:data:`POLL_S`) before *now*, or it was never polled."""
+    polled = units.utc_time(device.get("last_polled"))
+    return polled is None or (units.age(polled, now) or 0) > STALE_POLLS * POLL_S
+
+
 def no_description(port: Dict[str, Any]) -> bool:
     """Whether the port has no description of its own: ``ifAlias`` empty, or the same as its ``ifName`` or
     ``ifDescr`` (some devices copy one into it)."""
