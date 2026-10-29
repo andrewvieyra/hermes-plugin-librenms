@@ -6,6 +6,54 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-29
+
+### Security
+- The approval prompt shows the steps where Hermes cuts it. Hermes' CLI panel shows 9 rows of 64 columns of the
+  message, Discord 300 characters, Slack and Telegram 500, and the message spent them on a long header and the
+  rendered plan's Plan/LibreNMS/Created lines: a person approved a two-step plan seeing one field of the first step
+  in the CLI and no step at all on Discord. It now opens with one header line (plan id, counts, irreversible steps,
+  `rollback_on_failure` or `FORCE`), then one line per step naming the object and the fields it sets, deletes and
+  irreversible steps first and marked; the field-level diff, the warnings and the description follow while room
+  remains, and the message ends with `/librenms show <id>`. A rollback prompt lists each pending entry and what
+  reverting it does. Every line is cut to 120 characters and a label to 40, and a line that does not fit is left
+  out and counted instead of ending the message: a 255-character location name (one the model chose, or one
+  LibreNMS took from a device's `sysLocation`) escaped to 1,530 characters had hidden a delete after it.
+- A `plan_id` that names no saved plan is blocked by the approval hook, with the handler's refusal, instead of
+  being put to a person as an "unknown" change. The handler resolved the text again after the answer, so a plan
+  created while the prompt was open (by another session, a subagent, cron or the CLI) ran without anyone seeing it:
+  `lnp-2` matches every plan id of the year. `librenms_apply` and `librenms_rollback` now take only a plan's full id;
+  a fragment is refused, naming the plan it ends. A failure to load the plan blocks too. Both are audited as
+  `apply_refused` / `rollback_refused` with `tool` set to the write tool.
+- `librenms_plans` returns each actor of a plan (`apply`, `rollback`, `checks[]`) in a public form: how and where it
+  acted and the phrase the diff and the journal show. Plans belong to the profile, so another user's session on a
+  shared gateway read the message someone else typed to start an apply (a password in prose included) and their
+  sender id. The plan file and the audit stream keep the whole record.
+- That phrase (`Created: … by`, `Applied: … by`, `Rolled back: … by`) names the user and the chat by display name
+  only. It fell back to the user, sender and chat ids, so a Signal user without a profile name showed as their
+  phone number in every session of the profile. Hermes also fills a name in with the id where a platform has none
+  (SMS, Signal), so a name that is one of the actor's ids, holds one or is part of one is left out too. Such a
+  user is "an unnamed user", and such a chat goes by its type alone.
+- The terminal guard also reads what `process_manage` writes or submits to the input of a shell
+  `terminal(background=true)` started, which no Hermes guard sees: `hermes librenms apply` sent there ran as an
+  operator, past the approval prompt and `operator_only`, without any obfuscation.
+- The terminal guard's match takes linear time. It scanned from every `hermes` to the end of the line, so a long
+  line repeating it (a JSON list of `~/.hermes` paths) held the agent loop in `pre_tool_call` for seconds before
+  every `terminal` and `execute_code` call (7.6 s for 112 KB). Padding between `hermes` and `librenms` does not hide
+  the command either.
+- `/librenms` and `hermes librenms` resolve a plan fragment only as the end of one id, at least four characters
+  long, and say which plan it named. Any fragment matched anywhere in an id, so with one plan saved
+  `/librenms apply 2` (every id holds `2026`) or `/librenms apply -` applied it at once.
+- Audit events no longer carry unbounded model text: a rejected plan's description is cut to 200 characters, a
+  refusal's reason and first error to 500, and every string of an event to 2,000, saying so. A UDP syslog message
+  over 8,192 bytes is fitted (strings clipped, else only the common fields and the actor, marked
+  `"truncated": true`) instead of failing the send: a padded refused attempt never reached the collector.
+
+### Changed
+- Approval rule keys always name a saved plan; `librenms:<tool>:unresolved:<digest>` is no longer issued.
+- `librenms_plans` with `plan_id` accepts the end of an id (four or more characters) but no longer a substring from
+  its middle.
+
 ## [0.1.1] - 2026-10-29
 
 ### Security

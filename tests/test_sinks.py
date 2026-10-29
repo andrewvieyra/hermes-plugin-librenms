@@ -519,6 +519,48 @@ class Delivery(EnvCase):
         finally:
             _stop(server)
 
+    def test_an_oversize_udp_message_is_fitted_rather_than_dropped(self):
+        # a padded refusal failed the send ("Message too long") and never reached the collector; the test server reads
+        # 8,192 bytes of a datagram, as rsyslog does by default
+        server = _serve(_UDP(("127.0.0.1", 0), _UDPHandler))
+        try:
+            worker = sinks.SinkWorker([sinks.SyslogSink("127.0.0.1", server.server_address[1])])
+            errors = [{"index": n, "error": "x" * 2000} for n in range(40)]
+            worker.enqueue(_record("plan_rejected", description="d" * 2000, errors=errors))
+            worker.enqueue(_record("plans_pruned", plan_ids=[f"lnp-20261028T190000Z-{n:04x}" for n in range(3000)]))
+            worker.enqueue(_record("step_done"))
+            self.assertTrue(worker.flush(5))
+            self.assertTrue(_wait(lambda: len(server.received) == 3))
+            self.assertEqual(worker.stats["sent"], 3)
+            worker.close(1)
+        finally:
+            _stop(server)
+        self.assertTrue(all(len(datagram) <= sinks.UDP_MAX_BYTES for datagram in server.received))
+        rejected, pruned, done = (json.loads(m.decode().split(" - ", 1)[1]) for m in server.received)
+        self.assertEqual((rejected["event"], rejected["truncated"]), ("plan_rejected", True))
+        self.assertEqual(rejected["description"], "d" * 100 + "… [truncated 1900 chars]")
+        self.assertEqual(len(rejected["errors"]), 40)
+        self.assertEqual(rejected["actor"]["request"], "Move sw1 | to SFO")
+        # a list no clip shortens: the common fields and the actor
+        self.assertEqual(list(pruned), [*sinks.COMMON_FIELDS, "truncated"])
+        self.assertEqual((pruned["event"], pruned["actor"]["user_name"]), ("plans_pruned", "Andrew"))
+        self.assertNotIn("truncated", done)
+
+    def test_only_udp_messages_are_fitted(self):
+        record = _record("plan_rejected", description="d" * 2000, errors=[{"error": "x" * 2000}] * 10)
+        self.assertGreater(len(sinks.SyslogSink("127.0.0.1", 514, protocol="tcp").payload(record)), 20_000)
+        fitted = sinks.SyslogSink("127.0.0.1", 514).payload(record)
+        self.assertLessEqual(len(fitted), sinks.UDP_MAX_BYTES)
+        self.assertEqual(
+            json.loads(fitted.decode().split(" - ", 1)[1])["description"], "d" * 500 + "… [truncated 1500 chars]"
+        )
+        # past every clip (an actor no event has): cut to the limit, still UTF-8
+        odd = _record("step_done", actor={f"field{n}": "é" * 100 for n in range(100)})
+        cut = sinks.SyslogSink("127.0.0.1", 514, fmt="cef").payload(odd)
+        self.assertLessEqual(len(cut), sinks.UDP_MAX_BYTES)
+        cut.decode("utf-8")
+        self.assertEqual(sinks.COMMON_FIELDS, tuple(_record("step_done")))  # every event's common fields
+
     def test_udp_syslog_over_ipv6(self):
         try:
             server = _serve(_UDP6(("::1", 0), _UDPHandler))

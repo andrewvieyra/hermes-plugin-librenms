@@ -59,6 +59,7 @@ from typing import Any, Dict, List
 from urllib.parse import urlsplit
 
 from .client import env_file
+from .redact import clip
 from .settings import Settings, flag, get_settings
 from .store import PLUGIN_NAME, profile_key
 from .version import __version__
@@ -76,6 +77,11 @@ CEF_VENDOR = "andrewvieyra"
 CEF_PRODUCT = "hermes-plugin-librenms"
 APP_NAME = "hermes-librenms"
 SOURCETYPE = "hermes:librenms:audit"
+# The largest syslog message sent over UDP, in bytes. Larger datagrams fail outright (Linux refuses one over
+# 65,507 bytes, macOS over 9,216) or arrive cut mid-JSON (rsyslog's default limit is 8 KiB), so one is fitted.
+UDP_MAX_BYTES = 8192
+# What every event carries (audit.AuditLog.emit), kept when an oversize UDP message has to lose its details.
+COMMON_FIELDS = ("ts", "schema", "plugin", "event", "plan_id", "librenms_url", "config_digest", "actor", "host", "pid")
 
 FACILITIES = {
     "kern": 0,
@@ -366,8 +372,22 @@ class SyslogSink(Sink):
         self._sock = sock
         return sock
 
-    def send(self, record: Dict[str, Any]) -> None:
+    def payload(self, record: Dict[str, Any]) -> bytes:
+        """The message as sent. Over UDP one longer than :data:`UDP_MAX_BYTES` is fitted rather than refused by the
+        socket or cut mid-JSON by the collector: its strings are clipped, saying so, and when that is not enough
+        (a long list) only the common fields and the actor are kept; a fitted record carries ``"truncated": true``."""
         payload = self.message(record).encode("utf-8")
+        if self.protocol != "udp" or len(payload) <= UDP_MAX_BYTES:
+            return payload
+        common = {key: record.get(key) for key in COMMON_FIELDS}
+        for fitted in (clip(record, 500), clip(record, 100), clip(common, 100)):
+            payload = self.message({**fitted, "truncated": True}).encode("utf-8")
+            if len(payload) <= UDP_MAX_BYTES:
+                return payload
+        return payload[:UDP_MAX_BYTES].decode("utf-8", "ignore").encode("utf-8")
+
+    def send(self, record: Dict[str, Any]) -> None:
+        payload = self.payload(record)
         try:
             sock = self._connect()
             if self.protocol == "udp":

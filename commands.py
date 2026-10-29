@@ -15,7 +15,7 @@ from . import audit, handlers, timefmt
 from .client import LibreNMSError
 from .redact import mask, one_line, printable
 from .settings import get_settings
-from .store import get_store
+from .store import MIN_FRAGMENT, get_store
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ _HELP = """\
   status                            Connectivity check, LibreNMS version, write mode and settings
   plans [status]                    List saved plans (optionally filtered by status)
   show <plan_id>                    Full diff, journal and rollback outcome of one plan
-                                    (<plan_id> may be an unambiguous suffix, e.g. 4f1a)
+                                    (<plan_id> may be the end of one, 4+ characters, e.g. 4f1a)
   check <plan_id>                   Re-verify a plan's preconditions without writing
   apply <plan_id> [--no-rollback]   Apply a reviewed plan
   rollback <plan_id> [--force]      Revert an applied plan from its journal
@@ -48,7 +48,8 @@ _SYNTAX: Dict[str, Tuple[str, int, Dict[str, bool]]] = {
 }
 _PLAN_COMMANDS = ("show", "check", "apply", "rollback")
 
-# Hermes binds these for an agent session and its terminal tool passes them to the shells it starts.
+# Hermes binds these for an agent session and its terminal tool passes them to the shells it starts. Not
+# HERMES_AGENT or AI_AGENT: every `hermes` command sets those in its own environment, an operator's included.
 AGENT_SESSION_VARS = ("HERMES_SESSION_ID", "HERMES_SESSION_KEY")
 AGENT_SESSION_REASON = "started from a Hermes agent session"
 
@@ -141,13 +142,27 @@ def _prune(options: Dict[str, Any], prog: str, actor: Dict[str, Any]) -> str:
 
 
 def _resolve(fragment: str, prog: str) -> Tuple[str | None, str]:
-    """``(plan_id, "")`` for what the operator typed, or ``(None, message)`` when it is unknown or ambiguous."""
+    """``(plan_id, "")`` for what the operator typed, or ``(None, message)`` when it is unknown, ambiguous or too
+    short to name a plan (:meth:`PlanStore.resolve`): apply and rollback run at once, so a typo must not pick
+    whichever plan happens to contain it."""
     plan_id, candidates = get_store().resolve(fragment)
     if plan_id is not None:
         return plan_id, ""
-    if not candidates:
-        return None, f"No plan matches {fragment!r}. Use {prog} plans to list them."
-    return None, f"{fragment!r} is ambiguous; matches:\n" + "\n".join(f"  {one_line(c)}" for c in candidates)
+    if len(candidates) > 1:
+        return None, f"{fragment!r} is ambiguous; matches:\n" + "\n".join(f"  {one_line(c)}" for c in candidates)
+    if len(fragment.strip()) < MIN_FRAGMENT:
+        return None, (
+            f"{fragment!r} is too short to name a plan: give the full plan id or its last {MIN_FRAGMENT} or more "
+            f"characters (e.g. 4f1a). Use {prog} plans to list them."
+        )
+    return None, f"No plan matches {fragment!r}. Use {prog} plans to list them."
+
+
+def _named(fragment: str, plan_id: str) -> str:
+    """The line that says which plan a fragment named: its id, status and description."""
+    plan = get_store().load(plan_id) or {}
+    description = f": {one_line(plan['description'])}" if plan.get("description") else ""
+    return f"{fragment.strip()!r} is plan {plan_id} ({one_line(plan.get('status'))}){description}"
 
 
 def _agent_shell_refusal(cmd: str, plan_id: str, actor: Dict[str, Any]) -> str | None:
@@ -222,7 +237,10 @@ def _run(argv: List[str], via: str, actor: Dict[str, Any]) -> str:
     plan_id, message = _resolve(positional[0], prog)
     if plan_id is None:
         return message
-    return _plan_command(cmd, plan_id, options, via, actor)
+    if cmd == "show" or positional[0].strip() == plan_id:  # the diff names it; so did the operator
+        return _plan_command(cmd, plan_id, options, via, actor)
+    named = _named(positional[0], plan_id)
+    return f"{named}\n{_plan_command(cmd, plan_id, options, via, actor)}"
 
 
 def run(argv: List[str], *, via: str = audit.VIA_SLASH, caller: Dict[str, Any] | None = None) -> str:

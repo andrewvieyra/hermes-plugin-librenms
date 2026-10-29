@@ -158,6 +158,28 @@ class AuditCase(unittest.TestCase):
 
 
 class ActorCapture(AuditCase):
+    def test_public_actor_keeps_how_and_where_but_no_words_or_ids(self):
+        os.environ.update(_SESSION)
+        audit.remember_request("sess-abc", "t-1", "apply it; my password is hunter2", "alice-123")
+        actor = audit.capture_actor({"task_id": "t-1", "session_id": "sess-abc"}, via=audit.VIA_MODEL)
+        self.assertEqual(
+            audit.public_actor(actor),
+            {
+                "kind": "model",
+                "via": "tool",
+                "surface": None,
+                "platform": "signal",
+                "source": "gateway",
+                "profile": None,
+                "chat_type": "dm",
+                "cron": False,
+                "cron_job_id": None,
+                "by": "model via tool on signal for Andrew in dm Andrew",
+            },
+        )
+        for other in (None, "unknown", [actor]):
+            self.assertIs(audit.public_actor(other), other)
+
     def test_model_actor_from_session_context_and_kwargs(self):
         os.environ.update(_SESSION)
         actor = audit.capture_actor(
@@ -266,6 +288,32 @@ class ActorCapture(AuditCase):
         )
         self.assertEqual(audit.describe_actor(None), "unknown")
 
+    def test_describe_actor_names_no_id(self):
+        # Signal without a profile name: no names bound, or (as Hermes' adapter does) the number as the user's name;
+        # SMS binds it as the chat's name too
+        ids = {key: value for key, value in _SESSION.items() if not key.endswith("_NAME")}
+        for names in ({}, {"HERMES_SESSION_USER_NAME": "+15550001111"}, {
+            "HERMES_SESSION_USER_NAME": "+15550001111", "HERMES_SESSION_CHAT_NAME": "+15550001111"
+        }):  # fmt: skip
+            with self.subTest(names=names):
+                for name in _SESSION:
+                    os.environ.pop(name, None)
+                os.environ.update({**ids, **names})
+                actor = audit.capture_actor({"session_id": "sess-abc", "task_id": "t-1"})
+                self.assertEqual(actor["user_id"], "+15550001111")  # the record keeps the ids
+                by = audit.describe_actor(actor)
+                self.assertEqual(by, "model via tool on signal for an unnamed user in dm")
+                self.assertEqual(audit.public_actor(actor)["by"], by)
+        # a name built around an id (A2A's chat), or one that is part of an id (a BlueBubbles group's identifier in
+        # its chat guid), is left out; a name that only shares a few characters with an id is not
+        actor = {"kind": "model", "via": "tool", "platform": "a2a", "user_id": "peer-7", "user_name": "peer-7"}
+        actor.update(chat_type="dm", chat_id="ctx-1", chat_name="a2a:peer-7")
+        self.assertEqual(audit.describe_actor(actor), "model via tool on a2a for an unnamed user in dm")
+        actor.update(chat_type="group", chat_id="iMessage;+;chat0123456", chat_name="chat0123456", user_name="Bo")
+        self.assertEqual(audit.describe_actor(actor), "model via tool on a2a for Bo in group")
+        actor.update(chat_id="-10", chat_name="NOC -10 bridge", user_id="42", user_name="Andrew 42")
+        self.assertEqual(audit.describe_actor(actor), "model via tool on a2a for Andrew 42 in group NOC -10 bridge")
+
 
 class RequestCache(AuditCase):
     def test_tool_call_recalls_the_turns_message_and_sender(self):
@@ -273,7 +321,7 @@ class RequestCache(AuditCase):
         actor = audit.capture_actor({"session_id": "sess-1", "task_id": "task-1"})
         self.assertEqual(actor["request"], "Put sw1 in maintenance for 2h")
         self.assertEqual(actor["sender_id"], "+15550001111")
-        self.assertEqual(audit.describe_actor(actor), "model via tool for +15550001111")
+        self.assertEqual(audit.describe_actor(actor), "model via tool for an unnamed user")
 
     def test_lookup_falls_back_to_the_latest_message_of_the_session(self):
         audit.remember_request("sess-1", "task-1", "first", None)
@@ -456,11 +504,25 @@ class EventStream(AuditCase):
 
         os.write = counting_write
         try:
-            audit.emit("plan_created", plan_id="lnp-1", description="d" * 100_000)
+            audit.emit("plans_pruned", plan_ids=["d" * 1000] * 100)  # strings are clipped, lists are not
         finally:
             os.write = real_write
         self.assertEqual(len(writes), 1)
-        self.assertEqual(len(self.events()[0]["description"]), 100_000)
+        self.assertGreater(writes[0], 100_000)
+        self.assertEqual(self.events()[0]["plan_ids"], ["d" * 1000] * 100)
+
+    def test_every_string_is_clipped_saying_so(self):
+        # the model can pad what it sends; a collector cuts a long event mid-JSON, and UDP drops it
+        audit.emit(
+            "plan_rejected",
+            description="d" * 100_000,
+            errors=[{"error": "e" * 3000}],
+            actor={"kind": "model", "request": "r" * 2000},
+        )
+        (event,) = self.events()
+        self.assertEqual(event["description"], "d" * audit.TEXT_LIMIT + "… [truncated 98000 chars]")
+        self.assertEqual(event["errors"], [{"error": "e" * 2000 + "… [truncated 1000 chars]"}])
+        self.assertEqual(event["actor"]["request"], "r" * 2000)  # at the limit: whole
 
     def test_concurrent_writers_never_interleave_lines(self):
         other = audit.AuditLog(self.audit_path)  # a second writer on the same file, like another process
@@ -468,7 +530,7 @@ class EventStream(AuditCase):
         def worker(n):
             log = other if n % 2 else audit.get_audit_log()
             for i in range(25):
-                log.emit("step_done", plan_id=f"lnp-{n}", index=i, label=str(n) * 20_000)
+                log.emit("step_done", plan_id=f"lnp-{n}", index=i, labels=[str(n) * 1000] * 20)
 
         threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
         for t in threads:
@@ -478,7 +540,7 @@ class EventStream(AuditCase):
         events = self.events()
         self.assertEqual(len(events), 150)
         for event in events:
-            self.assertEqual(event["label"], event["plan_id"][-1] * 20_000)
+            self.assertEqual(event["labels"], [event["plan_id"][-1] * 1000] * 20)
 
     def test_lone_surrogates_are_replaced(self):
         audit.emit("step_done", plan_id="lnp-1", label="sw\ud800-1", actor={"request": "a\udfffb"})
@@ -701,6 +763,71 @@ class Lifecycle(PluginTestCase):
         text = self.audit_path.read_text(encoding="utf-8")
         for secret in (TOKEN, "acc3ss-Community", "Sup3rS3cret"):
             self.assertNotIn(secret, text)
+
+    def test_another_session_reads_no_users_words_or_ids(self):
+        # Alice's DM: a plan checked, applied and rolled back with her message on record; another session of the same
+        # profile (Bob, on the same gateway) reads the plan
+        said = "mark access-sw2 decommissioned. fyi the vendor portal login is alice / Tr0ub4dor&3"
+        audit.remember_request("sess-abc", "t-9", said, "alice-123")
+        alice = {"task_id": "t-9", "session_id": "sess-abc"}
+        operations = [{"op": "update", "resource": "device", "id": 3, "data": {"purpose": "decommissioned"}}]
+        pid = self.call("librenms_plan", {"description": "tidy", "operations": operations}, **alice)["plan_id"]
+        self.call("librenms_apply", {"plan_id": pid, "dry_run": True}, **alice)
+        self.call("librenms_apply", {"plan_id": pid}, **alice)
+        self.call("librenms_rollback", {"plan_id": pid}, **alice)
+        raw = self.handlers.librenms_plans({"plan_id": pid}, task_id="t-1", session_id="sess-bob")
+        for private in ("Tr0ub4dor", "vendor portal", "alice-123", "+15550001111", "uuid-1234", "sess-abc", "m-77"):
+            self.assertNotIn(private, raw)
+        shown = json.loads(raw)
+        for record in (shown["apply"], shown["rollback"], *shown["checks"]):
+            self.assertEqual(list(record["actor"]), [*audit.PUBLIC_ACTOR_FIELDS, "by"])
+            self.assertEqual(record["actor"]["by"], "model via tool on signal for Andrew in dm Andrew")
+            self.assertEqual((record["actor"]["kind"], record["actor"]["chat_type"]), ("model", "dm"))
+        self.assertEqual(len(shown["checks"]), 1)
+        self.assertEqual(shown["apply"]["outcome"], "applied")
+        # the plan file and the audit stream keep the whole record
+        stored = self.store.load(pid)
+        for actor in (stored["apply"]["actor"], stored["rollback"]["actor"], stored["checks"][0]["actor"]):
+            self.assertEqual((actor["sender_id"], actor["user_id"]), ("alice-123", "+15550001111"))
+            self.assertIn("Tr0ub4dor", actor["request"])
+        self.assertIn("Tr0ub4dor", self.events("apply_started")[0]["actor"]["request"])
+
+    def test_another_session_reads_no_ids_of_an_unnamed_user(self):
+        # Alice on Signal with no profile name: Hermes binds her number as the user and chat id, and its Signal
+        # adapter as her name too; then a turn without session variables, known only by the sender id pre_llm_call
+        # remembered
+        ids = {key: value for key, value in _SESSION.items() if not key.endswith("_NAME")}
+        unnamed = "model via tool on signal for an unnamed user in dm"
+        for bound, by in (
+            (ids, unnamed),
+            ({**ids, "HERMES_SESSION_USER_NAME": "+15550001111"}, unnamed),
+            ({}, "model via tool for an unnamed user"),
+        ):
+            with self.subTest(bound=sorted(bound)):
+                for name in _SESSION:
+                    os.environ.pop(name, None)
+                os.environ.update(bound)
+                audit.remember_request("sess-abc", "t-9", "mark access-sw2 decommissioned", "alice-123")
+                alice = {"task_id": "t-9", "session_id": "sess-abc"}
+                operations = [{"op": "update", "resource": "device", "id": 3, "data": {"purpose": "decommissioned"}}]
+                pid = self.call("librenms_plan", {"description": "tidy", "operations": operations}, **alice)["plan_id"]
+                self.call("librenms_apply", {"plan_id": pid, "dry_run": True}, **alice)
+                self.call("librenms_apply", {"plan_id": pid}, **alice)
+                self.call("librenms_rollback", {"plan_id": pid}, **alice)
+                raw = self.handlers.librenms_plans({"plan_id": pid}, task_id="t-1", session_id="sess-bob")
+                for private in ("alice-123", "+15550001111", "uuid-1234", "sess-abc", "m-77", "t-9"):
+                    self.assertNotIn(private, raw)
+                shown = json.loads(raw)
+                for record in (shown["apply"], shown["rollback"], *shown["checks"]):
+                    self.assertEqual(record["actor"]["by"], by)
+                for text, line in ((shown["diff"], "Created"), *((shown["report"], line) for line in (
+                    "Applied", "Rolled back"
+                ))):  # fmt: skip
+                    found = [row for row in text.splitlines() if row.startswith(f"{line}: ")]
+                    self.assertEqual(len(found), 1, text)
+                    self.assertTrue(found[0].endswith(f" by {by}"), found[0])
+                stored = self.store.load(pid)["apply"]["actor"]
+                self.assertEqual((stored["sender_id"], stored["session_id"]), ("alice-123", "sess-abc"))
 
 
 if __name__ == "__main__":

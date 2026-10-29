@@ -73,11 +73,16 @@ class PluginTestCase(unittest.TestCase):
             if module is not None:
                 getattr(module, function)(*args)
 
-    def plan(self, operations: List[Dict[str, Any]], description: str = "test") -> Dict[str, Any]:
-        """Build and save a plan as librenms_plan does, minus the handler (no actor, no plan_created event)."""
+    def plan(
+        self, operations: List[Dict[str, Any]], description: str = "test", plan_id: str | None = None
+    ) -> Dict[str, Any]:
+        """Build and save a plan as librenms_plan does, minus the handler (no actor, no plan_created event); under
+        *plan_id* when one is given (two plans that end alike)."""
         plan = submodule("planner").build_plan(
             self.client, operations, description, self.settings, self.client.base_url
         )
+        if plan_id is not None:
+            plan["id"] = plan_id
         self.store.create(plan)
         return plan
 

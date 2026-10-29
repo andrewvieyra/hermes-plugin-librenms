@@ -23,8 +23,12 @@ hermes > [librenms_plan]   Plan lnp-20261028T190312Z-7dde (planned) — Move acc
                            Summary: 0 create, 1 update, 0 delete, 1 action, 0 noop
          Step [1] cannot be undone: the window expires on its own after two hours. Apply? (yes/no)
 you    > yes
-hermes > [approval]        Apply LibreNMS plan lnp-20261028T190312Z-7dde to https://nms.example.com:
-                           0 create, 1 update, 0 delete, 1 action; irreversible steps [1]   [once/session/always/deny]
+hermes > [approval]        Apply lnp-20261028T190312Z-7dde: 1 update, 1 action; irreversible steps: [1];
+                           rollback_on_failure=true
+                           [1] maintenance device #3 "access-sw2.example.net" (irreversible):
+                               duration, start, title, notes, behavior
+                           [0] update device #3 "access-sw2.example.net": location_id, notes
+                           ...                                                  [once/session/always/deny]
 you    > once
 hermes > [librenms_apply]  [0] update device #3 -> done   [1] maintenance device #3 -> done
          Applied. access-sw2 is in SFO-1 and its alerts are held until 21:05.
@@ -238,8 +242,11 @@ Inside a session, `/librenms` gives an operator the same actions without going t
 ```
 
 The same subcommands exist as `hermes librenms …` in the shell, useful for rolling back after a
-session has ended. Both accept an unambiguous fragment of the plan id, so `/librenms apply 7dde`
-works from a phone; the full id remains the canonical form in files and tool output. Text that
+session has ended. Both accept the end of a plan id, at least four characters and matching exactly
+one plan, so `/librenms apply 7dde` works from a phone, and then say which plan it named; anything
+shorter, or from the middle of an id, names no plan, because apply and rollback act at once. The
+full id remains the canonical form in files and tool output, and the only one the model's apply and
+rollback accept. Text that
 came from LibreNMS is printed with control and bidirectional characters escaped, so a crafted
 `ifAlias` cannot rewrite your terminal.
 
@@ -266,7 +273,7 @@ came from LibreNMS is printed with control and bidirectional characters escaped,
 - **Rollback respects later edits.** An object modified after the apply is skipped as a conflict
   unless `force` is set.
 - **What cannot be undone is said up front.** Each step in the diff names its rollback kind, and the
-  approval prompt lists the irreversible steps.
+  approval prompt lists the irreversible steps and shows them, with the deletes, first.
 - **Risky operations are opt-in.** `allow_delete`, `allow_device_add` (which also covers changing a
   device's `hostname` other than in letter case, or its `overwrite_ip`, since that redirects its SNMP
   credentials to another host) and `allow_services` (a service runs a check plugin on the poller with
@@ -290,8 +297,13 @@ came from LibreNMS is printed with control and bidirectional characters escaped,
 In the default `full` mode the model asks you in chat and calls `librenms_apply` after you say yes.
 With `require_approval` (default on), the plugin also sends every `librenms_apply` and
 `librenms_rollback` call to Hermes' approval prompt, the same gate as dangerous shell commands, with
-the plan summary and its irreversible steps. The approval is keyed per plan, so "session" or "always"
-never carries over to another plan. Unattended runs follow your Hermes approval policy:
+a summary built for the little of it Hermes shows (9 rows of 64 columns in the CLI panel, 300
+characters on Discord, 500 on Slack and Telegram): a header with the counts, the irreversible steps
+and the rollback choice, then one line per step, deletes and irreversible steps first, then the
+field-level diff while room remains. The approval is keyed per plan, so "session" or "always" never
+carries over to another plan. The model's `librenms_apply` and `librenms_rollback` take only the full
+plan id, and one that names no saved plan is refused without asking, so the plan a person approved
+is the plan that runs. Unattended runs follow your Hermes approval policy:
 `approvals.cron_mode` for cron jobs, `approvals.unattended_mode` for webhook and API-server sessions,
 and `approvals.single_query_mode` for `hermes -q`, each `deny` unless you set it to `approve`, which
 lets an apply through without asking, as YOLO mode and `approvals.mode: off` do. `write_mode` adds
@@ -304,8 +316,9 @@ the lock:
 | `read_only` | Nobody. The apply and rollback tools are hidden from the model and refuse if called; `/librenms apply` refuses too | Drift audits, demos, first deployments |
 
 The model can reach a shell through Hermes' terminal tool, so the plugin also blocks a terminal or
-code call that runs `hermes librenms apply` or `rollback`, and the CLI refuses those subcommands when
-it was started from an agent session, unless `write_mode` is `full` and `require_approval` is off.
+code call that runs `hermes librenms apply` or `rollback`, and the same line written to a background
+shell's input (`process_manage`), and the CLI refuses those subcommands when it was started from an
+agent session, unless `write_mode` is `full` and `require_approval` is off.
 Both are heuristics an obfuscated command can evade; the token's role is the hard limit.
 
 Plans persist across every Hermes surface on the same `HERMES_HOME`, so `operator_only` supports
@@ -340,10 +353,12 @@ Every plan, apply and rollback is recorded for review and for SIEM ingestion:
 
 The actor record distinguishes a model tool call from a human using `/librenms` or `hermes
 librenms`, and carries the Hermes surface, profile, gateway platform, chat, user, session, cron job,
-and the message that triggered the call (`audit_include_request`). All timestamps are UTC. Point
-your collector at the file, or set `audit_log_path` to an absolute path it already watches (a
-regular file owned by the account Hermes runs as, with no other hard link; the plugin never writes
-through a symlink).
+and the message that triggered the call (`audit_include_request`). Plans belong to the profile, so
+`librenms_plans` shows the model of any session only who acted (by display name), how and where,
+never that message or the sender's, chat's or session's ids, not even as a name Hermes filled in
+with an id. All timestamps are UTC. Point your collector at the file, or set `audit_log_path` to an
+absolute path it already watches (a regular file owned by the account Hermes runs as, with no other
+hard link; the plugin never writes through a symlink).
 Schema and examples: [docs/audit.md](docs/audit.md).
 
 Installs without a log shipper can forward events directly: `audit_sinks` sends each event to a

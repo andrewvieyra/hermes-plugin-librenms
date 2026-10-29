@@ -348,32 +348,47 @@ human approval gate (`{"action": "approve", "message", "rule_key"}`). Hermes sho
 the CLI, TUI and desktop, or as a pending `/approve` on the gateway; a denial, a timeout, or no
 human to ask blocks the call.
 
-- **Message**: a header that is never clipped, then the rendered plan (rollback: the rendered
-  journal), escaped with `printable()` and clipped to 1,500 characters in all, ending with
-  `… N more lines; run /librenms show <id>` when clipped. The plan's description, which the model
-  wrote (at most 200 characters, cut with a warning), is left out of the plan's header and comes
-  last, as `Description: <text>` on one line, so it can neither pass for a step nor push the steps
-  past the clip. The header:
-  `Apply LibreNMS plan <id> to <url>: <c> create, <u> update, <d> delete, <a> action; irreversible
-  steps [<idx>]; rollback_on_failure=<bool>`, or `Roll back LibreNMS plan <id> (<n> pending
-  entries)`, with `, FORCE: overwrites edits made after the apply` inside the parentheses for a
-  forced rollback.
+- **Message**: built for the little of it Hermes shows: 9 rows of 64 columns in the CLI panel
+  (which offers no way to see more of it), 300 characters on Discord, 500 on Slack and Telegram, at
+  most 1,500 from the plugin. First one header line,
+  `Apply <id>: <n> create, <n> update, <n> delete, <n> action; irreversible steps: [<idx>] | none;
+  rollback_on_failure=<bool>` (zero counts left out), or `Roll back <id>: <n> pending entries`, with
+  `, FORCE: overwrites edits made after the apply` for a forced rollback. Then one line per step,
+  `[<i>] <action> <resource> #<id> "<label>"` with ` (irreversible)` and the names of the fields it
+  sets (an update's changes, a create's data, an action's arguments), deletes and irreversible steps
+  first and no-ops left out; for a rollback one line per pending entry in the order it is reverted,
+  saying what reverting it does (`restore <fields>`, `delete it`, `re-create it (new id)`, `cannot be
+  undone`). Only when every step line fit come, while room remains, the field-level diff (`  [<i>]
+  <detail>`, with the rollback note of a lossy or irreversible step), the warnings and last the
+  model's description (`Description: <text>`); for a rollback, the journal. The message ends with
+  `Full plan: /librenms show <id>`, or `… N more lines; full plan: /librenms show <id>` when lines
+  were left out. Every line is escaped and kept to one line with `one_line()` and cut to 120
+  characters, a label to 40, so no text from LibreNMS or the model can pass for a step or take the
+  room the steps need; a line that does not fit is left out and counted, not the lines after it.
 - **Rule key**: `librenms:librenms_apply:<id>:rb|norb` and
-  `librenms:librenms_rollback:<id>:force|safe`, with the id resolved through the store, never the
-  raw argument. An "always" or "session" answer therefore covers that plan with that choice only.
+  `librenms:librenms_rollback:<id>:force|safe`. An "always" or "session" answer therefore covers that
+  plan with that choice only.
+- **Exact ids only**: the hook and the `librenms_apply` / `librenms_rollback` handlers take a plan's
+  full id, never a fragment. A `plan_id` that names no saved plan, or only the end of one (the
+  refusal names the plan), or several, is blocked with the handler's own refusal
+  (`{"action": "block", "message"}`) rather than put to a person: the handler would refuse it, and a
+  fragment resolved again after the prompt could name a plan created while it was open. The block is
+  audited as `apply_refused` or `rollback_refused` with `tool` set to the write tool.
 - **Dry runs** skip approval only when `dry_run` is true by the same parser the handler uses
   (`handlers.parse_bool`), so a string like `"false"` cannot slip a real apply past the prompt.
 - **Failure**: the hook never raises (Hermes blocks any tool call whose hook raises). On any internal
-  error it still asks for approval, with `Plan details could not be loaded (err-<id>)` and a key
-  of the form `librenms:<tool>:unresolved:<hash>`; an id that does not resolve gets a "not found
-  locally" message and the same kind of key.
-- **Terminal**: a `terminal` or `execute_code` call whose text matches
-  `\bhermes\s+librenms\s+(apply|rollback)\b` is blocked unless `write_mode` is `full` and
-  `require_approval` is off. It is never approved. The message says what the model may do under
-  the `write_mode` in force: in `full`, call the tool, which asks the user; in `operator_only`, ask
-  the user to run `/librenms <action> <id>` or `hermes librenms <action> <id>` from their own
-  terminal; in `read_only`, that writes are disabled and queries and plans still work. The block
-  is audited as `apply_refused` or `rollback_refused` with `reason: "blocked in the agent's
+  error it blocks the call with `<action> refused: the plan could not be loaded for the approval
+  prompt (err-<id>)`, audited like an unknown plan.
+- **Terminal**: a `terminal` or `execute_code` call, or a `process_manage` `write` or `submit` whose
+  `data` goes to the input of a shell `terminal(background=true)` started, is blocked when its text
+  holds `librenms apply` or `librenms rollback` with the word `hermes` before it in the same command
+  (no newline, `;`, `|` or `&` in between; global options allowed), unless `write_mode` is `full` and
+  `require_approval` is off. The match takes linear time, so a long line of `hermes` words (a JSON
+  list of `~/.hermes` paths) cannot stall the agent loop. It is never approved. The message says what
+  the model may do under the `write_mode` in force: in `full`, call the tool, which asks the user; in
+  `operator_only`, ask the user to run `/librenms <action> <id>` or `hermes librenms <action> <id>`
+  from their own terminal; in `read_only`, that writes are disabled and queries and plans still work.
+  The block is audited as `apply_refused` or `rollback_refused` with `reason: "blocked in the agent's
   terminal/execute_code"`, `tool`, `write_mode` and the plan id it names, never the command text.
 - **Other tools**: the hook returns immediately, without I/O, for every other tool.
 - Every `approve` the hook returns is audited as `approval_requested` (tool, plan id, rule key), and
@@ -396,7 +411,7 @@ the setting the plugin controls, and the one to use on a profile that serves una
 | `librenms_apply`, `librenms_rollback` (the model) | yes, through the approval prompt when `require_approval` | refused, with the exact `/librenms apply <id>` and `hermes librenms apply <id>` commands to relay | hidden and refused |
 | `/librenms apply`, `/librenms rollback` | yes | yes | refused |
 | `hermes librenms apply`, `rollback` | yes; from a shell an agent session started, only when `require_approval` is off | yes, but not from a shell an agent session started | refused |
-| `terminal` / `execute_code` running `hermes librenms apply\|rollback` | blocked unless `require_approval` is off | blocked | blocked |
+| `terminal` / `execute_code` / `process_manage` input running `hermes librenms apply\|rollback` | blocked unless `require_approval` is off | blocked | blocked |
 
 "A shell an agent session started" is detected by `HERMES_SESSION_ID` or `HERMES_SESSION_KEY` in
 the environment, which Hermes binds into its terminal tool's children. Every refusal is audited

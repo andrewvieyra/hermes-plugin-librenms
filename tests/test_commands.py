@@ -95,12 +95,47 @@ class Slash(CommandCase):
             self.commands.slash_handler("show lnp-x"), "No plan matches 'lnp-x'. Use /librenms plans to list them."
         )
         self.assertIn("Use hermes librenms plans", self.commands.run(["show", "nope"], via=self.audit.VIA_CLI))
-        other = self.planned(NOTES)
-        text = self.commands.slash_handler("apply lnp-")
-        self.assertTrue(text.startswith("'lnp-' is ambiguous; matches:\n"), text)
-        self.assertIn(f"  {pid}", text)
-        self.assertIn(f"  {other}", text)
+        first = self.plan([NOTES], plan_id="lnp-20261028T190000Z-ab12")["id"]
+        second = self.plan([NOTES], plan_id="lnp-20261028T190100Z-ab12")["id"]
+        text = self.commands.slash_handler("apply ab12")
+        self.assertEqual(text, f"'ab12' is ambiguous; matches:\n  {first}\n  {second}")
         self.assertEqual(self.fake.writes(), [])
+
+    def test_a_short_or_inner_fragment_names_no_plan(self):
+        # every id holds 2026, T, Z and -: with one plan saved, "apply 2" applied it, at once
+        pid = self.planned()
+        too_short = "is too short to name a plan: give the full plan id or its last 4 or more characters (e.g. 4f1a)"
+        for cmd in ("apply", "rollback", "check", "show"):
+            for fragment in ("2", "-", "Z", pid[-3:]):
+                for text, prog in (
+                    (self.commands.slash_handler(f"{cmd} {fragment}"), "/librenms"),
+                    (self.cli(cmd, fragment), "hermes librenms"),
+                ):
+                    self.assertTrue(text.strip().startswith(f"{fragment!r} {too_short}"), (cmd, fragment, text))
+                    self.assertIn(f"Use {prog} plans to list them.", text)
+            for inner in ("2026", pid[4:12], "lnp-2"):  # not the end of an id
+                self.assertEqual(
+                    self.commands.slash_handler(f"{cmd} {inner}"),
+                    f"No plan matches {inner!r}. Use /librenms plans to list them.",
+                )
+        self.assertEqual(self.fake.writes(), [])
+        self.assertEqual(self.store.load(pid)["status"], "planned")
+
+    def test_a_fragment_says_which_plan_it_named(self):
+        pid = self.planned(description="tidy\nports")
+        suffix = pid.rsplit("-", 1)[1]
+        named = f"'{suffix}' is plan {pid} (planned): tidy\\nports"
+        applicable = f"{pid} is applicable: all preconditions hold."
+        self.assertEqual(self.commands.slash_handler(f"check {suffix}"), f"{named}\n{applicable}")
+        self.assertEqual(self.commands.slash_handler(f"check {pid}"), applicable)  # the operator named it in full
+        applied = self.commands.slash_handler(f"apply {suffix}").split("\n")
+        self.assertEqual(applied[:2], [named, f"Plan {pid} (applied)"])
+        rolled = self.cli("rollback", pid[-9:]).split("\n")
+        self.assertEqual(
+            rolled[:2], [f"'{pid[-9:]}' is plan {pid} (applied): tidy\\nports", f"Plan {pid} (rolled_back)"]
+        )
+        # show's diff names the plan itself
+        self.assertTrue(self.commands.slash_handler(f"show {suffix}").startswith(f"Plan {pid} (rolled_back) — tidy"))
 
     def test_status_reports_librenms_and_never_the_token(self):
         text = self.commands.slash_handler("status")

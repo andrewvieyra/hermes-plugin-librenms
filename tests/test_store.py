@@ -429,8 +429,8 @@ class Listing(StoreTestCase):
         self.assertEqual(len(self.store.list(limit=2)), 2)
         self.assertEqual(len(self.store.list(limit=0)), 1)
 
-    def test_resolve_exact_suffix_substring_and_case(self):
-        for plan_id in ("lnp-20261028T190000Z-4f1a", "lnp-20261028T190100Z-9c2e", "lnp-20261028T190200Z-9c2f"):
+    def test_resolve_exact_suffix_and_case(self):
+        for plan_id in ("lnp-20261028T190000Z-4f1a", "lnp-20261028T190100Z-9c2e", "lnp-20261028T190200Z-19c2e"):
             self.store.create(_plan(plan_id))
         resolve = self.store.resolve
         self.assertEqual(
@@ -439,10 +439,17 @@ class Listing(StoreTestCase):
         self.assertEqual(resolve(" 4f1a ")[0], "lnp-20261028T190000Z-4f1a")
         self.assertEqual(resolve("4F1A")[0], "lnp-20261028T190000Z-4f1a")
         self.assertEqual(resolve("T190000Z-4f1a")[0], "lnp-20261028T190000Z-4f1a")
-        self.assertEqual(resolve("190100")[0], "lnp-20261028T190100Z-9c2e")
-        self.assertEqual(resolve("9c2"), (None, ["lnp-20261028T190100Z-9c2e", "lnp-20261028T190200Z-9c2f"]))
+        self.assertEqual(resolve("9c2e"), (None, ["lnp-20261028T190100Z-9c2e", "lnp-20261028T190200Z-19c2e"]))
+        self.assertEqual(resolve("Z-9c2e")[0], "lnp-20261028T190100Z-9c2e")
         for missing in ("zzzz", "", None, "../etc"):
             self.assertEqual(resolve(missing), (None, []), missing)
+
+    def test_short_or_inner_fragments_resolve_nothing(self):
+        # every id holds 2026, T, Z and -: with one plan saved, "2" would name it, and /librenms apply 2 would apply it
+        self.store.create(_plan("lnp-20261028T190000Z-4f1a"))
+        for fragment in ("a", "1a", "f1a", "2", "-", "Z", "lnp-", "2026", "190000", "20261028T190000Z", "lnp-2"):
+            self.assertEqual(self.store.resolve(fragment), (None, []), fragment)
+        self.assertEqual(self.store.resolve("Z-4f1a")[0], "lnp-20261028T190000Z-4f1a")
 
 
 class Prune(StoreTestCase):

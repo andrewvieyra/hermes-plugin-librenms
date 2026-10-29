@@ -331,20 +331,40 @@ class PlanApplyRollback(HandlerCase):
                 self.assertIn("unknown plan_id", out["error"])
         self.assertEqual(self.events("apply_refused")[0]["reason"], "unknown plan_id 'lnp-nope'")
         self.assertIn("unknown plan_id", self.events("rollback_refused")[0]["reason"])
-        self.plan([self.update_purpose()])
-        self.plan([self.update_purpose("edge", 2)])
-        out = self.call("librenms_apply", plan_id="lnp-")
-        self.assertIn("matches 2 plans", out["error"])
+        first = self.plan([self.update_purpose()], plan_id="lnp-20261028T190000Z-ab12")["id"]
+        second = self.plan([self.update_purpose("edge", 2)], plan_id="lnp-20261028T190100Z-ab12")["id"]
+        for name in ("librenms_apply", "librenms_rollback", "librenms_plans"):
+            out = self.call(name, plan_id="ab12")
+            self.assertEqual(out["error"], f"plan_id 'ab12' matches 2 plans ({first}, {second}); pass the full plan_id")
         self.assertEqual(self.fake.writes(), [])
 
-    def test_a_unique_fragment_resolves_to_its_plan(self):
+    def test_padded_model_text_is_clipped_in_refusal_events(self):
+        # a 100 KB description or query path made a 100 KB event, which a UDP syslog sink could not send at all
+        op = {"op": "update", "resource": "device", "id": 1, "data": {"purpose": "x"}, "z" * 5000: 1}
+        self.assertFalse(self.call("librenms_plan", description="d" * 100_000, operations=[op])["success"])
+        [rejected] = self.events("plan_rejected")
+        self.assertEqual(rejected["description"], "d" * 200 + "… [truncated 99800 chars]")
+        self.assertTrue(rejected["first_error"].startswith("unknown operation key(s) zzz"), rejected["first_error"])
+        self.assertRegex(rejected["first_error"], r"^.{500}… \[truncated \d+ chars\]$")
+        self.assertTrue(self.call("librenms_query", path="nosuchroute/" + "p" * 100_000)["refused"])
+        [refused] = self.events("query_refused")
+        self.assertEqual(len(refused["path"]), 200)
+        self.assertRegex(refused["reason"], r"^.{500}… \[truncated \d+ chars\]$")
+        self.assertLess(self.audit_path.stat().st_size, 6000)
+
+    def test_a_unique_fragment_shows_its_plan_but_applies_nothing(self):
         pid = self.plan([self.update_purpose()])["id"]
-        out = self.call("librenms_plans", plan_id=pid.rsplit("-", 1)[1])
-        self.assertEqual(out["plan_id"], pid)
-        for short in (pid[-3:], "1", "Z"):  # shorter than the random suffix: never a guess at "the" plan
-            self.assertIn("unknown plan_id", self.call("librenms_apply", plan_id=short)["error"])
-            directive = self.handlers.pre_tool_call("librenms_apply", {"plan_id": short})
-            self.assertIn(":unresolved:", directive["rule_key"])
+        suffix = pid.rsplit("-", 1)[1]
+        for fragment in (suffix, suffix.upper(), pid[-8:]):
+            self.assertEqual(self.call("librenms_plans", plan_id=fragment)["plan_id"], pid)
+        # apply and rollback take the full id: a fragment resolved again after the approval prompt could name a plan
+        # created while it was open
+        for name in ("librenms_apply", "librenms_rollback"):
+            out = self.call(name, plan_id=suffix)
+            self.assertEqual(out["error"], f"plan_id '{suffix}' is only the end of {pid}; pass the full plan_id")
+        for short in (pid[-3:], "1", "Z", "2026", pid[4:12]):  # too short, or not the end of an id
+            self.assertIn("unknown plan_id", self.call("librenms_plans", plan_id=short)["error"])
+        self.assertEqual(self.fake.writes(), [])
         self.assertTrue(self.call("librenms_apply", plan_id=f"  {pid}  ")["success"])
 
     def test_plans_show_has_the_full_journal_and_the_listing_filters(self):

@@ -153,6 +153,15 @@ a lost datagram is lost without a failure, and a receiver need not take a messag
 (RFC 5426), so it may truncate or drop one. An event with a long request text or error easily
 passes that. Use `tls` where it matters.
 
+A UDP syslog message is never longer than 8,192 bytes: a larger datagram fails outright (Linux
+refuses one over 65,507 bytes, macOS over 9,216) or arrives cut mid-JSON (rsyslog's default
+maximum message size is 8 KiB). An event that would be longer is fitted rather than dropped: its
+strings are cut to 500, then 100 characters (each ending `… [truncated N chars]`), and when that is
+not enough (a long list, such as a large prune's `plan_ids`) only the common fields and the actor
+are sent. A fitted message carries `"truncated": true`; the file keeps the whole event. TCP, TLS
+and HTTP messages are sent whole (every string of an event is cut to 2,000 characters; see
+[audit.md](audit.md#events)).
+
 ## Syslog details
 
 Messages are RFC 5424:

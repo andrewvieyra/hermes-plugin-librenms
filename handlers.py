@@ -5,10 +5,11 @@ Handlers are thin. They parse arguments, obtain a client and the plan store, cal
 the result; every result passes through :func:`redact.mask` on its way out. Everything here is also reachable from
 the ``/librenms`` slash command and the ``hermes librenms`` CLI through :mod:`commands`.
 
-The hooks put ``librenms_apply`` and ``librenms_rollback`` in front of Hermes' approval prompt with the plan they
-would run (``pre_tool_call``, audited as ``approval_requested``), keep the agent's own terminal from running
-``hermes librenms apply`` around that prompt (audited as a refusal), remember the user's message for the audit trail
-(``pre_llm_call``) and record the human's decision (``post_approval_response``). Hook callbacks never raise.
+The hooks put ``librenms_apply`` and ``librenms_rollback`` in front of Hermes' approval prompt with a summary of the
+plan they would run (``pre_tool_call``, audited as ``approval_requested``; a plan id that names no saved plan is
+blocked instead), keep the agent's own terminal, code and background shells from running ``hermes librenms apply``
+around that prompt (audited as a refusal), remember the user's message for the audit trail (``pre_llm_call``) and
+record the human's decision (``post_approval_response``). Hook callbacks never raise.
 
 Named ``handlers`` rather than ``tools`` so the module can never shadow Hermes' own ``tools`` package when the
 repository root is on ``sys.path`` (tests, editable checkouts).
@@ -18,7 +19,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import hashlib
 import json
 import logging
 import re
@@ -29,8 +29,9 @@ from typing import Any, Callable, Dict, List, Tuple
 from . import audit, sinks
 from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
 from .executor import ExecutionRefused, apply_plan, pending_entries, render_journal, rollback_plan
-from .planner import PlanError, build_plan, render_plan
-from .redact import for_model, mask, one_line, printable
+from .planner import DESCRIPTION_CHARS, PlanError, build_plan, render_plan
+from .redact import clip, for_model, mask, one_line
+from .resources import get_resource
 from .routes import QueryError, prepare
 from .settings import Settings, get_settings
 from .store import PlanStore, get_store, profile_key
@@ -39,7 +40,13 @@ from .version import __version__
 logger = logging.getLogger(__name__)
 
 WRITE_TOOLS = ("librenms_apply", "librenms_rollback")
+# The approval message: at most APPROVAL_MESSAGE_CHARS in all, every line cut to APPROVAL_LINE_CHARS and a label to
+# APPROVAL_LABEL_CHARS (as escaped), so no text from LibreNMS or the model can take the room the steps need. Hermes
+# shows far less than the whole message: its CLI panel 9 rows of 64 columns, Discord 300 characters, Slack and
+# Telegram 500.
 APPROVAL_MESSAGE_CHARS = 1500
+APPROVAL_LINE_CHARS = 120
+APPROVAL_LABEL_CHARS = 40
 # What the model is told when its terminal or code runs `hermes librenms apply|rollback`: under write_mode full (with
 # approval required) to call the tool, under the other modes what write_gate tells the write tools, and
 # TERMINAL_BLOCK when the settings cannot be read.
@@ -54,20 +61,28 @@ TERMINAL_BLOCK_FULL = (
 TERMINAL_REASON = "blocked in the agent's terminal/execute_code"
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
-_HOOKED_TOOLS = frozenset({*WRITE_TOOLS, "terminal", "execute_code"})
-# `hermes librenms apply|rollback` in a shell command, also with global options before the subcommand and in the
-# argument list of code that builds one (["hermes", "librenms", "apply", ...]), and the plan named after it (options
-# before it skipped). Defence in depth only: the CLI itself refuses to write from a shell an agent session started.
+# The shell tools: a command (terminal), code (execute_code), and what process_manage writes to the stdin of a
+# shell that terminal(background=true) started, which Hermes runs no command guard on.
+_SHELL_TOOLS = frozenset({"terminal", "execute_code", "process_manage"})
+_STDIN_ACTIONS = frozenset({"write", "submit"})
+_HOOKED_TOOLS = frozenset({*WRITE_TOOLS, *_SHELL_TOOLS})
+# `librenms apply|rollback` in a shell command, also in the argument list of code that builds one (["hermes",
+# "librenms", "apply", ...]), and the plan named after it (options before it skipped); _cli_write looks for the word
+# hermes before it in the same command, global options allowed in between. Defence in depth only: the CLI itself
+# refuses to write from a shell an agent session started.
 _CLI_WRITE_RE = re.compile(
-    r"\bhermes\b[^\n;|&]*?\blibrenms[\s'\",]+(?P<action>apply|rollback)\b"
+    r"\blibrenms[\s'\",]+(?P<action>apply|rollback)\b"
     r"(?:(?:[\s'\",]+-[\w-]*)*[\s'\",]+(?P<plan>[A-Za-z0-9_][A-Za-z0-9_.-]{0,79})(?![A-Za-z0-9_.-]))?",
     re.IGNORECASE,
 )
-# The rule_key pre_tool_call returns, as Hermes reports it back (prefixed "plugin_rule:").
+_HERMES_RE = re.compile(r"\bhermes\b", re.IGNORECASE)
+_COMMAND_SEPARATORS = "\n;|&"
+# The rule_key pre_tool_call returns, as Hermes reports it back (prefixed "plugin_rule:"). 0.1.1 and earlier also
+# returned "librenms:<tool>:unresolved:<digest>", which a remembered answer can still carry.
 _RULE_KEY_RE = re.compile(
     r"(?:^|:)(?P<key>librenms:(?P<tool>librenms_apply|librenms_rollback):(?P<plan>[^:]+):(?P<variant>[^:]+))$"
 )
-_MIN_FRAGMENT = 4  # hex digits in a plan id's random suffix
+_COUNTED = ("create", "update", "delete", "action")
 _PRUNE_INTERVAL = 3600.0
 # store.profile_key() -> when this process last swept that profile's plans (absent: never)
 _last_prune_at: Dict[str, float] = {}
@@ -155,14 +170,16 @@ def write_gate(
     return None
 
 
-def find_plan(store: PlanStore, raw: Any) -> Tuple[str | None, Dict[str, Any] | None, List[str]]:
-    """``(plan_id, plan, candidates)`` for what a caller named: an exact id, else an unambiguous suffix or substring,
-    as :meth:`PlanStore.resolve` matches. The approval hook resolves the same way, so the plan a human approved is
-    the plan that runs. A fragment shorter than a plan id's random suffix is not resolved: ``"1"`` would pick
-    whichever single plan happens to contain a 1."""
+def find_plan(
+    store: PlanStore, raw: Any, *, exact: bool = False
+) -> Tuple[str | None, Dict[str, Any] | None, List[str]]:
+    """``(plan_id, plan, candidates)`` for what a caller named: an exact id, else (unless *exact*) the end of one, as
+    :meth:`PlanStore.resolve` matches. ``librenms_apply``, ``librenms_rollback`` and their approval hook take only an
+    exact id, so the plan a human approved is the plan that runs: a fragment resolved again after the prompt could
+    name a plan created while it was open. *candidates* still lists what a fragment matches, for the refusal."""
     text = str(raw or "").strip()
     plan_id, candidates = store.resolve(text)
-    if plan_id != text and len(text) < _MIN_FRAGMENT:
+    if exact and plan_id != text:
         plan_id = None
     plan = store.load(plan_id) if plan_id else None
     return (plan_id, plan, candidates) if plan is not None else (None, None, candidates)
@@ -173,6 +190,8 @@ def _unknown(raw: Any, candidates: List[str]) -> str:
     if len(candidates) > 1:
         listed = ", ".join(candidates[:5]) + (", ..." if len(candidates) > 5 else "")
         return f"plan_id {shown!r} matches {len(candidates)} plans ({listed}); pass the full plan_id"
+    if candidates and candidates[0] != shown:
+        return f"plan_id {shown!r} is only the end of {candidates[0]}; pass the full plan_id"
     return f"unknown plan_id {shown!r}"
 
 
@@ -364,6 +383,13 @@ def _rollback_summary(rb: Dict[str, Any] | None) -> Dict[str, Any] | None:
     return {k: rb.get(k) for k in keys}
 
 
+def _public(record: Any) -> Any:
+    """A run or check record of a plan for a tool result, its actor in public form (:func:`audit.public_actor`)."""
+    if isinstance(record, dict) and "actor" in record:
+        return {**record, "actor": audit.public_actor(record["actor"])}
+    return record
+
+
 def _project(value: Any, fields: List[str] | None) -> Any:
     if fields and isinstance(value, dict):
         return {key: value[key] for key in fields if key in value}
@@ -413,7 +439,7 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
             actor=_actor_from(kwargs),
             librenms_url=client.base_url,
             path=str(raw_path or "")[:200],
-            reason=str(exc),
+            reason=clip(str(exc), audit.REASON_LIMIT),
         )
         return _fail(str(exc), refused=True)
     route = prepared.route
@@ -448,10 +474,10 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
             plan_id=None,
             actor=actor,
             librenms_url=client.base_url,
-            description=description,
+            description=clip(description, DESCRIPTION_CHARS),
             operations=len(operations) if isinstance(operations, list) else None,
             errors=len(exc.errors),
-            first_error=exc.errors[0].get("error") if exc.errors else None,
+            first_error=clip(exc.errors[0].get("error"), audit.REASON_LIMIT) if exc.errors else None,
         )
         raise
     get_store().create(plan)  # may give the plan a new id on a collision: read plan["id"] only after this
@@ -488,7 +514,7 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
 def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
-    _plan_id, plan, candidates = find_plan(store, args.get("plan_id"))
+    _plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
     if plan is None:
         reason = _unknown(args.get("plan_id"), candidates)
         audit.emit("apply_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
@@ -547,7 +573,7 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
 def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
-    _plan_id, plan, candidates = find_plan(store, args.get("plan_id"))
+    _plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
     if plan is None:
         reason = _unknown(args.get("plan_id"), candidates)
         audit.emit("rollback_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
@@ -605,10 +631,10 @@ def librenms_plans(args: Dict[str, Any], **kwargs: Any) -> str:
             steps=plan["steps"],
             warnings=plan.get("warnings", []),
             irreversible=plan.get("irreversible", []),
-            checks=plan.get("checks", []),
+            checks=[_public(check) for check in plan.get("checks") or []],
             journal=plan.get("journal", []),
-            apply=plan.get("apply"),
-            rollback=plan.get("rollback"),
+            apply=_public(plan.get("apply")),
+            rollback=_public(plan.get("rollback")),
             report=render_journal(plan),
         )
     limit = _int(args.get("limit"), 20, maximum=200)
@@ -630,20 +656,25 @@ HANDLERS = {
 
 
 def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dict[str, Any] | None:
-    """Hermes ``pre_tool_call``: fires for every tool call, so anything but our two write tools and the agent's
-    terminal returns at once, without reading settings or plans. A callback that raises would block the call it
-    was asked about, so neither branch raises; when in doubt they ask a human (apply, rollback) or block (terminal).
-    An approval asked for is audited as ``approval_requested``: Hermes may refuse it (cron, unattended platforms)
-    without a ``post_approval_response``, and the attempt must still show in the trail."""
+    """Hermes ``pre_tool_call``: fires for every tool call, so anything but our two write tools and the agent's shell
+    tools returns at once, without reading settings or plans. A callback that raises would block the call it was
+    asked about, so neither branch raises; when in doubt they block. An approval asked for is audited as
+    ``approval_requested``: Hermes may refuse it (cron, unattended platforms) without a ``post_approval_response``,
+    and the attempt must still show in the trail. A block is audited as the refusal it is."""
     if not isinstance(tool_name, str) or tool_name not in _HOOKED_TOOLS:
         return None
     if tool_name not in WRITE_TOOLS:
         return _terminal_guard(tool_name, args, kwargs)
     directive = _approval(tool_name, args)
-    if directive is not None:
+    if directive is None:
+        return None
+    if directive["action"] == "approve":
         found = _RULE_KEY_RE.search(directive["rule_key"])
-        plan_id = found.group("plan") if found is not None and found.group("plan") != "unresolved" else None
+        plan_id = found.group("plan") if found is not None else None
         _audit_hook("approval_requested", kwargs, plan_id, None, tool=tool_name, rule_key=directive["rule_key"])
+    else:
+        event = "apply_refused" if tool_name == "librenms_apply" else "rollback_refused"
+        _audit_hook(event, kwargs, None, None, reason=directive["message"], tool=tool_name)
     return directive
 
 
@@ -660,91 +691,197 @@ def _audit_hook(
 
 
 def _approval(tool: str, args: Any) -> Dict[str, Any] | None:
-    """``approve`` with the rendered plan (apply) or journal (rollback) when ``require_approval`` is on in ``full``
-    mode; in the other modes the handler refuses the model and audits it. The rule_key names the canonical plan id
-    and the flag that changes what runs, so an "always" answer never carries over to another plan or variant."""
-    raw = ""
+    """``approve`` with a summary of the plan (apply) or of what its rollback reverts, when ``require_approval`` is
+    on in ``full`` mode; in the other modes the handler refuses the model and audits it. The rule_key names the plan
+    and the flag that changes what runs, so an "always" answer never carries over to another plan or variant.
+    A ``plan_id`` that is not a saved plan's exact id is blocked with the handler's own refusal, and so is any
+    failure to load the plan: asking about a plan nobody can be shown would let one that comes to match while the
+    prompt is open run unseen."""
+    action = "apply" if tool == "librenms_apply" else "rollback"
     try:
         settings = get_settings()
         if not settings.require_approval or settings.write_mode != "full":
             return None
-        raw = str(args.get("plan_id") or "")
+        args = args if isinstance(args, dict) else {}
         if tool == "librenms_apply" and parse_bool(args.get("dry_run"), False):
             return None
-        plan_id, plan, _candidates = find_plan(get_store(), raw)
-        if plan_id is None or plan is None:  # the handler will refuse it; still ask rather than let it through
-            return _unresolved(tool, raw, "It was not found locally, so what it would change is unknown.")
+        plan_id, plan, candidates = find_plan(get_store(), args.get("plan_id"), exact=True)
+        if plan_id is None or plan is None:
+            return {"action": "block", "message": _unknown(args.get("plan_id"), candidates)}
         if tool == "librenms_apply":
             rollback = parse_bool(args.get("rollback_on_failure"), True)
-            summary = plan.get("summary") or {}
-            counts = ", ".join(f"{summary.get(key, 0)} {key}" for key in ("create", "update", "delete", "action"))
-            irreversible = ", ".join(str(index) for index in plan.get("irreversible") or [])
-            header = (
-                f"Apply LibreNMS plan {plan_id} to {plan.get('librenms_url')}: {counts}; irreversible steps "
-                f"[{irreversible}]; rollback_on_failure={'true' if rollback else 'false'}"
-            )
-            body, variant = _approval_plan(plan), "rb" if rollback else "norb"
+            message, variant = _apply_approval(plan, plan_id, rollback), "rb" if rollback else "norb"
         else:
             force = parse_bool(args.get("force"), False)
-            header = f"Roll back LibreNMS plan {plan_id} ({len(pending_entries(plan))} pending entries"
-            header += ", FORCE: overwrites edits made after the apply)" if force else ")"
-            body, variant = render_journal(plan), "force" if force else "safe"
-        return {
-            "action": "approve",
-            "message": _approval_message(header, body, plan_id),
-            "rule_key": f"librenms:{tool}:{plan_id}:{variant}",
-        }
+            message, variant = _rollback_approval(plan, plan_id, force), "force" if force else "safe"
+        return {"action": "approve", "message": message, "rule_key": f"librenms:{tool}:{plan_id}:{variant}"}
     except Exception as exc:
         error_id = new_error_id()
-        logger.warning("librenms approval hook: plan details not loaded (%s)", error_id, exc_info=exc)
-        return _unresolved(tool, raw, f"Plan details could not be loaded ({error_id}).")
+        logger.warning("librenms approval hook: plan not loaded (%s)", error_id, exc_info=exc)
+        return {
+            "action": "block",
+            "message": f"{action} refused: the plan could not be loaded for the approval prompt ({error_id}); see "
+            "the Hermes log",
+        }
 
 
-def _unresolved(tool: str, raw: str, sentence: str) -> Dict[str, Any]:
-    digest = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:12]
-    return {
-        "action": "approve",
-        "message": printable(f"Approve {tool} for plan {raw[:80]}? {sentence}"),
-        "rule_key": f"librenms:{tool}:unresolved:{digest}",
-    }
+def _apply_approval(plan: Dict[str, Any], plan_id: str, rollback: bool) -> str:
+    """One header line (the plan, its counts, the irreversible steps, ``rollback_on_failure``), one line per step
+    that writes, deletes and irreversible steps first, then while room remains the field-level diff, the warnings,
+    and last the plan's description, which the model wrote."""
+    summary = plan.get("summary") or {}
+    counts = ", ".join(f"{summary[key]} {key}" for key in _COUNTED if summary.get(key)) or "nothing to change"
+    irreversible = plan.get("irreversible") or []
+    header = (
+        f"Apply {plan_id}: {counts}; irreversible steps: {_indexes(irreversible)}; "
+        f"rollback_on_failure={'true' if rollback else 'false'}"
+    )
+    steps = sorted(
+        (step for step in plan.get("steps") or [] if step.get("action") != "noop"),
+        key=lambda step: step.get("action") != "delete" and step.get("index") not in irreversible,
+    )
+    lines = [_step_line(step, step.get("index") in irreversible) for step in steps]
+    details: List[str] = []
+    for step in steps:
+        prefix = f"  [{step.get('index')}] "
+        details += [prefix + line for line in get_resource(step["resource"]).describe(step)]
+        if step.get("inverse_kind") in ("none", "lossy"):
+            note = step.get("inverse_note")
+            details.append(f"{prefix}rollback: {step['inverse_kind']}" + (f" — {one_line(note)}" if note else ""))
+    details += [f"Warning: {one_line(warning)}" for warning in dict.fromkeys(plan.get("warnings") or [])]
+    if plan.get("description"):
+        details.append(f"Description: {one_line(plan['description'])}")
+    return _approval_message(header, lines, details, plan_id)
 
 
-def _approval_plan(plan: Dict[str, Any]) -> str:
-    """The diff an apply approval shows: the plan's description, free text the model wrote, comes last and on one
-    line, so it can neither pass for step lines nor push them past the clip."""
-    body = render_plan({**plan, "description": ""})
-    return f"{body}\nDescription: {one_line(plan['description'])}" if plan.get("description") else body
+def _rollback_approval(plan: Dict[str, Any], plan_id: str, force: bool) -> str:
+    """The header (pending entries, ``FORCE``), one line per entry in the order rollback reverts them saying what
+    it does to the object, then while room remains the journal."""
+    pending = pending_entries(plan)
+    header = f"Roll back {plan_id}: {len(pending)} pending entries"
+    if force:
+        header += ", FORCE: overwrites edits made after the apply"
+    steps = {step.get("index"): step for step in plan.get("steps") or []}
+    lines = [_revert_line(entry, steps.get(entry.get("index")) or {}) for entry in reversed(pending)]
+    return _approval_message(header, lines, render_journal(plan).split("\n")[1:], plan_id)
 
 
-def _approval_message(header: str, body: str, plan_id: str) -> str:
-    """Header, then as many whole lines of *body* as fit in :data:`APPROVAL_MESSAGE_CHARS`, then how many were left
-    out. Escaped first: labels, notes and descriptions come from LibreNMS and the model, and must not be able to
-    rewrite what the human reads in a terminal approval prompt."""
-    header, lines = printable(header), printable(body).split("\n")
-    text = "\n".join([header, *lines])
-    if len(text) <= APPROVAL_MESSAGE_CHARS:
-        return text
-    shown_id = printable(plan_id)
-    kept: List[str] = []
-    used = len(header)
-    for line in lines:
-        tail = f"\n… {len(lines) - len(kept) - 1} more lines; run /librenms show {shown_id}"
-        if used + 1 + len(line) + len(tail) > APPROVAL_MESSAGE_CHARS:
-            break
-        kept.append(line)
-        used += 1 + len(line)
-    return "\n".join([header, *kept]) + f"\n… {len(lines) - len(kept)} more lines; run /librenms show {shown_id}"
+def _target_line(item: Dict[str, Any]) -> str:
+    """``[index] action resource #id "label"`` of a step or journal entry, the label cut short."""
+    ident = f" #{item['object_id']}" if item.get("object_id") is not None else ""
+    label = _cut(one_line(item.get("label") or ""), APPROVAL_LABEL_CHARS)
+    return f'[{item.get("index")}] {item.get("action")} {item.get("resource")}{ident} "{label}"'
+
+
+def _step_line(step: Dict[str, Any], irreversible: bool) -> str:
+    """A step and the names of the fields it sets (an update's changes, a create's data, an action's
+    arguments)."""
+    line = _target_line(step) + (" (irreversible)" if irreversible else "")
+    fields = {"update": step.get("changes"), "create": step.get("data")}.get(step.get("action"), step.get("params"))
+    return line + (": " + ", ".join(one_line(name) for name in fields) if isinstance(fields, dict) and fields else "")
+
+
+def _revert_line(entry: Dict[str, Any], step: Dict[str, Any]) -> str:
+    """A journal entry and what its rollback does to the object."""
+    kind, action = entry.get("inverse_kind"), entry.get("action")
+    if kind == "none":
+        what = "cannot be undone"
+    elif kind == "not_needed":
+        what = "nothing to undo"
+    elif action == "create":
+        what = "delete it"
+    elif action == "update":
+        fields = (entry.get("inverse") or {}).get("data") or step.get("changes") or {}
+        what = "restore " + (", ".join(one_line(name) for name in fields) if isinstance(fields, dict) else "it")
+    elif action == "delete":
+        what = "re-create it (new id)"
+    else:
+        what = f"undo it ({kind})"
+    if entry.get("status") == "unknown":
+        what = f"outcome unknown; {what}"
+    return f"{_target_line(entry)}: {what}"
+
+
+def _indexes(indexes: List[Any]) -> str:
+    if not indexes:
+        return "none"
+    shown = ", ".join(str(index) for index in indexes[:10])
+    return f"[{shown}, … {len(indexes)} in all]" if len(indexes) > 10 else f"[{shown}]"
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _approval_message(header: str, lines: List[str], details: List[str], plan_id: str) -> str:
+    """*header*, a line per step, and *details* only when every step line fit, within
+    :data:`APPROVAL_MESSAGE_CHARS`; then how many lines were left out and where the whole plan is. Every line is
+    kept to one line, escaped and cut to :data:`APPROVAL_LINE_CHARS`: labels, notes and descriptions come from
+    LibreNMS and the model, and must neither rewrite what the human reads in a terminal nor take the room the steps
+    need. A line that does not fit is left out and counted, not the lines after it."""
+    shown_id = one_line(plan_id)
+    header = one_line(header)
+    room = APPROVAL_MESSAGE_CHARS - len(f"\n… {len(lines) + len(details)} more lines; full plan: /librenms show ")
+    room -= len(shown_id)
+    kept, used, left = [header], len(header), 0
+    for group in (lines, details):
+        if left:  # details only below a complete list of steps
+            left += len(group)
+            continue
+        for line in group:
+            line = _cut(one_line(line), APPROVAL_LINE_CHARS)
+            if used + 1 + len(line) <= room:
+                kept.append(line)
+                used += 1 + len(line)
+            else:
+                left += 1
+    kept.append(
+        f"… {left} more lines; full plan: /librenms show {shown_id}"
+        if left
+        else f"Full plan: /librenms show {shown_id}"
+    )
+    return "\n".join(kept)
+
+
+def _shell_text(tool: str, args: Any) -> str:
+    """What a shell tool call hands a shell: every string argument of ``terminal`` and ``execute_code``, and the
+    ``data`` that ``process_manage`` writes or submits to a background process's stdin (as Hermes sends it,
+    ``str()`` of any value)."""
+    if not isinstance(args, dict):
+        return args if isinstance(args, str) else ""
+    if tool == "process_manage":
+        action = args.get("action")
+        return str(args.get("data", "")) if isinstance(action, str) and action in _STDIN_ACTIONS else ""
+    return "\n".join(value for value in args.values() if isinstance(value, str))
+
+
+def _cli_write(text: str) -> re.Match[str] | None:
+    """The first ``librenms apply|rollback`` in *text* with the word hermes before it in the same command (no
+    newline, ``;``, ``|`` or ``&`` in between). One pass: each stretch between two ``librenms`` hits is searched
+    once, so a long line of ``hermes`` words (a JSON list of ``~/.hermes`` paths) costs linear time in the hook."""
+    if "librenms" not in text.casefold():
+        return None
+    hermes, scanned = False, 0
+    for found in _CLI_WRITE_RE.finditer(text):
+        start = found.start()
+        cut = max(text.rfind(separator, scanned, start) for separator in _COMMAND_SEPARATORS)
+        if cut >= 0:
+            hermes, scanned = False, cut + 1
+        hermes = hermes or _HERMES_RE.search(text, scanned, start) is not None
+        if hermes:
+            return found
+        scanned = start
+    return None
 
 
 def _terminal_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Block ``hermes librenms apply|rollback`` in the agent's terminal or code unless the operator lets the model
-    write without approval anyway: run there, it would skip the approval prompt and act as an operator. The model is
-    told what it may do instead under this write_mode, and the attempt is audited as ``apply_refused`` /
-    ``rollback_refused`` naming the tool and the plan, never the command text."""
+    """Block ``hermes librenms apply|rollback`` in the agent's terminal, its code or a background shell's stdin unless
+    the operator lets the model write without approval anyway: run there, it would skip the approval prompt and act
+    as an operator. The model is told what it may do instead under this write_mode, and the attempt is audited as
+    ``apply_refused`` / ``rollback_refused`` naming the tool and the plan, never the command text."""
     message = TERMINAL_BLOCK
     try:
-        values = args.values() if isinstance(args, dict) else [args]
-        found = _CLI_WRITE_RE.search("\n".join(value for value in values if isinstance(value, str)))
+        found = _cli_write(_shell_text(tool, args))
         if found is None:
             return None
         settings = get_settings()

@@ -5,7 +5,10 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-PLAN_ID = {"type": "string", "description": "The plan_id returned by librenms_plan."}
+PLAN_ID = {
+    "type": "string",
+    "description": "The full plan_id returned by librenms_plan (lnp-...); a fragment of it is refused.",
+}
 
 OPERATION = {
     "type": "object",
@@ -169,7 +172,10 @@ LIBRENMS_PLANS = _schema(
     "librenms_plans",
     "List saved plans, or show one plan in full (diff, journal, rollback outcome) when plan_id is given.",
     {
-        "plan_id": {"type": "string"},
+        "plan_id": {
+            "type": "string",
+            "description": "A plan_id, or its last 4 or more characters when only one plan ends with them.",
+        },
         "status": {
             "type": "string",
             "enum": [

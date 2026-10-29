@@ -30,7 +30,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-from .redact import MASK, mask, scrub_text
+from .redact import MASK, clip, mask, scrub_text
 from .settings import get_settings
 from .store import data_dir, now_iso, private_dir
 from .version import __version__
@@ -41,6 +41,11 @@ SCHEMA = 1
 PLUGIN = "librenms"
 REQUEST_TEXT_LIMIT = 500
 REQUEST_CACHE_SIZE = 256
+# Every string of an event is clipped to TEXT_LIMIT characters, saying so; a refusal's reason or first error to
+# REASON_LIMIT where it is emitted. The model can pad what it sends (a description, a query path): an event that a
+# collector truncates is broken JSON, and one too large for a UDP datagram is not sent at all.
+TEXT_LIMIT = 2000
+REASON_LIMIT = 500
 
 # Hermes session variables -> actor field names, in the actor's key order. Missing values are recorded as null so
 # every event carries the same keys (stable field mapping for SIEM ingestion).
@@ -80,6 +85,24 @@ _SOURCE_FIELDS = (
 VIA_MODEL = "tool"
 VIA_SLASH = "slash"
 VIA_CLI = "cli"
+# The actor fields public_actor keeps for tool results.
+PUBLIC_ACTOR_FIELDS = ("kind", "via", "surface", "platform", "source", "profile", "chat_type", "cron", "cron_job_id")
+# The actor's ids: kept in the plan file and the audit stream, never in describe_actor's phrase.
+_ID_FIELDS = (
+    "user_id",
+    "user_id_alt",
+    "sender_id",
+    "chat_id",
+    "parent_chat_id",
+    "thread_id",
+    "scope_id",
+    "message_id",
+    "session_key",
+    "session_id",
+    "ui_session_id",
+    "task_id",
+    "cron_execution_id",
+)
 
 _ctx: Any = None
 
@@ -318,26 +341,61 @@ def capture_actor(kwargs: Dict[str, Any] | None = None, *, via: str = VIA_MODEL)
     return actor
 
 
+def _display_name(actor: Dict[str, Any], field: str) -> str | None:
+    """The actor's user or chat name for :func:`describe_actor`, or ``None`` where it would show an id. Hermes fills
+    a name in with the id when the platform has none (an SMS number, a Signal user without a profile name, an IRC
+    nick), and some adapters build one around an id (``a2a:<peer>``, a BlueBubbles chat identifier that is part of
+    its chat guid), so a name that is one of the actor's ids, or holds or is part of one (4 characters or more), is
+    left out."""
+    name = actor.get(field)
+    if not isinstance(name, str) or not name:
+        return None
+    for key in _ID_FIELDS:
+        ident = actor.get(key)
+        if not isinstance(ident, str) or not ident:
+            continue
+        if name == ident or (min(len(name), len(ident)) >= 4 and (ident in name or name in ident)):
+            return None
+    return name
+
+
 def describe_actor(actor: Dict[str, Any] | None) -> str:
     """One human-readable phrase for reports: ``model via tool on signal for Andrew in dm Andrew``,
-    ``operator via slash on tui (quartermaster)`` or ``operator via cli (quartermaster)``."""
+    ``operator via slash on tui (quartermaster)`` or ``operator via cli (quartermaster)``. The diff and the journal
+    that carry it reach the model of any session of the profile (:func:`public_actor`), so it names a user and a chat
+    by display name only (:func:`_display_name`): a user known only by an id is ``an unnamed user``, a chat only by
+    its type. The ids stay in the actor record."""
     if not actor:
         return "unknown"
     where = actor.get("platform") or actor.get("surface") or actor.get("source")
     text = f"{actor.get('kind', 'unknown')} via {actor.get('via') or where or 'unknown'}"
     if where and actor.get("via") in {VIA_MODEL, VIA_SLASH} and where != actor.get("via"):
         text += f" on {where}"
-    who = actor.get("user_name") or actor.get("user_id") or actor.get("sender_id")
+    who = _display_name(actor, "user_name")
     if who:
         text += f" for {who}"
+    elif any(actor.get(key) for key in ("user_name", "user_id", "user_id_alt", "sender_id")):
+        text += " for an unnamed user"
     elif actor.get("os_user"):
         text += f" ({actor['os_user']})"
-    chat = actor.get("chat_name") or actor.get("chat_id")
-    if chat and actor.get("chat_type"):
-        text += f" in {actor['chat_type']} {chat}"
+    if actor.get("chat_type"):
+        chat = _display_name(actor, "chat_name")
+        text += f" in {actor['chat_type']}" + (f" {chat}" if chat else "")
     if actor.get("cron"):
         text += f" [cron {actor['cron_job_id']}]" if actor.get("cron_job_id") else " [cron]"
     return text
+
+
+def public_actor(actor: Any) -> Any:
+    """What a tool result shows of an actor record: how and where it acted, and :func:`describe_actor`'s phrase, which
+    names no id, as ``by``. Plans belong to the profile, not to a session, so the model of any session of the profile (another
+    user of a shared gateway) can read them; the user's message, the sender, user and chat ids and the session ids
+    stay in the plan file and the audit stream. Anything but a record is returned as it is."""
+    if not isinstance(actor, dict):
+        return actor
+    shown = {key: actor.get(key) for key in PUBLIC_ACTOR_FIELDS}
+    shown["by"] = describe_actor(actor)
+    return shown
 
 
 # -- event stream ---------------------------------------------------------------------------------
@@ -457,7 +515,8 @@ class AuditLog:
         **details: Any,
     ) -> Dict[str, Any] | None:
         """Append one event and hand it to the sinks; returns the record as written. Credential-bearing keys are
-        masked whatever the caller passed (defence in depth). Never raises."""
+        masked whatever the caller passed (defence in depth), and every string is clipped to :data:`TEXT_LIMIT`
+        characters, saying so. Never raises."""
         if not self.enabled:
             return None
         path: Any = self._path
@@ -476,7 +535,7 @@ class AuditLog:
                     "pid": os.getpid(),
                 }
                 record.update(details)
-                record = _encodable(mask(record))
+                record = _encodable(clip(mask(record), TEXT_LIMIT))
                 try:
                     line = json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":")) + "\n"
                     data = line.encode("utf-8", "replace")

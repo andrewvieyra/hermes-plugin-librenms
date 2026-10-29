@@ -286,12 +286,12 @@ class LoadThroughPluginManager(unittest.TestCase):
         self.assertTrue(out["success"])
         self.assertEqual(out["count"], 0)
 
-        # the approval hook as Hermes invokes it: ours asks for an unknown plan too, and stays out of other tools
+        # the approval hook as Hermes invokes it: ours blocks an unknown plan with the handler's refusal, and stays
+        # out of other tools
         [directive] = mgr.invoke_hook(
             "pre_tool_call", tool_name="librenms_apply", args={"plan_id": "lnp-nope"}, task_id="t", session_id="s"
         )
-        self.assertEqual(directive["action"], "approve")
-        self.assertTrue(directive["rule_key"].startswith("librenms:librenms_apply:unresolved:"))
+        self.assertEqual(directive, {"action": "block", "message": "unknown plan_id 'lnp-nope'"})
         self.assertEqual(mgr.invoke_hook("pre_tool_call", tool_name="web_search", args={"query": "x"}), [])
 
 

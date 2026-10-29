@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterator, List, Tuple
 PLUGIN_NAME = "librenms"
 PREFIX = "lnp"
 IN_FLIGHT = ("applying", "rolling_back")
+MIN_FRAGMENT = 4  # hex digits in a plan id's random suffix
 # A plan can carry a lone surrogate (a JSON tool argument may hold "\ud800"), which UTF-8 cannot encode.
 # json.dumps only leaves one inside a JSON string, where backslashreplace writes it as that escape again, so the
 # plan is saved whole and reads back the same.
@@ -279,9 +280,12 @@ class PlanStore:
         return plans[: max(1, limit)]
 
     def resolve(self, fragment: str) -> Tuple[str | None, List[str]]:
-        """Map what a human typed to a plan id. An exact id wins; otherwise an unambiguous suffix or substring
-        match (``ab12`` or ``T190000Z-ab12``) resolves. Returns ``(plan_id, candidates)``: ``plan_id`` is None when
-        nothing or more than one plan matches, and ``candidates`` lists the matches so the caller can show them."""
+        """Map what a human typed to a plan id. An exact id wins; otherwise the end of an id, at least
+        :data:`MIN_FRAGMENT` characters in any case (``ab12`` or ``T190000Z-ab12``), resolves when exactly one plan
+        ends with it. Shorter text and text from the middle of an id resolve nothing: every id holds ``2026``,
+        ``T``, ``Z`` and ``-``, so ``2`` would pick whichever single plan is saved, and the apply or rollback it
+        names runs at once. Returns ``(plan_id, candidates)``: ``plan_id`` is None when nothing or more than one
+        plan matches, and ``candidates`` lists the matches so the caller can show them."""
         fragment = (fragment or "").strip()
         if not fragment:
             return None, []
@@ -291,11 +295,11 @@ class PlanStore:
                     return fragment, [fragment]
             except ValueError:
                 return None, []
+            if len(fragment) < MIN_FRAGMENT:
+                return None, []
             ids = sorted(p.stem for p in self.directory.glob(f"{PREFIX}-*.json"))
         needle = fragment.lower()
         candidates = [i for i in ids if i.lower().endswith(needle)]
-        if not candidates:
-            candidates = [i for i in ids if needle in i.lower()]
         return (candidates[0], candidates) if len(candidates) == 1 else (None, candidates)
 
     def prune(self, max_age_days: int, *, now: datetime | None = None, dry_run: bool = False) -> List[Dict[str, Any]]:

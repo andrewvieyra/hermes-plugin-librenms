@@ -73,6 +73,18 @@ separate host process. For `/librenms` the gateway's record of who sent the comm
 session variables. In a plain CLI session most platform fields are `null` and `os_user` is the
 meaningful identity.
 
+Plans belong to the profile, so the model of any of its sessions (another user of a shared gateway)
+can read one with `librenms_plans`. There each actor (`apply.actor`, `rollback.actor`,
+`checks[].actor`) is shown in a public form: `kind`, `via`, `surface`, `platform`, `source`,
+`profile`, `chat_type`, `cron`, `cron_job_id`, and `by`, the phrase the diff's `Created:` line and
+the journal's `Applied:` and `Rolled back:` lines show ("model via tool on signal for Andrew in dm
+Andrew"). The phrase names the user and the chat by display name only. Hermes fills a name in with
+the id when the platform has none (an SMS number, a Signal user without a profile name), so a name
+that is one of the actor's ids, holds one or is part of one is left out: such a user is "an
+unnamed user" and such a chat goes by its type alone ("model via tool on signal for an unnamed user
+in dm"). `request`, `sender_id`, the user, chat and message ids and the session ids are kept in the
+plan file and the event stream only.
+
 ### The request text
 
 Hermes does not pass the user's message to a tool. The plugin's `pre_llm_call` hook remembers it
@@ -195,11 +207,11 @@ Step and revert events identify their object with `index`, `action`, `resource`,
 | Event | When | Extra fields |
 |---|---|---|
 | `plan_created` | A plan was built and saved | `description`, `summary`, `steps` and `warnings` (counts), `irreversible` (step indexes) |
-| `plan_rejected` | Operations failed validation, a gate or resolution; nothing saved | `description`, `operations`, `errors`, `first_error` |
+| `plan_rejected` | Operations failed validation, a gate or resolution; nothing saved | `description` (cut to 200 characters), `operations`, `errors`, `first_error` (cut to 500) |
 | `plan_checked` | A dry run re-verified the preconditions | `conflicts` (count), `applicable` |
-| `query_refused` | `librenms_query` refused a path or its parameters before sending anything | `path`, `reason` |
-| `apply_refused` | Apply was refused: unknown id, wrong status, stale plan, another LibreNMS, a gate, a second apply, a run in progress, the lock held, `write_mode`, the CLI started from an agent session, or `hermes librenms apply` blocked in the agent's `terminal` or `execute_code` | `reason`, `dry_run`, `write_mode` when that was the cause. The terminal block: `reason` `blocked in the agent's terminal/execute_code`, `tool` (`terminal` or `execute_code`), `write_mode`; `plan_id` is the plan the command named (the canonical id when it resolves, else the id as written, or `null`), never the command text |
-| `approval_requested` | The plugin asked Hermes' approval prompt about `librenms_apply` or `librenms_rollback` (`require_approval` in `full` mode). Hermes may pass or block it by policy (YOLO, `approvals.mode: off`, an earlier "always", `approvals.cron_mode`, `approvals.unattended_mode`, `approvals.single_query_mode`) without asking anyone, and then no `approval_decided` follows | `tool`, `plan_id` (`null` when the id did not resolve), `rule_key` |
+| `query_refused` | `librenms_query` refused a path or its parameters before sending anything | `path` (its first 200 characters), `reason` (cut to 500) |
+| `apply_refused` | Apply was refused: unknown id (or not a full one), wrong status, stale plan, another LibreNMS, a gate, a second apply, a run in progress, the lock held, `write_mode`, the CLI started from an agent session, `hermes librenms apply` blocked in the agent's `terminal`, `execute_code` or `process_manage` input, or a `plan_id` the approval hook blocked before asking (it named no saved plan, or the plan could not be loaded) | `reason`, `dry_run`, `write_mode` when that was the cause. The terminal block: `reason` `blocked in the agent's terminal/execute_code`, `tool` (`terminal`, `execute_code` or `process_manage`), `write_mode`; `plan_id` is the plan the command named (the canonical id when it resolves, else the id as written, or `null`), never the command text. The approval hook's block: `tool` (`librenms_apply`), `reason`, `plan_id` `null` |
+| `approval_requested` | The plugin asked Hermes' approval prompt about `librenms_apply` or `librenms_rollback` (`require_approval` in `full` mode). Hermes may pass or block it by policy (YOLO, `approvals.mode: off`, an earlier "always", `approvals.cron_mode`, `approvals.unattended_mode`, `approvals.single_query_mode`) without asking anyone, and then no `approval_decided` follows | `tool`, `plan_id`, `rule_key`. A `plan_id` that names no saved plan is never asked about: it is blocked, as `apply_refused` or `rollback_refused` |
 | `approval_decided` | Hermes' approval prompt for `librenms_apply` or `librenms_rollback` was answered | `choice` (`once`, `session`, `always`, `deny`, `timeout`, `cancelled`), `tool`, `plan_id` when it could be read, `rule_key` (or Hermes' `pattern_key` for a command that mentions librenms), `decided_by` and `surface` as Hermes reports them. Never the command text |
 | `apply_started` | Plan claimed and execution begins | `steps`, `summary`, `rollback_on_failure` |
 | `step_done` | One step's write succeeded and was verified | object fields, `status`, `http_status`, `request` |
@@ -208,7 +220,7 @@ Step and revert events identify their object with `index`, `action`, `resource`,
 | `step_failed` | LibreNMS rejected the write, verification failed, or the request failed; the run stops | object fields, `status`, `error`, `http_status`, `request`, and `wrote: true` when LibreNMS may have applied part of the step |
 | `eventlog_linked` | LibreNMS eventlog lookup after an apply or rollback | `phase`, `linked`, `devices`, `events` (counts); or `linked: false`, `error`, `http_status` |
 | `apply_finished` | Outcome of the run | `outcome` (`applied` or `failed`), `status`, `done`, and on failure `failed_step`, `failure_kind` (`conflict` or `error`), `error` |
-| `rollback_refused` | Rollback was refused: unknown id, wrong status, another LibreNMS, nothing left to roll back, a run in progress, the lock held, `write_mode`, the CLI started from an agent session, or `hermes librenms rollback` blocked in the agent's `terminal` or `execute_code` | `reason`, `force`, `write_mode` when that was the cause; `automatic: true` and `pending` when the automatic rollback after a failed apply was the one refused; the terminal block as for `apply_refused` |
+| `rollback_refused` | Rollback was refused: unknown id (or not a full one), wrong status, another LibreNMS, nothing left to roll back, a run in progress, the lock held, `write_mode`, the CLI started from an agent session, `hermes librenms rollback` blocked in the agent's `terminal`, `execute_code` or `process_manage` input, or a `plan_id` the approval hook blocked before asking | `reason`, `force`, `write_mode` when that was the cause; `automatic: true` and `pending` when the automatic rollback after a failed apply was the one refused; the terminal block and the approval hook's block as for `apply_refused` |
 | `run_recovered` | A rollback found the plan left `applying` or `rolling_back` by a process that died | `previous_status`, `dangling_indexes` (entries that were in flight) |
 | `rollback_started` | Reverting begins, newest entry first | `entries`, `force`, `reason` (`requested`, or `automatic after failure at step N`) |
 | `revert_reverted`, `revert_conflict`, `revert_failed`, `revert_irreversible`, `revert_skipped` | Outcome of one inverse. A write whose answer was lost and that LibreNMS shows no trace of yet is `revert_failed` until ten minutes have passed (it may still land), with an `error` that says when to roll back again | object fields, `status`, `error`, `new_object_id` (a re-created object), `http_status`, `request` |
@@ -217,6 +229,11 @@ Step and revert events identify their object with `index`, `action`, `resource`,
 
 `summary` counts `create`, `update`, `delete`, `action` (maintenance, discover, ack, unmute) and
 `noop`. `request` is `{"method", "path", "status", "duration_ms"}`.
+
+Every string in an event, at any depth, is cut to 2,000 characters; a longer one ends
+`… [truncated N chars]`. Text the model writes is cut shorter where it is recorded (above). A
+padded description or path therefore cannot make an event that a collector truncates into broken
+JSON, or one too large to send over UDP (see [sinks.md](sinks.md) for how a UDP message is fitted).
 
 A complete successful lifecycle emits `plan_created`, (`approval_requested`, `approval_decided`,)
 `apply_started`, one `step_*` per step, `eventlog_linked`, `apply_finished`. A failure adds `step_failed` or

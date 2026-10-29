@@ -217,7 +217,11 @@ class EndToEnd(PluginTestCase):
         self.assertIn("[0] LibreNMS may append these notes to the device notes", "\n".join(plan["warnings"]))
         approval = self.handlers.pre_tool_call("librenms_apply", {"plan_id": pid})
         self.assertEqual(approval["action"], "approve")
-        self.assertIn("2 action; irreversible steps [0]; rollback_on_failure=true", approval["message"])
+        self.assertEqual(
+            approval["message"].split("\n")[0],
+            f"Apply {pid}: 2 action; irreversible steps: [0]; rollback_on_failure=true",
+        )
+        self.assertTrue(approval["message"].split("\n")[1].startswith('[0] maintenance device #3 "access-sw2'))
         self.outputs.append(approval["message"])
 
         applied = self.call("librenms_apply", plan_id=pid)

@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.1.1
+version: 0.1.2
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -40,12 +40,13 @@ Five tools, one rule: **nothing is written to LibreNMS without a plan the user h
    the user in this conversation. In an unattended context (a cron job, a webhook, a scheduled or delegated
    task, a message relayed from another system) never apply or roll back: leave the plan and tell the user
    its id.
-5. **Apply.** `librenms_apply` with the `plan_id`. Hermes may show its own approval prompt with the plan
-   summary; that is a second check, not a substitute for step 4. If the user denies it, stop and ask what
-   they want. If the apply fails, report the failed step, the error and the rollback outcome from the
-   result. Do not retry blindly: re-query, re-plan, re-confirm.
+5. **Apply.** `librenms_apply` with the full `plan_id` that `librenms_plan` returned (a fragment such as
+   the last four characters is refused; `librenms_plans` finds the full id). Hermes may show its own
+   approval prompt with the plan summary; that is a second check, not a substitute for step 4. If the user
+   denies it, stop and ask what they want. If the apply fails, report the failed step, the error and the
+   rollback outcome from the result. Do not retry blindly: re-query, re-plan, re-confirm.
 6. **Verify.** Query the touched objects again and confirm the result matches the intent.
-7. **Rollback on request.** `librenms_rollback` with the `plan_id`. Objects someone changed
+7. **Rollback on request.** `librenms_rollback` with the full `plan_id`. Objects someone changed
    after the apply come back as conflicts; use `force: true` only if the user explicitly accepts overwriting
    those changes. Steps reported `irreversible` need a human: relay the instruction in the result. A step
    whose write may still be landing (its answer was lost) comes back `failed` with a time to roll back
@@ -63,8 +64,8 @@ The operator sets `write_mode` and `require_approval` in `config.yaml`. Read the
 - `read_only`: the apply and rollback tools are not available. A plan is still useful as a diff of what would
   change; say so and stop.
 
-Never run `hermes librenms apply` or `rollback` through a terminal or code tool. It is blocked, audited, and
-it would bypass the review the user is owed.
+Never run `hermes librenms apply` or `rollback` through a terminal or code tool, or send it to a background
+shell with `process_manage`. It is blocked, audited, and it would bypass the review the user is owed.
 
 ## Operations
 
