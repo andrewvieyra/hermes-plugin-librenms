@@ -395,7 +395,8 @@ class Files(StoreTestCase):
 
     def test_the_content_digest_is_what_runs_and_what_was_shown(self):
         # the approval hook keys a person's answer to it, and the claim compares it again: every key that decides what
-        # an apply or rollback does changes it, a save, a dry-run check or who planned it does not
+        # an apply or rollback does or that a prompt shows (the run records a rollback prompt shows too) changes it; a
+        # save, a dry-run check or who planned it does not
         plan = _plan(
             "lnp-20261028T190000Z-d1d1",
             version=1,
@@ -413,7 +414,7 @@ class Files(StoreTestCase):
         self.assertRegex(digest, r"^[0-9a-f]{32}$")
         self.assertEqual(store_mod.content_digest(plan), digest)  # the same from memory as from the file
         loaded = self.store.load(plan["id"])
-        loaded.update(requested_by={"kind": "operator"}, audit={}, checks=[{"conflicts": []}], apply=None)
+        loaded.update(requested_by={"kind": "operator"}, audit={}, checks=[{"conflicts": []}])
         self.store.save(loaded)  # a new updated_at too
         self.assertEqual(store_mod.content_digest(self.store.load(plan["id"])), digest)
         changes = {
@@ -428,6 +429,8 @@ class Files(StoreTestCase):
             "irreversible": [0],
             "steps": [{"index": 0, "action": "update", "changes": {"purpose": {"from": "core", "to": "edge"}}}],
             "journal": [{"index": 0, "status": "done"}],
+            "apply": {"actor": {"kind": "operator"}, "auto_rollback_error": "reviewed"},
+            "rollback": {"reason": "requested", "reverted": 1},
         }
         self.assertEqual(set(changes), set(store_mod.CONTENT_KEYS))
         for key, value in changes.items():
@@ -444,6 +447,24 @@ class Files(StoreTestCase):
             with self.assertRaises(ValueError):
                 self.store.run_lock_free(bad)
         self.assertIsNone(self.store.load("lnp-20261028T190000Z-none"))
+
+    def test_an_id_the_approval_key_could_not_carry_names_no_plan(self):
+        # ':' separates the parts of the approval rule key (and names a stream on Windows); a file named so by hand
+        # is listed, so it can be found and pruned, but never loaded, resolved, saved or run
+        for bad in ("lnp-x:1", "lnp-20261028T190000Z-ab12:rb", "-ab12", ".lock", "lnp-x y", "lnp-\u00e9", 5, None):
+            self.assertFalse(store_mod.valid_plan_id(bad), bad)
+            with self.assertRaises(ValueError):
+                self.store.load(bad)
+            with self.assertRaises(ValueError):
+                self.store.save(_plan(bad))
+        for good in ("lnp-20261028T190000Z-ab12", "lnp-test_1.2", "x"):
+            self.assertTrue(store_mod.valid_plan_id(good), good)
+        self.write_raw(_plan("lnp-20261028T190000Z-ab12"))
+        (self.dir / "lnp-x:ab12.json").write_text(json.dumps(_plan("lnp-x:ab12")))
+        self.assertEqual(self.store.resolve("lnp-x:ab12"), (None, []))
+        self.assertEqual(self.store.resolve("ab12"), ("lnp-20261028T190000Z-ab12", ["lnp-20261028T190000Z-ab12"]))
+        self.assertEqual(self.store.resolve("-ab12"), ("lnp-20261028T190000Z-ab12", ["lnp-20261028T190000Z-ab12"]))
+        self.assertEqual({p["id"] for p in self.store.list(limit=50)}, {"lnp-20261028T190000Z-ab12", "lnp-x:ab12"})
 
 
 class Listing(StoreTestCase):

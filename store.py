@@ -13,6 +13,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import secrets
 import stat
 import threading
@@ -26,6 +27,9 @@ PREFIX = "lnp"
 IN_FLIGHT = ("applying", "rolling_back")
 UNKNOWN_STATUS = "unknown"  # what a plan file without a usable status (hand-edited, damaged) is listed and found as
 MIN_FRAGMENT = 4  # hex digits in a plan id's random suffix
+# What a plan id (and so a plan file's name) may hold: the planner's own ids (new_plan_id) and nothing that leaves
+# the plans directory or that the approval rule key could not be read back from.
+PLAN_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 # A plan can carry a lone surrogate (a JSON tool argument may hold "\ud800"), which UTF-8 cannot encode.
 # json.dumps only leaves one inside a JSON string, where backslashreplace writes it as that escape again, so the
 # plan is saved whole and reads back the same.
@@ -33,9 +37,10 @@ _ENCODE_ERRORS = "backslashreplace"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 # The keys of a plan that decide what an apply or a rollback does and what the approval prompt shows of it: what it
 # changes and how (steps, with their snapshots and inverses), what it says about that (summary, irreversible steps,
-# warnings, the description), where and since when (LibreNMS, created_at), and how far it has run (status, journal).
-# Left out: who planned it and from where (requested_by, audit), the dry-run checks and every run's own record
-# (checks, apply, rollback), and updated_at, which a dry run changes without changing what runs.
+# warnings, the description), where and since when (LibreNMS, created_at), and how far it has run (status, journal,
+# and the apply and rollback records a rollback prompt shows: who ran it, how it failed, what was recovered). Left
+# out: who planned it and from where (requested_by, audit), the dry-run checks, and updated_at, which a dry run
+# changes without changing what runs or what a prompt shows.
 CONTENT_KEYS = (
     "id",
     "version",
@@ -48,6 +53,8 @@ CONTENT_KEYS = (
     "irreversible",
     "steps",
     "journal",
+    "apply",
+    "rollback",
 )
 CONTENT_DIGEST_CHARS = 32  # hex: 128 bits, too many to make two plan files that share one
 
@@ -149,6 +156,14 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def valid_plan_id(plan_id: Any) -> bool:
+    """Whether *plan_id* can name a plan file: :data:`PLAN_ID_RE` (letters, digits, ``_``, ``.`` and ``-``) without
+    ``..``. So nothing outside the plans directory, and no ``:``, which separates the parts of the approval rule key
+    (``librenms:<tool>:<id>:<variant>:<digest>``) and which Windows reads as a stream name. A file whose name is not
+    one (made by hand) is listed but never loaded, resolved or run."""
+    return isinstance(plan_id, str) and PLAN_ID_RE.fullmatch(plan_id) is not None and ".." not in plan_id
+
+
 def new_plan_id() -> str:
     """``lnp-<ISO 8601 basic UTC timestamp>-<4 hex>``, e.g. ``lnp-20261028T190000Z-ab12``: filename-safe (no
     colons), sorts chronologically, and the ``Z`` makes the zone explicit."""
@@ -246,7 +261,8 @@ class PlanStore:
         return private_dir(self._dir if self._dir is not None else default_plans_dir())
 
     def _path(self, plan_id: str) -> Path:
-        if not plan_id or "/" in plan_id or "\\" in plan_id or ".." in plan_id:
+        """``<plans>/<plan_id>.json``; ``ValueError`` for an id that is not :func:`valid_plan_id`."""
+        if not valid_plan_id(plan_id):
             raise ValueError(f"invalid plan id {plan_id!r}")
         return self.directory / f"{plan_id}.json"
 
@@ -329,20 +345,18 @@ class PlanStore:
         :data:`MIN_FRAGMENT` characters in any case (``ab12`` or ``T190000Z-ab12``), resolves when exactly one plan
         ends with it. Shorter text and text from the middle of an id resolve nothing: every id holds ``2026``,
         ``T``, ``Z`` and ``-``, so ``2`` would pick whichever single plan is saved, and the apply or rollback it
-        names runs at once. Returns ``(plan_id, candidates)``: ``plan_id`` is None when nothing or more than one
-        plan matches, and ``candidates`` lists the matches so the caller can show them."""
+        names runs at once. Only files named by a :func:`valid_plan_id` count. Returns ``(plan_id, candidates)``:
+        ``plan_id`` is None when nothing or more than one plan matches, and ``candidates`` lists the matches so the
+        caller can show them."""
         fragment = (fragment or "").strip()
         if not fragment:
             return None, []
         with self._lock:
-            try:
-                if self._path(fragment).exists():
-                    return fragment, [fragment]
-            except ValueError:
-                return None, []
+            if valid_plan_id(fragment) and self._path(fragment).exists():
+                return fragment, [fragment]
             if len(fragment) < MIN_FRAGMENT:
                 return None, []
-            ids = sorted(p.stem for p in self.directory.glob(f"{PREFIX}-*.json"))
+            ids = sorted(p.stem for p in self.directory.glob(f"{PREFIX}-*.json") if valid_plan_id(p.stem))
         needle = fragment.lower()
         candidates = [i for i in ids if i.lower().endswith(needle)]
         return (candidates[0], candidates) if len(candidates) == 1 else (None, candidates)

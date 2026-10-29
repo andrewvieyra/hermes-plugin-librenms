@@ -188,7 +188,12 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
 ## The plan document
 
 Plans live in `<HERMES_HOME>/plugin-data/librenms/plans/<plan_id>.json` (mode `0600`, directories
-`0700`). The id is `lnp-<UTC timestamp>-<4 hex>`, so ids sort chronologically.
+`0700`). The id is `lnp-<UTC timestamp>-<4 hex>`, so ids sort chronologically. The store loads, resolves
+and saves only ids of letters, digits, `_`, `.` and `-` without `..` (`store.valid_plan_id`): nothing
+outside the directory, and no `:`, which separates the parts of the approval rule key. A file named
+otherwise by hand is listed (and pruned) but never loaded or run, and a plan file whose `id` is not the
+name it is found by (edited or copied by hand) is refused by every tool, the operator's commands too:
+`plan file <name> holds plan '<id>', not <name>`.
 
 ```jsonc
 {
@@ -391,10 +396,10 @@ run lock is held.
 | Guarantee | Enforcement |
 |---|---|
 | A plan applies at most once | `planned -> applying` is flipped under `<plans>/.lock` after re-reading the file; a second claim finds `applying` or later and is refused (`refusing to apply twice`) |
-| An approved call runs only the plan the prompt showed | The approval key carries the plan's content digest, and the claim of an apply or rollback that went through the prompt compares the digest of the file it re-read with the prompt's (`approved_digest`) and refuses a difference (see [The approval hook](#the-approval-hook)) |
+| An approved call runs only the plan the prompt showed | The approval key carries the plan's content digest, and the claim of an apply or rollback that went through the prompt compares the digest of the file it re-read with the prompt's (`approved_digest`) and refuses a difference; what runs is that re-read plan whole, never a key kept from the handler's earlier load. A model's call that reaches the handler with no prompt bound to it while `require_approval` is on is refused (see [The approval hook](#the-approval-hook)) |
 | Only against the LibreNMS it was built for | The plan records `librenms_url`; apply and rollback refuse when `LIBRENMS_URL` now names another base URL |
 | Only while fresh | Apply refuses a plan older than `max_plan_age_hours` (default 24) |
-| Only while the operator's gates allow it | `allow_delete`, `allow_device_add` (device creates, and updates that change `hostname` or `overwrite_ip`) and `allow_services` are checked when planning and again for every step when applying |
+| Only while the operator's gates allow it | `allow_delete`, `allow_device_add` (device creates, and updates that change `hostname` or `overwrite_ip`) and `allow_services` are checked when planning and again for every step when applying, on the plan as the claim re-read it |
 | One run at a time | Under the store lock, apply and rollback refuse while another plan's run lock is held, whatever its status says (a failed apply holds it through its automatic rollback): two runs writing the same objects would trip over each other's preconditions. A refused claim drops the run lock it took before it lets go of the store lock |
 | Nothing runs against an object that changed | Each step's `check()` re-reads the object and compares it with `precondition.state` before the write; a conflict stops the run like an error |
 | Every write is verified | After each write the resource re-reads the object and compares the written fields with what was sent; a mismatch is a failure with the inverse journaled |
@@ -512,12 +517,14 @@ human to ask blocks the call.
   `librenms:librenms_rollback:<id>:force|safe:<digest>`, where `<digest>` is `store.content_digest`
   of the plan as the hook loaded it for the message: the first 32 hex digits of a sha256 of the
   canonical JSON (sorted keys, ASCII) of its `id`, `version`, `status`, `created_at`, `librenms_url`,
-  `description`, `summary`, `warnings`, `irreversible`, `steps` and `journal`. Who planned it
-  (`requested_by`, `audit`), the dry-run `checks`, the `apply` and `rollback` records and
-  `updated_at` are left out, so a dry run between the prompt and the apply changes nothing. An
-  "always" or "session" answer therefore covers that plan with that choice as it was shown; once its
-  file changes Hermes asks again. Keys of 0.10.x and earlier, without the digest, are never asked
-  again, and `post_approval_response` still reads them.
+  `description`, `summary`, `warnings`, `irreversible`, `steps`, `journal` and the `apply` and
+  `rollback` records (who ran it, how it failed, what was recovered: a rollback prompt shows them).
+  Who planned it (`requested_by`, `audit`), the dry-run `checks` and `updated_at` are left out, so a
+  dry run between the prompt and the apply changes nothing. An "always" or "session" answer therefore
+  covers that plan with that choice as it was shown; once its file changes Hermes asks again. What
+  the hook hands `bind_approval` is made from the same plan id, variant and digest as the key, not
+  read back from it, and a key that would not read back as them is blocked. Keys of 0.10.x and
+  earlier, without the digest, are never asked again, and `post_approval_response` still reads them.
 - **Bound to the call**: a second `pre_tool_call` callback, `bind_approval`, registered after the
   first, hands the handler of the same call what its prompt showed, as
   `_librenms_approval: {"plan_id", "variant", "digest"}` in its arguments by Hermes' `modify`
@@ -528,16 +535,24 @@ human to ask blocks the call.
   `modify`, tool middleware), and passes the digest to the executor, which refuses under the claim,
   after the last load before the run, a plan whose digest differs (`plan <id> changed after the
   approval prompt showed it`, `executor.PlanChanged`, audited with `approved_digest` and `digest`).
-  So an edit made while the prompt was open, or another plan saved under the same id, never runs on
-  that approval. The value only adds checks: one the model wrote that no hook replaced (a Hermes
-  without `modify`) can make the call refuse, never let it run. An operator's `/librenms` or
-  `hermes librenms` command is never held to it.
+  The claim then runs that load whole: it replaces the handler's copy instead of merging into it, so
+  no key the digested file lacks (its steps, its journal) is filled in from an earlier load, and it
+  checks the preflight (status, age, URL, gates) on it again. So an edit made while the prompt was
+  open, or another plan saved under the same id, never runs on that approval. A model's call whose
+  `_librenms_approval` is there but names no prompt (`null`) is refused while `require_approval` is
+  on in `full` mode (`apply refused: no approval prompt showed this call`): a `dry_run` that another
+  plugin's `modify` or tool middleware turned false after the hook skipped the prompt, arguments
+  changed between the two callbacks, a record lost. The value only adds checks: one the model wrote
+  that no hook replaced (a Hermes without `modify`) can make the call refuse, never let it run. An
+  operator's `/librenms` or `hermes librenms` command is never held to it.
 - **Exact ids only**: the hook and the `librenms_apply` / `librenms_rollback` handlers take a plan's
-  full id, never a fragment. A `plan_id` that names no saved plan, or only the end of one (the
-  refusal names the plan), or several, is blocked with the handler's own refusal
-  (`{"action": "block", "message"}`) rather than put to a person: the handler would refuse it, and a
-  fragment resolved again after the prompt could name a plan created while it was open. The block is
-  audited as `apply_refused` or `rollback_refused` with `tool` set to the write tool.
+  full id, never a fragment. A `plan_id` that names no saved plan (an id the store does not take,
+  such as one with `:`, included), or only the end of one (the refusal names the plan), or several,
+  or a plan file whose `id` names another plan, is blocked with the handler's own refusal
+  (`{"action": "block", "message"}`) rather than put to a person: the handler would refuse it, a
+  fragment resolved again after the prompt could name a plan created while it was open, and the
+  prompt would show one file while the claim re-read the one its `id` names. The block is audited as
+  `apply_refused` or `rollback_refused` with `tool` set to the write tool.
 - **Dry runs** skip approval only when `dry_run` is true by the same parser the handler uses
   (`handlers.parse_bool`), so a string like `"false"` cannot slip a real apply past the prompt.
 - **Failure**: the hook never raises (Hermes blocks any tool call whose hook raises). On any internal

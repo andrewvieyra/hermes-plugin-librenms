@@ -5,7 +5,9 @@ Guarantees the executor enforces on every run:
 * A plan applies at most once, only against the LibreNMS it was built for, only while it is fresh and only while the
   operator's gates still allow every step: ``planned -> applying`` is flipped under the store lock.
 * A call a person approved runs only the plan they were shown: under the claim, the plan's content digest must be
-  the one the approval prompt showed (``approved_digest``), for an apply and a rollback alike.
+  the one the approval prompt showed (``approved_digest``), for an apply and a rollback alike. What runs is the plan
+  as the claim read it, whole (no key kept from an earlier read), from the file its id names, and the preflight is
+  checked again on it.
 * One run at a time. A run holds its plan's run lock from the claim to its last save, and no apply or rollback
   starts while another plan's run is alive. A refused claim drops the run lock it took before the store lock. A plan left ``applying`` or ``rolling_back`` whose run lock is free
   belongs to a run that died; rollback recovers it.
@@ -154,6 +156,8 @@ def _same_librenms(plan: Dict[str, Any], client: LibreNMSClient, verb: str) -> N
 
 
 def preflight_apply(plan: Dict[str, Any], client: LibreNMSClient, settings: Settings) -> None:
+    """Refuse *plan* unless it may run now: planned, a list of steps, fresh, built against this LibreNMS and every
+    step allowed by the operator's gates. Checked before the claim and again, under it, on the plan as re-read."""
     if plan.get("status") not in APPLYABLE:
         raise ExecutionRefused(
             f"plan {plan['id']} is {plan.get('status')}; only a 'planned' plan can be applied "
@@ -169,6 +173,8 @@ def preflight_apply(plan: Dict[str, Any], client: LibreNMSClient, settings: Sett
             f"{settings.max_plan_age_hours}. Re-run librenms_plan."
         )
     _same_librenms(plan, client, "built")
+    if not isinstance(plan.get("steps"), list):
+        raise ExecutionRefused(f"plan {plan['id']} has no list of steps; build a new plan with librenms_plan")
     for step in plan["steps"]:
         if step.get("action") == "noop":
             continue
@@ -219,6 +225,28 @@ def _hold_run_lock(store: PlanStore, plan_id: str, claim: contextlib.ExitStack) 
         raise ExecutionRefused(
             f"plan {plan_id} is still being applied by another process; try again when it finishes"
         ) from exc
+
+
+def _reload(store: PlanStore, plan: Dict[str, Any], done: str) -> Dict[str, Any]:
+    """*plan* as its file holds it now, read under the claim; *plan* itself when the file is gone. A file that holds
+    another id than the one it is named by (edited or copied by hand) is refused: everything the run saves would go
+    to that other plan's file. *done* says what did not happen ("applied", "reverted", "checked")."""
+    current = store.load(plan["id"])
+    if current is None:
+        return plan
+    if not isinstance(current, dict) or current.get("id") != plan["id"]:
+        raise ExecutionRefused(
+            f"plan file {plan['id']} no longer holds plan {plan['id']} (it was edited by hand); nothing was {done}"
+        )
+    return current
+
+
+def _adopt(plan: Dict[str, Any], current: Dict[str, Any]) -> None:
+    """Make *plan* the plan the claim read, key for key: what the claim checked (its status, its content digest, the
+    preflight) is all that runs. A key the file no longer holds is dropped, never kept from an earlier read."""
+    if current is not plan:
+        plan.clear()
+        plan.update(current)
 
 
 def _refuse_changed(plan: Dict[str, Any], approved_digest: str | None, action: str) -> None:
@@ -374,8 +402,8 @@ def _dry_run(
     take a while, and the lock serialises every claim); the result is recorded only if the plan is still planned."""
     conflicts = check_preconditions(client, plan)
     with _claiming(store):
-        current = store.load(plan["id"]) or plan
-        plan.update(current)
+        current = _reload(store, plan, "checked")
+        _adopt(plan, current)
         if current.get("status") not in APPLYABLE:
             return plan
         plan.setdefault("checks", []).append({"at": now_iso(), "conflicts": conflicts, "actor": actor})
@@ -468,12 +496,14 @@ def apply_plan(
         # dead one and no second apply (gateway vs CLI) can claim the same plan.
         with _claiming(store), contextlib.ExitStack() as claim:
             _hold_run_lock(store, plan["id"], claim)
-            current = store.load(plan["id"]) or plan
+            current = _reload(store, plan, "applied")
             if current.get("status") not in APPLYABLE:
                 raise ExecutionRefused(f"plan {plan['id']} is {current.get('status')}; refusing to apply twice")
             _refuse_changed(current, approved_digest, "apply")
+            if current is not plan:  # the file may have changed since the preflight above
+                preflight_apply(current, client, settings)
             _refuse_concurrent(store, plan["id"])
-            plan.update(current)
+            _adopt(plan, current)
             plan["status"] = "applying"
             plan["journal"] = []
             plan["apply"] = {"started_at": now_iso(), "rollback_on_failure": rollback_on_failure, "actor": actor}
@@ -629,7 +659,7 @@ def rollback_plan(
         with _claiming(store), contextlib.ExitStack() as claim:
             free = store.run_lock_free(plan["id"])
             _hold_run_lock(store, plan["id"], claim)
-            current = store.load(plan["id"]) or plan
+            current = _reload(store, plan, "reverted")
             previous = current.get("status")
             recovering = previous in IN_FLIGHT
             if recovering and not free:  # this process is running it
@@ -639,8 +669,9 @@ def rollback_plan(
             if not recovering and previous not in ROLLBACKABLE:
                 raise _not_rollbackable(plan["id"], previous)
             _refuse_changed(current, approved_digest, "rollback")
+            _same_librenms(current, client, "applied")
             _refuse_concurrent(store, plan["id"])
-            plan.update(current)
+            _adopt(plan, current)
             dangling = _recover(plan) if recovering else []
             pending = pending_entries(plan)
             journal = plan.get("journal") or []

@@ -473,6 +473,35 @@ class LoadThroughPluginManager(unittest.TestCase):
         )
         self.assertNotEqual(first_key, second_key)
 
+    def test_the_dry_run_another_hook_turns_into_an_apply_is_refused(self):
+        # through Hermes' own dispatch: our callbacks see a dry run and ask nothing, another plugin's modify directive
+        # makes it an apply, and the handler gets the null bind_approval handed over, so it does not run unbound
+        import model_tools
+        from tools import approval
+
+        plugin, fake, plan_id = self._dispatching_plugin()
+        asked = []
+
+        def gate(tool_name, reason, *, rule_key="", approval_callback=None):
+            asked.append(rule_key)
+            return {"approved": True, "message": None}
+
+        def flip(tool_name=None, args=None, **_kwargs):
+            return {"action": "modify", "args": {"dry_run": False}} if tool_name == "librenms_apply" else None
+
+        original = approval.request_tool_approval
+        approval.request_tool_approval = gate
+        self.addCleanup(setattr, approval, "request_tool_approval", original)
+        callbacks = self.mgr._hooks.setdefault("pre_tool_call", [])
+        callbacks.append(flip)
+        self.addCleanup(callbacks.remove, flip)
+        call = {"task_id": "t", "session_id": "s", "tool_call_id": "call-1"}
+        args = {"plan_id": plan_id, "dry_run": True}
+        out = json.loads(model_tools.handle_function_call("librenms_apply", args, **call))
+        self.assertTrue(out["error"].startswith("apply refused: no approval prompt showed this call"), out)
+        self.assertEqual((asked, fake.writes()), ([], []))
+        self.assertEqual(plugin.store.get_store().load(plan_id)["status"], "planned")
+
     def test_the_second_skill_is_offered_viewed_and_invoked_like_the_first(self):
         # the question skill reaches the model as the workflow does: a line in <available_skills>, skill_view by its
         # qualified name (with Hermes' banner naming its sibling), and a /librenms:ask slash command. (Named to run

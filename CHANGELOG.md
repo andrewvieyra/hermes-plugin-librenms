@@ -6,6 +6,56 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-29
+
+What the review of 0.11.0 found in its own changes, each confirmed against the 0.11.0 code first.
+
+### Security
+- The claim runs the plan it digested, whole. `apply_plan` and `rollback_plan` compared the digest of the plan they
+  re-read under the claim but then merged it into the handler's own load (`plan.update(current)`), so a key the
+  re-read file lacked kept the handler's value, which no digest covered; and the claim re-read the file the plan's
+  `id` field names, not the one the hook and the handler loaded. A plan file whose `id` named a second file with the
+  same content and no `steps` was prompted as `nothing to change`, gained a step while the prompt was open, and that
+  step ran; a rollback prompted as `0 pending entries` reverted the journal of the handler's copy, inverses
+  included. The claim now replaces the handler's copy with what it read (a key the file lacks is dropped), refuses a
+  file that holds another id than its name (`plan file <id> no longer holds plan <id>`), and checks the preflight
+  (status, age, URL, a list of steps, the operator's gates) again on what it read, so a step added after the
+  handler's load is gated like the rest. Every tool, the operator's commands included, refuses a plan file whose
+  `id` is not the name it is found by (`plan file <name> holds plan '<id>', not <name>`): the hook blocks it
+  instead of asking.
+- The approval binding no longer fails open. The hook re-read what its prompt showed from the rule key, whose plan
+  and variant parts stop at `:`, while the store took any file name without `/`, `\` or `..`: a plan file named
+  `lnp-x:1.json` was prompted for, but `bind_approval` handed the handler `null`, and the handler, which treated
+  `null` like no hook at all, ran it unbound, an edit made while the prompt was open included. The hook now hands
+  over the plan id, variant and digest it built the key from, and blocks a key that would not read back as them;
+  plan ids hold only letters, digits, `_`, `.` and `-` without `..` (`store.valid_plan_id`; the store neither loads,
+  resolves nor saves another); and a model's call whose `_librenms_approval` is there but names no prompt is refused
+  while `require_approval` is on in `full` mode (`apply refused: no approval prompt showed this call, and
+  require_approval is on; nothing was applied`), so a `dry_run: true` that another plugin's `modify` or tool
+  middleware turns false after the hook skipped the prompt, or a binding lost between the two callbacks, no longer
+  runs. Without the argument at all (a Hermes without `modify`) and for an operator's command nothing changes.
+
+### Fixed
+- The content digest covers the `apply` and `rollback` records. A rollback prompt shows them (who applied it, `Apply
+  FAILED ...`, `Automatic rollback refused: ...`, what was recovered, the counts and the reason), but the digest left
+  them out, so a remembered answer covered a prompt whose text a file edit had changed, and text written into them
+  could push the journal out of the prompt. A dry run still changes nothing the digest covers (it writes only
+  `checks` and `updated_at`).
+
+### Changed
+- `handlers.find_plan` returns `(plan_id, plan, reason)`: the refusal to return instead of the candidates.
+- README (Safety model, Write modes), SECURITY.md (the approval row), docs/architecture.md (the plan document's ids,
+  the guarantees, the rule key, binding the call, exact ids), docs/audit.md (the refusals) and SKILL.md (what to do
+  on the two new refusals) say so.
+- Tests: the claim running only what it read (a stepless file refused, a journal-less one reverting nothing), a file
+  holding another id refused by the claim for apply, dry run and rollback, the preflight checked again under the
+  claim; the store refusing ids with `:` and the like while still resolving fragments such as `-ab12`; the digest
+  covering the run records; the hook and the handlers refusing a plan file holding another id (the review's
+  scenario) and an id with `:`, and blocking a key that would not read back; a null binding refused for an apply
+  and a rollback but not for an operator, with approval off or without the argument; the rollback prompt's run
+  records bound; and, through Hermes' real dispatch, a dry run another plugin's `modify` turns into an apply
+  refused.
+
 ## [0.11.0] - 2026-10-29
 
 Approvals bound to plan content (finding sec-approval-not-bound-to-plan-content).

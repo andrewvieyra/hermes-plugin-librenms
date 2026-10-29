@@ -241,19 +241,29 @@ def write_gate(
     return None
 
 
-def find_plan(
-    store: PlanStore, raw: Any, *, exact: bool = False
-) -> Tuple[str | None, Dict[str, Any] | None, List[str]]:
-    """``(plan_id, plan, candidates)`` for what a caller named: an exact id, else (unless *exact*) the end of one, as
-    :meth:`PlanStore.resolve` matches. ``librenms_apply``, ``librenms_rollback`` and their approval hook take only an
-    exact id, so the plan a human approved is the plan that runs: a fragment resolved again after the prompt could
-    name a plan created while it was open. *candidates* still lists what a fragment matches, for the refusal."""
+def find_plan(store: PlanStore, raw: Any, *, exact: bool = False) -> Tuple[str | None, Dict[str, Any] | None, str]:
+    """``(plan_id, plan, "")`` for what a caller named: an exact id, else (unless *exact*) the end of one, as
+    :meth:`PlanStore.resolve` matches; else ``(None, None, why)``, the refusal to return. ``librenms_apply``,
+    ``librenms_rollback`` and their approval hook take only an exact id, so the plan a human approved is the plan that
+    runs: a fragment resolved again after the prompt could name a plan created while it was open. A plan file whose
+    ``id`` is not the name it is found by (edited or copied by hand) is refused too: the prompt would show one file
+    and the run re-read, and save to, the file its ``id`` names."""
     text = str(raw or "").strip()
     plan_id, candidates = store.resolve(text)
     if exact and plan_id != text:
         plan_id = None
     plan = store.load(plan_id) if plan_id else None
-    return (plan_id, plan, candidates) if plan is not None else (None, None, candidates)
+    if plan_id is None or plan is None:
+        return None, None, _unknown(raw, candidates)
+    if not isinstance(plan, dict) or plan.get("id") != plan_id:
+        named = plan.get("id") if isinstance(plan, dict) else None
+        holds = f"plan {str(named)[:80]!r}" if named else "no plan id"
+        reason = (
+            f"plan file {plan_id} holds {holds}, not {plan_id}: it was edited or copied by hand, so it is neither "
+            "shown nor run. Build a new plan with librenms_plan"
+        )
+        return None, None, reason
+    return plan_id, plan, ""
 
 
 def _call_key(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Tuple[str, ...]:
@@ -269,14 +279,14 @@ def _call_key(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Tuple[str, .
     return (tool, *ids, hashlib.sha256(text.encode("ascii")).hexdigest()[:16])
 
 
-def _note_shown(tool: str, args: Any, hook_kwargs: Dict[str, Any], found: re.Match[str] | None) -> None:
-    """Keep for :func:`bind_approval` what the approval prompt of this *tool* call shows, from the rule key
-    :func:`pre_tool_call` returns (*found*), or that it shows none (None: approval off, a dry run, a block)."""
+def _note_shown(tool: str, args: Any, hook_kwargs: Dict[str, Any], shown: _Shown | None) -> None:
+    """Keep for :func:`bind_approval` what the approval prompt of this *tool* call shows (*shown*), or that it shows
+    none (None: approval off, a dry run, a block)."""
     key = _call_key(tool, args, hook_kwargs)
     with _pending_lock:
         _pending.pop(key, None)  # whatever an earlier call with the same ids left; a new one goes in last
-        if found is not None and found.group("digest"):
-            _pending[key] = _Shown(found.group("plan"), found.group("variant"), found.group("digest"))
+        if shown is not None:
+            _pending[key] = shown
         while len(_pending) > _PENDING_LIMIT:
             _pending.pop(next(iter(_pending)))
 
@@ -304,6 +314,30 @@ def _not_shown(action: str, shown: _Shown, plan_id: str, variant: str) -> str | 
         f"nothing was {'applied' if action == 'apply' else 'reverted'}. Call librenms_{action} again so the user "
         "is asked about what runs"
     )
+
+
+def _bound(
+    action: str, args: Dict[str, Any], kwargs: Dict[str, Any], settings: Settings, plan_id: str, variant: str
+) -> Tuple[str | None, str | None]:
+    """``(refusal, approved_digest)`` for a write call that is not a dry run. A call whose approval prompt showed
+    something (:func:`_shown_in`) runs only as that call, and the claim is handed the digest it showed. A model's call
+    whose :data:`APPROVAL_ARG` is there but names no prompt (null from :func:`bind_approval`, or anything else) is
+    refused while ``require_approval`` is on in ``full`` mode: no prompt showed what it would run, whatever made it so
+    (a ``dry_run`` another plugin's ``modify`` or tool middleware turned false after the prompt was skipped, arguments
+    changed between our two callbacks, a record lost). Without :data:`APPROVAL_ARG` (a Hermes without ``modify``) and
+    for an operator's command nothing is added."""
+    shown = _shown_in(args, kwargs)
+    if shown is not None:
+        refusal = _not_shown(action, shown, plan_id, variant)
+        return refusal, None if refusal else shown.digest
+    operator = isinstance(kwargs.get("_actor"), dict)
+    if APPROVAL_ARG not in args or operator or not settings.require_approval or settings.write_mode != "full":
+        return None, None
+    return (
+        f"{action} refused: no approval prompt showed this call, and require_approval is on; nothing was "
+        f"{'applied' if action == 'apply' else 'reverted'}. Call librenms_{action} again so the user is asked about "
+        "what runs"
+    ), None
 
 
 def _changed(exc: ExecutionRefused) -> Dict[str, Any]:
@@ -1044,10 +1078,8 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
 def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
-    shown = _shown_in(args, kwargs)
-    plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
+    plan_id, plan, reason = find_plan(store, args.get("plan_id"), exact=True)
     if plan_id is None or plan is None:
-        reason = _unknown(args.get("plan_id"), candidates)
         audit.emit("apply_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
         return _fail(reason)
     settings = get_settings()
@@ -1066,8 +1098,8 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
         return _fail(refusal, refused=True, write_mode=settings.write_mode)
     rollback = parse_bool(args.get("rollback_on_failure"), True)
     approved = None
-    if shown is not None and not dry_run:  # a dry run writes nothing, whatever the prompt showed
-        refusal = _not_shown("apply", shown, plan_id, "rb" if rollback else "norb")
+    if not dry_run:  # a dry run writes nothing, whatever the prompt showed
+        refusal, approved = _bound("apply", args, kwargs, settings, plan_id, "rb" if rollback else "norb")
         if refusal:
             audit.emit(
                 "apply_refused",
@@ -1078,7 +1110,6 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
                 dry_run=dry_run,
             )
             return _fail(refusal, refused=True)
-        approved = shown.digest
     client = make_client(settings)
     try:
         plan = apply_plan(
@@ -1136,10 +1167,8 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
 def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
-    shown = _shown_in(args, kwargs)
-    plan_id, plan, candidates = find_plan(store, args.get("plan_id"), exact=True)
+    plan_id, plan, reason = find_plan(store, args.get("plan_id"), exact=True)
     if plan_id is None or plan is None:
-        reason = _unknown(args.get("plan_id"), candidates)
         audit.emit("rollback_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
         return _fail(reason)
     settings = get_settings()
@@ -1156,7 +1185,7 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
             write_mode=settings.write_mode,
         )
         return _fail(refusal, refused=True, write_mode=settings.write_mode)
-    refusal = _not_shown("rollback", shown, plan_id, "force" if force else "safe") if shown is not None else None
+    refusal, approved = _bound("rollback", args, kwargs, settings, plan_id, "force" if force else "safe")
     if refusal:
         audit.emit(
             "rollback_refused",
@@ -1177,7 +1206,7 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
             force=force,
             reason="requested",
             actor=actor,
-            approved_digest=shown.digest if shown is not None else None,
+            approved_digest=approved,
         )
     except ExecutionRefused as exc:
         audit.emit(
@@ -1211,9 +1240,9 @@ def librenms_plans(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     budget = _budget(get_settings(), kwargs)
     if str(args.get("plan_id") or "").strip():
-        _plan_id, plan, candidates = find_plan(store, args.get("plan_id"))
+        _plan_id, plan, reason = find_plan(store, args.get("plan_id"))
         if plan is None:
-            return _fail(_unknown(args.get("plan_id"), candidates))
+            return _fail(reason)
         detail = parse_bool(args.get("detail"), False)
         total = len(plan["steps"])
         checks = plan.get("checks") or []
@@ -1281,16 +1310,19 @@ def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dic
         return None
     if tool_name not in WRITE_TOOLS:
         return _terminal_guard(tool_name, args, kwargs)
-    directive = _approval(tool_name, args)
-    approve = directive is not None and directive["action"] == "approve"
-    found = _RULE_KEY_RE.search(directive["rule_key"]) if approve else None
-    _note_shown(tool_name, args, kwargs, found)
+    directive, shown = _approval(tool_name, args)
+    _note_shown(tool_name, args, kwargs, shown)
     if directive is None:
         return None
-    if approve:
-        plan_id, digest = (found.group("plan"), found.group("digest")) if found is not None else (None, None)
+    if shown is not None:
         _audit_hook(
-            "approval_requested", kwargs, plan_id, None, tool=tool_name, rule_key=directive["rule_key"], digest=digest
+            "approval_requested",
+            kwargs,
+            shown.plan_id,
+            None,
+            tool=tool_name,
+            rule_key=directive["rule_key"],
+            digest=shown.digest,
         )
     else:
         event = "apply_refused" if tool_name == "librenms_apply" else "rollback_refused"
@@ -1324,25 +1356,27 @@ def _audit_hook(
         logger.warning("librenms hook audit failed: %s", type(exc).__name__)
 
 
-def _approval(tool: str, args: Any) -> Dict[str, Any] | None:
-    """``approve`` with a summary of the plan (apply) or of what its rollback reverts, when ``require_approval`` is
-    on in ``full`` mode; in the other modes the handler refuses the model and audits it. The rule_key names the plan,
-    the flag that changes what runs and the content digest of the plan as loaded for the message
-    (:func:`store.content_digest`), so a "session" or "always" answer never carries over to another plan, variant
-    or content: a plan edited after the answer is asked about again. A ``plan_id`` that is not a saved plan's exact
-    id is blocked with the handler's own refusal, and so is any failure to load the plan: asking about a plan nobody
-    can be shown would let one that comes to match while the prompt is open run unseen."""
+def _approval(tool: str, args: Any) -> Tuple[Dict[str, Any] | None, _Shown | None]:
+    """The directive for this call and what its prompt shows. ``approve`` with a summary of the plan (apply) or of
+    what its rollback reverts, when ``require_approval`` is on in ``full`` mode; in the other modes the handler
+    refuses the model and audits it. The rule_key names the plan, the flag that changes what runs and the content
+    digest of the plan as loaded for the message (:func:`store.content_digest`), so a "session" or "always" answer
+    never carries over to another plan, variant or content: a plan edited after the answer is asked about again. The
+    :class:`_Shown` is made from the same three values, not read back from the key; a key that would not read back
+    as them is blocked, since ``approval_decided`` reads it. A ``plan_id`` that is not a saved plan's exact id is
+    blocked with the handler's own refusal, and so is any failure to load the plan: asking about a plan nobody can
+    be shown would let one that comes to match while the prompt is open run unseen."""
     action = "apply" if tool == "librenms_apply" else "rollback"
     try:
         settings = get_settings()
         if not settings.require_approval or settings.write_mode != "full":
-            return None
+            return None, None
         args = args if isinstance(args, dict) else {}
         if tool == "librenms_apply" and parse_bool(args.get("dry_run"), False):
-            return None
-        plan_id, plan, candidates = find_plan(get_store(), args.get("plan_id"), exact=True)
+            return None, None
+        plan_id, plan, reason = find_plan(get_store(), args.get("plan_id"), exact=True)
         if plan_id is None or plan is None:
-            return {"action": "block", "message": _unknown(args.get("plan_id"), candidates)}
+            return {"action": "block", "message": reason}, None
         digest = content_digest(plan)  # of the one load the message is made from
         if tool == "librenms_apply":
             rollback = parse_bool(args.get("rollback_on_failure"), True)
@@ -1350,7 +1384,15 @@ def _approval(tool: str, args: Any) -> Dict[str, Any] | None:
         else:
             force = parse_bool(args.get("force"), False)
             message, variant = _rollback_approval(plan, plan_id, force), "force" if force else "safe"
-        return {"action": "approve", "message": message, "rule_key": f"librenms:{tool}:{plan_id}:{variant}:{digest}"}
+        shown, rule_key = _Shown(plan_id, variant, digest), f"librenms:{tool}:{plan_id}:{variant}:{digest}"
+        found = _RULE_KEY_RE.search(rule_key)
+        if found is None or _Shown(found.group("plan"), found.group("variant"), found.group("digest")) != shown:
+            return {
+                "action": "block",
+                "message": f"{action} refused: plan id {one_line(plan_id)} cannot be named in an approval key; "
+                "build a new plan with librenms_plan",
+            }, None
+        return {"action": "approve", "message": message, "rule_key": rule_key}, shown
     except Exception as exc:
         error_id = new_error_id()
         logger.warning("librenms approval hook: plan not loaded (%s)", error_id, exc_info=exc)
@@ -1358,7 +1400,7 @@ def _approval(tool: str, args: Any) -> Dict[str, Any] | None:
             "action": "block",
             "message": f"{action} refused: the plan could not be loaded for the approval prompt ({error_id}); see "
             "the Hermes log",
-        }
+        }, None
 
 
 def _apply_approval(plan: Dict[str, Any], plan_id: str, rollback: bool) -> str:
@@ -1526,7 +1568,7 @@ def _terminal_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[s
         action, ref = found.group("action").lower(), found.group("plan")
         plan_id, plan = None, None
         with contextlib.suppress(Exception):  # the block and its audit never depend on the plan store
-            plan_id, plan, _candidates = find_plan(get_store(), ref) if ref else (None, None, [])
+            plan_id, plan, _reason = find_plan(get_store(), ref) if ref else (None, None, "")
         named = plan_id or ref
         message = write_gate({"kind": "model"}, action, named or "<plan_id>", settings=settings)
         message = message or TERMINAL_BLOCK_FULL.format(action=action)

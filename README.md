@@ -573,10 +573,12 @@ error; anything but 0 is printed on stderr. So `hermes librenms check 7dde && he
   one plan runs at a time (a failed apply until its automatic rollback ends), so the gateway and the
   CLI cannot interleave writes.
 - **Approvals are bound to what was shown.** The approval prompt's key carries a digest of the plan's
-  content, so a remembered "session" or "always" answer does not cover the plan once its file
-  changes, and the handler of the approved call refuses, under the claim, a plan whose content is
-  not what the prompt showed (an edit made while the prompt was open, another plan saved under the
-  same id). See [Write modes](#write-modes).
+  content (what runs and what the prompt shows, a rollback's run records included), so a remembered
+  "session" or "always" answer does not cover the plan once its file changes, and the handler of the
+  approved call refuses, under the claim, a plan whose content is not what the prompt showed (an edit
+  made while the prompt was open, another plan saved under the same id), then runs exactly the plan
+  it checked. A model's call that no prompt showed while one was due is refused, and so is a plan
+  file whose `id` is not its name. See [Write modes](#write-modes).
 - **No secrets in plans.** The token appears only in the request header. SNMP credentials are
   environment references in the plan and are resolved only while the step runs. Credential fields
   (communities, SNMP passwords, service parameters) are masked in every tool result and audit event;
@@ -601,7 +603,9 @@ the same plan once its file has changed: Hermes asks again. The model's `librenm
 `librenms_rollback` take only the full plan id, and one that names no saved plan is refused without
 asking; the call then runs only the plan the prompt showed, since a plan whose file changed while
 the prompt was open is refused under the claim (`plan … changed after the approval prompt showed
-it`), so the plan a person approved is the plan that runs. Unattended runs follow your Hermes
+it`), so the plan a person approved is the plan that runs. A call that reaches the tool with no
+prompt bound to it (another plugin or middleware turned a dry run into an apply after the prompt was
+skipped) is refused too (`apply refused: no approval prompt showed this call`). Unattended runs follow your Hermes
 approval policy: `approvals.cron_mode` for cron jobs, `approvals.unattended_mode` for webhook and
 API-server sessions, and `approvals.single_query_mode` for `hermes -q`, each `deny` unless you set
 it to `approve`, which lets an apply through without asking, as YOLO mode and `approvals.mode: off`

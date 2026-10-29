@@ -831,6 +831,75 @@ class Approved(ExecutorCase):
         self.assertEqual(self.rollback(plan["id"], approved_digest=shown)["status"], "rolled_back")
         self.assertEqual((self.backend.rows[1]["color"], self.backend.rows[2]["size"]), ("red", 2))
 
+    def test_what_runs_is_the_plan_the_claim_digested_whole(self):
+        # the handler's own load (here with steps, or a journal) never fills in a key the file under the claim lacks:
+        # the prompt showed that file ("nothing to change", "0 pending entries"), so that is all that may run
+        plan = self.plan([update(1, size=4)])
+        loaded = self.store.load(plan["id"])
+        self.edit(plan["id"], lambda p: (p.pop("steps"), p.update(summary={})))
+        refused = self.refusal(self.apply, loaded, approved_digest=self.digest(plan["id"]))
+        self.assertEqual(refused, f"plan {plan['id']} has no list of steps; build a new plan with librenms_plan")
+        self.assertEqual((self.backend.writes(), self.events("apply_started")), ([], []))
+        self.assertTrue(self.store.run_lock_free(plan["id"]))
+        self.assertNotIn("steps", self.store.load(plan["id"]))  # and the refused claim saved nothing
+        applied = self.apply(self.plan([update(1, color="green"), update(2, size=9)]))
+        loaded = self.store.load(applied["id"])  # with the journal of the two writes
+        self.edit(applied["id"], lambda p: p.pop("journal"))
+        shown = self.digest(applied["id"])
+        done = self.executor.rollback_plan(self.client, loaded, self.store, self.settings, approved_digest=shown)
+        self.assertEqual((done["rollback"]["entries"], "journal" in done), (0, False))
+        self.assertEqual(self.backend.writes(), ["PATCH widgets/1", "PATCH widgets/2"])  # the apply's own
+        self.assertEqual((self.backend.rows[1]["color"], self.backend.rows[2]["size"]), ("green", 9))
+
+    def test_a_file_that_holds_another_id_by_the_claim_is_refused(self):
+        # every save of the run would go to the file that id names: an apply, a rollback and a dry run alike
+        plan = self.plan([update(1, size=4)])
+        other = self.plan([update(2, size=8)])
+        loaded = self.store.load(plan["id"])
+        path = self.store.directory / f"{plan['id']}.json"
+        path.write_text(json.dumps({**loaded, "id": other["id"]}), encoding="utf-8")
+        for dry_run, done in ((False, "applied"), (True, "checked")):
+            self.assertEqual(
+                self.refusal(self.apply, copy.deepcopy(loaded), dry_run=dry_run),
+                f"plan file {plan['id']} no longer holds plan {plan['id']} (it was edited by hand); nothing was {done}",
+            )
+        self.assertTrue(self.store.run_lock_free(plan["id"]))
+        applied = self.apply(self.store.load(other["id"]))
+        loaded = self.store.load(other["id"])
+        path = self.store.directory / f"{other['id']}.json"
+        path.write_text(json.dumps({**loaded, "id": plan["id"]}), encoding="utf-8")
+        self.assertIn(
+            "nothing was reverted", self.refusal(self.executor.rollback_plan, self.client, loaded, self.store)
+        )
+        self.assertEqual(self.backend.writes(), ["PATCH widgets/2"])  # the apply's own
+        self.assertEqual((self.store.load(other["id"])["status"], applied["status"]), ("applied", "applied"))
+        self.assertEqual(self.store.load(plan["id"])["status"], "planned")
+
+    def test_the_preflight_is_checked_again_on_what_the_claim_read(self):
+        # a step added to the file after the handler's load is gated like the others, whatever the approval
+        self.settings.allow_delete = True
+        steps = self.build([update(1, size=4), {"op": "delete", "resource": "widget", "id": 2}])["steps"]
+        self.settings.allow_delete = False
+        plan = self.plan([update(1, size=4)])
+        loaded = self.store.load(plan["id"])
+        self.edit(plan["id"], lambda p: p.update(steps=steps))
+        refused = self.refusal(self.apply, loaded, approved_digest=self.digest(plan["id"]))
+        self.assertTrue(refused.startswith("plan step [1] is not allowed: delete operations are disabled"), refused)
+        self.edit(plan["id"], lambda p: p.update(librenms_url="https://other.test", steps=loaded["steps"]))
+        self.assertEqual(
+            self.refusal(self.apply, loaded),
+            "plan was built against https://other.test but LIBRENMS_URL is now https://librenms.test",
+        )
+        self.assertEqual((self.backend.writes(), self.store.load(plan["id"])["status"]), ([], "planned"))
+        applied = self.apply(self.plan([update(1, size=4)]))
+        loaded = self.store.load(applied["id"])
+        self.edit(applied["id"], lambda p: p.update(librenms_url="https://other.test"))
+        self.assertEqual(
+            self.refusal(self.executor.rollback_plan, self.client, loaded, self.store),
+            "plan was applied against https://other.test but LIBRENMS_URL is now https://librenms.test",
+        )
+        self.assertEqual(self.backend.writes(), ["PATCH widgets/1"])  # the apply's own
+
     def test_a_rollback_asked_about_while_the_apply_ran_is_refused_once_it_wrote_more(self):
         plan = self.apply(self.plan([update(1, color="green"), update(2, size=9)]))
         self.edit(plan["id"], lambda p: p.update(status="applying", journal=p["journal"][:1]))
