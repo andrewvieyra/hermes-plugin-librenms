@@ -1,0 +1,262 @@
+# Audit trail
+
+Every plan, apply and rollback is recorded twice: inside the plan file, and as a stream of events in
+`audit.jsonl`. The plan file is state that changes as the plan progresses. The stream is append-only
+and is what a SIEM or log shipper should read. Refusals are recorded too: a plan that failed
+validation, an apply or rollback that was refused (also when the agent's terminal tried to run the
+CLI), a query the route allow-list refused, and every approval the plugin asked Hermes for.
+
+All timestamps are UTC in ISO 8601 with a `Z` suffix. Neither output contains the LibreNMS token
+or an SNMP credential: credentials reach LibreNMS from the environment at apply time and are
+never written down, and every audit record passes through the same key-based masking as tool
+results before it is written or forwarded.
+
+## Where
+
+| Output | Location | Setting |
+|---|---|---|
+| Plan files | `<HERMES_HOME>/plugin-data/librenms/plans/<plan_id>.json` | `plan_retention_days` (default 90; `0` keeps them forever) |
+| Event stream | `<HERMES_HOME>/plugin-data/librenms/audit.jsonl` | `audit_log` (on/off), `audit_log_path` (absolute path override), `audit_include_request` |
+
+`<HERMES_HOME>` is the active Hermes profile's home, resolved for every event, so a gateway that
+serves several profiles writes each profile's events to its own file.
+
+Set `audit_log_path` to a location your collector already watches, for example
+`/var/log/hermes/librenms-audit.jsonl` (`~` is expanded). The writer opens the file with `O_APPEND`
+for every event and writes each line with a single `write`, so `logrotate` with `copytruncate` is
+safe, and several Hermes processes (the gateway and `hermes librenms`) can append to the same file
+without coordination. A file the plugin creates is `0600`, and directories it creates are `0700`;
+an existing directory keeps its mode. Lines are UTF-8 JSON; a lone surrogate (which UTF-8 cannot
+encode) is replaced with U+FFFD rather than losing the event. A failed write is logged to Hermes'
+log and never fails the operation it describes.
+
+`audit_log: false` stops the file and the [sinks](sinks.md) alike: events are forwarded from the
+same call that writes them. Plan files are always written; they are how apply and rollback work.
+
+## The actor record
+
+Attached to every event and stored in the plan under `requested_by`, `apply.actor`,
+`rollback.actor` and each dry run's `checks[].actor`. Keys are always present, in this order;
+unknown values are `null`, so field mappings stay stable.
+
+| Field | Meaning |
+|---|---|
+| `kind` | `model` when the model called a tool, `operator` when a human used `/librenms` or `hermes librenms` |
+| `via` | `tool`, `slash` or `cli` |
+| `surface` | Where the session runs, as Hermes' plugin context reports it (`ctx.session_surface()`): `cli`, `tui`, `desktop` or `acp` locally, the platform name in a chat |
+| `platform` | Gateway platform: `signal`, `telegram`, `discord`, `slack`, `cli`, … |
+| `source` | Hermes session source (`gateway`, `cli`, `tui`, `desktop`, `api_server`, …) |
+| `profile` | Hermes profile, when multiplexing (`ctx.profile_name`, else the session's) |
+| `chat_id`, `chat_name`, `chat_type`, `parent_chat_id`, `thread_id`, `scope_id` | Where the conversation happened; `chat_type` is `dm`, `group`, `channel` or `thread` |
+| `user_id`, `user_id_alt`, `user_name` | The platform user who sent the message (`user_id_alt` is the platform's stable alternate id, such as a Signal UUID) |
+| `message_id` | The triggering message, where the platform exposes one |
+| `session_key`, `session_id`, `ui_session_id`, `task_id` | Hermes session identifiers, for joining with Hermes' own logs; `task_id` is set for tool calls |
+| `cron` | `true` when the turn ran inside a Hermes cron job |
+| `cron_job_id`, `cron_execution_id` | The cron job and run, when `cron` is true and Hermes reports them |
+| `os_user` | The OS account the Hermes gateway or CLI runs as. Not the person who asked |
+| `sender_id` | The gateway's id for the sender of the turn, remembered with the request (below) |
+| `request` | The user's message that led to the call, masked and truncated to 500 characters; `null` when `audit_include_request` is off, for operators, and when no message was remembered |
+
+Identity comes from Hermes' per-session context, which the gateway binds for every turn, and from
+the plugin context (`surface`, `profile`, the cron run), which also works when plugins run in a
+separate host process. For `/librenms` the gateway's record of who sent the command wins over the
+session variables. In a plain CLI session most platform fields are `null` and `os_user` is the
+meaningful identity.
+
+### The request text
+
+Hermes does not pass the user's message to a tool. The plugin's `pre_llm_call` hook remembers it
+for each session and task, and a tool call of that session looks it up (a delegated task, which has
+its own task id, gets the latest message of its session). The cache holds the last 256 turns of
+the process. What it keeps:
+
+- the text only: a multimodal message's text parts are joined, images are skipped;
+- with credential shapes masked as `<redacted>`: private key blocks, `Authorization:` values,
+  values after `token`, `password`, `passwd`, `secret`, `community`, `authpass`, `cryptopass` or
+  `psk` and `:` or `=`, a URL's user and password, LibreNMS API tokens (`<id>|<secret>` and the
+  older 32-hex-digit form, so an MD5 sum in the message is masked too), and the configured token;
+- at most 500 characters;
+- nothing at all while `audit_include_request` is off.
+
+Masking is pattern-based: a password typed as plain prose ("the community is hunter2") is not
+recognised. Turn `audit_include_request` off where users paste credentials into chat.
+
+## The config digest
+
+Every event carries `config_digest`: the first 12 hex digits of the SHA-256 of the settings in
+force, as canonical JSON, with `audit_sinks` reduced to their count and types (a sink's URL and
+headers can hold a credential). The same settings give the same digest in every process, so a
+collector can alert on any digest you have not approved, and two events with different digests ran
+under different configurations. `/librenms status` shows the settings behind the digest.
+
+## The plan file
+
+Besides the actor records, each plan carries an `audit` block written at planning time:
+
+```json
+"audit": {
+  "host": "hermes-01",
+  "os_user": "hermes",
+  "pid": 41233,
+  "python": "3.12.7",
+  "plugin_version": "0.1.0",
+  "hermes_version": "0.22.3",
+  "hermes_home": "/home/hermes/.hermes",
+  "librenms_version": "26.10.0",
+  "librenms_sha": "91b9a40b4cc42b27a06f3289a38b053ca6320218",
+  "db_schema": "2026_03_25_120000_add_ssl_certificate_permissions (412)"
+}
+```
+
+and every journal entry records the calls it made, method, path, status and duration, never a
+body or a query string:
+
+```json
+"requests": [
+  {"method": "GET", "path": "/api/v0/devices/12", "status": 200, "duration_ms": 41},
+  {"method": "PATCH", "path": "/api/v0/devices/12", "status": 200, "duration_ms": 77},
+  {"method": "GET", "path": "/api/v0/devices/12", "status": 200, "duration_ms": 38}
+],
+"request": {"method": "PATCH", "path": "/api/v0/devices/12", "status": 200, "duration_ms": 77}
+```
+
+`request` is the step's last write (else its last read). A reverted entry adds `revert_requests`
+and `revert_request` for the inverse. A failed entry carries `error` and, when LibreNMS answered,
+`librenms`: the message, HTTP status, error kind, method, path and the response body with the token
+scrubbed and 5xx debug details (exception, file, line, trace) removed. See
+[architecture.md](architecture.md) for the rest of the plan and journal.
+
+Plan files hold object data as LibreNMS returned it, with SNMP credentials masked. A service's
+check parameters (`param`) are kept, because rollback must be able to restore them; they can hold a
+password. Treat the `plugin-data` directory with the same care as the token.
+
+## LibreNMS's eventlog
+
+After every apply and rollback the plugin reads LibreNMS's eventlog for each device the run wrote
+to, from the newest event id it saw before the run, and attaches the new rows:
+
+```json
+"eventlog_ids": [8123, 8124]
+```
+
+on each journal entry about that device (`revert_eventlog_ids` for a rollback), and under
+`apply.eventlog` / `rollback.eventlog`:
+
+```json
+{"linked": true, "devices": {"12": [{"event_id": 8123, "datetime": "2026-10-28 12:00:08", "type": "system",
+                                      "message": "Location: SFO-1 -> NYC-2"}]}}
+```
+
+or `{"linked": false, "error": …, "status": 403}` when the token cannot read the log. `datetime` is
+LibreNMS's own, in the LibreNMS server's time zone. The lookup costs two reads per device per
+phase, never fails the operation, and can be turned off with `link_eventlog: false`. How rows are
+matched, and why a row can belong to someone else's change in the same minutes, is in
+[architecture.md](architecture.md#librenms-eventlog-linking).
+
+Other places the plugin's writes can be found from LibreNMS's side:
+
+- a maintenance schedule's title starts with `[hermes:<plan id>]` (Alerts → Scheduled Maintenance);
+- an acknowledgement note starts with `[hermes:<plan id>]`, and the unmute a rollback sends says
+  `[hermes:<plan id>] rollback`;
+- every request carries `User-Agent: hermes-plugin-librenms/<version>`, so the web server's access
+  log attributes the traffic; the journal's `request.path` and time locate each call there;
+- LibreNMS attributes eventlog rows and acknowledgements to the user that owns the token, which is
+  why a dedicated user is recommended ([SECURITY.md](../SECURITY.md)).
+
+## Events
+
+One JSON object per line. Common fields on every event:
+
+| Field | Meaning |
+|---|---|
+| `ts` | UTC timestamp |
+| `schema` | Event schema version, currently `1` |
+| `plugin` | `librenms` |
+| `event` | Event name, below |
+| `plan_id` | The plan, or `null` for a rejected plan, a query, pruning, or an unknown id |
+| `librenms_url` | The LibreNMS instance, or `null` when not known |
+| `config_digest` | The settings in force (above) |
+| `actor` | The actor record |
+| `host`, `pid` | Where the event was produced |
+
+Step and revert events identify their object with `index`, `action`, `resource`, `object_id` and
+`label` (the "object fields" below); a create learns its `object_id` when it runs.
+
+| Event | When | Extra fields |
+|---|---|---|
+| `plan_created` | A plan was built and saved | `description`, `summary`, `steps` and `warnings` (counts), `irreversible` (step indexes) |
+| `plan_rejected` | Operations failed validation, a gate or resolution; nothing saved | `description`, `operations`, `errors`, `first_error` |
+| `plan_checked` | A dry run re-verified the preconditions | `conflicts` (count), `applicable` |
+| `query_refused` | `librenms_query` refused a path or its parameters before sending anything | `path`, `reason` |
+| `apply_refused` | Apply was refused: unknown id, wrong status, stale plan, another LibreNMS, a gate, a second apply, a run in progress, the lock held, `write_mode`, the CLI started from an agent session, or `hermes librenms apply` blocked in the agent's `terminal` or `execute_code` | `reason`, `dry_run`, `write_mode` when that was the cause. The terminal block: `reason` `blocked in the agent's terminal/execute_code`, `tool` (`terminal` or `execute_code`), `write_mode`; `plan_id` is the plan the command named (the canonical id when it resolves, else the id as written, or `null`), never the command text |
+| `approval_requested` | The plugin asked Hermes' approval prompt about `librenms_apply` or `librenms_rollback` (`require_approval` in `full` mode). Hermes may pass or block it by policy (YOLO, `approvals.mode: off`, an earlier "always", `approvals.cron_mode`, `approvals.unattended_mode`, `approvals.single_query_mode`) without asking anyone, and then no `approval_decided` follows | `tool`, `plan_id` (`null` when the id did not resolve), `rule_key` |
+| `approval_decided` | Hermes' approval prompt for `librenms_apply` or `librenms_rollback` was answered | `choice` (`once`, `session`, `always`, `deny`, `timeout`, `cancelled`), `tool`, `plan_id` when it could be read, `rule_key` (or Hermes' `pattern_key` for a command that mentions librenms), `decided_by` and `surface` as Hermes reports them. Never the command text |
+| `apply_started` | Plan claimed and execution begins | `steps`, `summary`, `rollback_on_failure` |
+| `step_done` | One step's write succeeded and was verified | object fields, `status`, `http_status`, `request` |
+| `step_skipped` | A `noop` step | object fields, `status` |
+| `step_conflict` | The object changed since planning; the run stops | object fields, `status`, `error` |
+| `step_failed` | LibreNMS rejected the write, verification failed, or the request failed; the run stops | object fields, `status`, `error`, `http_status`, `request`, and `wrote: true` when LibreNMS may have applied part of the step |
+| `eventlog_linked` | LibreNMS eventlog lookup after an apply or rollback | `phase`, `linked`, `devices`, `events` (counts); or `linked: false`, `error`, `http_status` |
+| `apply_finished` | Outcome of the run | `outcome` (`applied` or `failed`), `status`, `done`, and on failure `failed_step`, `failure_kind` (`conflict` or `error`), `error` |
+| `rollback_refused` | Rollback was refused: unknown id, wrong status, another LibreNMS, nothing left to roll back, a run in progress, the lock held, `write_mode`, the CLI started from an agent session, or `hermes librenms rollback` blocked in the agent's `terminal` or `execute_code` | `reason`, `force`, `write_mode` when that was the cause; `automatic: true` and `pending` when the automatic rollback after a failed apply was the one refused; the terminal block as for `apply_refused` |
+| `run_recovered` | A rollback found the plan left `applying` or `rolling_back` by a process that died | `previous_status`, `dangling_indexes` (entries that were in flight) |
+| `rollback_started` | Reverting begins, newest entry first | `entries`, `force`, `reason` (`requested`, or `automatic after failure at step N`) |
+| `revert_reverted`, `revert_conflict`, `revert_failed`, `revert_irreversible`, `revert_skipped` | Outcome of one inverse. A write whose answer was lost and that LibreNMS shows no trace of yet is `revert_failed` until ten minutes have passed (it may still land), with an `error` that says when to roll back again | object fields, `status`, `error`, `new_object_id` (a re-created object), `http_status`, `request` |
+| `rollback_finished` | Outcome of the rollback | `status` (`rolled_back` or `partially_rolled_back`), `reverted`, `conflict`, `failed`, `irreversible`, `skipped`, `force`, `reason` |
+| `plans_pruned` | Retention removed plan files (`plan_id` is null) | `max_age_days`, `count`, `plan_ids` |
+
+`summary` counts `create`, `update`, `delete`, `action` (maintenance, discover, ack, unmute) and
+`noop`. `request` is `{"method", "path", "status", "duration_ms"}`.
+
+A complete successful lifecycle emits `plan_created`, (`approval_requested`, `approval_decided`,)
+`apply_started`, one `step_*` per step, `eventlog_linked`, `apply_finished`. A failure adds `step_failed` or
+`step_conflict` and an `apply_finished` with `outcome: failed`, then, when automatic rollback is on
+and something was written, `rollback_started`, one `revert_*` per entry that wrote,
+`eventlog_linked` and `rollback_finished`. A step with no inverse (maintenance, a device delete)
+reverts as `revert_irreversible`, which leaves the plan `partially_rolled_back`.
+
+## Examples
+
+A step, from a model in a Signal DM:
+
+```json
+{"ts":"2026-10-28T19:01:02Z","schema":1,"plugin":"librenms","event":"step_done","plan_id":"lnp-20261028T190000Z-ab12","librenms_url":"https://nms.example.com","config_digest":"4f590a27174c","actor":{"kind":"model","via":"tool","surface":"signal","platform":"signal","source":"gateway","profile":null,"chat_id":"+15550001111","chat_name":"Andrew","chat_type":"dm","parent_chat_id":null,"thread_id":null,"scope_id":null,"user_id":"+15550001111","user_id_alt":"9b1c…","user_name":"Andrew","message_id":"1793214062","session_key":"signal:dm:+15550001111","session_id":"7c0e…","ui_session_id":null,"task_id":"7c0e…","cron":false,"cron_job_id":null,"cron_execution_id":null,"os_user":"hermes","sender_id":"+15550001111","request":"Move core-sw1 to NYC-2 and put it in maintenance for two hours"},"host":"hermes-01","pid":41233,"index":0,"action":"update","resource":"device","object_id":1,"label":"core-sw1.example.net","status":"done","http_status":200,"request":{"method":"PATCH","path":"/api/v0/devices/1","status":200,"duration_ms":77}}
+```
+
+A refusal in `operator_only` mode (actor shortened):
+
+```json
+{"ts":"2026-10-28T19:00:40Z","schema":1,"plugin":"librenms","event":"apply_refused","plan_id":"lnp-20261028T190000Z-ab12","librenms_url":"https://nms.example.com","config_digest":"0d9e2c61a7b3","actor":{"kind":"model","via":"tool","…":"…"},"host":"hermes-01","pid":41233,"reason":"write_mode is operator_only: …","dry_run":false,"write_mode":"operator_only"}
+```
+
+A revert that could not be undone:
+
+```json
+{"ts":"2026-10-28T19:05:41Z","schema":1,"plugin":"librenms","event":"revert_irreversible","plan_id":"lnp-20261028T190000Z-ab12","librenms_url":"https://nms.example.com","config_digest":"4f590a27174c","actor":{"kind":"operator","via":"cli","…":"…"},"host":"hermes-01","pid":51877,"index":1,"action":"maintenance","resource":"device","object_id":1,"label":"core-sw1.example.net","status":"irreversible","error":null,"new_object_id":null,"http_status":null,"request":null}
+```
+
+## Ingestion notes
+
+- To push events instead of tailing the file, configure `audit_sinks` (syslog or HTTP). See
+  [sinks.md](sinks.md).
+- The stream is newline-delimited JSON. Point Filebeat, Fluent Bit, Vector or the Splunk forwarder
+  at the file with a JSON codec; every line is a self-contained record.
+- Map `ts` to your timestamp field (`@timestamp` in Elastic).
+- Useful searches:
+  - `event:apply_started AND actor.kind:model AND actor.chat_type:group`: a model wrote to
+    LibreNMS from a group chat;
+  - `event:apply_refused OR event:rollback_refused OR event:query_refused`: attempts that were
+    stopped;
+  - `event:step_failed OR event:revert_failed OR event:revert_conflict OR event:run_recovered`:
+    needs a human;
+  - `event:revert_irreversible`: something stayed in LibreNMS after a rollback (a maintenance
+    window, a deleted device);
+  - `actor.cron:true AND event:apply_*`: unattended writes;
+  - `event:approval_requested` with no `approval_decided` for the same `rule_key` after it: an
+    apply or rollback Hermes passed or blocked without asking anyone (cron, a webhook or the API
+    server, `hermes -q`, YOLO or approvals off);
+  - `event:approval_decided AND (choice:session OR choice:always)`: approvals that will not be
+    asked again for that plan;
+  - `config_digest` not in the set you approved: the configuration changed.
+- Join with LibreNMS's eventlog on `eventlog_ids`, and with its web server's access log on
+  `request.path`, the time and the plugin's User-Agent.

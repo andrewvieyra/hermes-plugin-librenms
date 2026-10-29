@@ -1,0 +1,9 @@
+{
+  "description": "Move access-sw2 to SFO-1 and hold its alerts during a two-hour IOS upgrade",
+  "operations": [
+    {"op": "update", "resource": "device", "match": {"hostname": "access-sw2.example.net"},
+     "data": {"location": "SFO-1", "override_sysLocation": true, "notes": "rack A2 after the move (NET-112)"}},
+    {"op": "maintenance", "resource": "device", "match": {"hostname": "access-sw2.example.net"},
+     "data": {"duration": "2:00", "title": "IOS upgrade NET-112", "behavior": "skip_alerts"}}
+  ]
+}

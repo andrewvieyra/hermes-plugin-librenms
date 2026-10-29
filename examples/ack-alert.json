@@ -1,0 +1,7 @@
+{
+  "description": "Acknowledge the high-CPU alert on core-sw1 while the line card is replaced",
+  "operations": [
+    {"op": "ack", "resource": "alert", "id": 4,
+     "data": {"note": "line card swap in progress, NET-118", "until_clear": false}}
+  ]
+}

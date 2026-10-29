@@ -1,0 +1,10 @@
+{
+  "description": "Ensure the LON-4 site and the access-switches group exist (idempotent)",
+  "operations": [
+    {"op": "create", "resource": "location", "match": {"location": "LON-4"},
+     "data": {"location": "LON-4", "lat": 51.5136, "lng": -0.089, "fixed_coordinates": true}},
+    {"op": "create", "resource": "device_group", "match": {"name": "access-switches"},
+     "data": {"name": "access-switches", "type": "static", "desc": "Access layer switches",
+              "devices": ["access-sw2.example.net"]}}
+  ]
+}

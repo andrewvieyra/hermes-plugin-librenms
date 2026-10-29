@@ -1,0 +1,273 @@
+# LibreNMS API v0 coverage
+
+How the plugin maps onto the LibreNMS API v0, route by route: all 145 registrations of
+`routes/api.php`, in the order LibreNMS registers them (the numbers below). Each route is one of:
+
+- **query**: readable through `librenms_query` with `path` relative to `/api/v0`. Device
+  references in the path (`{hostname}`) are resolved to the numeric id with `GET devices/{hostname}`
+  first, and so is `?hostname=` on the routes marked "(`?hostname=` resolved)", because those
+  filters silently return every device's rows for a name they do not know. A numeric id is checked
+  with the same `GET`, and `0` is refused, because several of them read an unknown id or `0` as no
+  filter at all. On every other route a `hostname` parameter (matched as PHP names it) is refused:
+  LibreNMS ignores it there and would return every device's rows. The refusal names the path that
+  filters by device where there is one (`logs/eventlog/<hostname>`, `services/<hostname>`). No path
+  segment may decode to a `/`, which LibreNMS would read as another route. Results are capped at
+  `max_query_results`, strings are clipped, and every credential-bearing key (SNMP communities and
+  v3 passwords, service check parameters, tokens, keys) is masked at any depth.
+- **plan**: written only through a reviewed plan (`librenms_plan`, then `librenms_apply`), as the
+  resource operation named. Every write path uses numeric ids, is verified by re-reading and has a
+  journaled inverse or an explicit inverse kind. Operations behind a gate say which.
+- **refused**: `librenms_query` refuses it, with the reason given; no setting enables it.
+- **not in 0.1.0**: the plugin never sends it, for the reason given.
+
+"Planning reads" marks a route the resources also read while planning, checking preconditions,
+verifying a write or rolling back. Unknown paths are refused before anything is sent:
+`librenms_query` matches a path against these routes in registration order, exactly as LibreNMS
+does, so a path that would reach a refused route by shadowing (a mistyped device sub-path, for
+example) is refused as that route.
+
+Logs routes (`logs/*`) are paged: `limit` (default 50, at most `max_query_results`), `start`,
+`sortorder` (`asc`/`desc`, sent as `ASC`/`DESC`; default `DESC`), `from`, `to`. A result is
+`truncated` while `total` exceeds `start` plus the rows returned. In every query,
+`params` values must be text, numbers, booleans or lists of them (joined with commas), and
+`api_token` and `_method` are refused in any case, and also spelled with `.`, a space or `[`,
+which PHP turns into `_`.
+
+## System
+
+| # | Route | Coverage |
+|---|---|---|
+| 1 | `GET ping` | query |
+| 2 | `GET system` | query; also `librenms_query {"action": "status"}`, and recorded in every plan's `audit` block |
+| 3 | `GET /api/v0` (index) | query (`path: ""`): the route names this LibreNMS has |
+| 145 | `ANY {path?}` (catch-all) | not a route: LibreNMS answers `This API route doesn't exist.` (also for a known path with the wrong method), which the client reports as error kind `route`. `librenms_query` refuses a path no read route matches before sending it |
+
+## Alert templates, pollers
+
+| # | Route | Coverage |
+|---|---|---|
+| 4 | `GET alert_templates/{id}` | query |
+| 5 | `GET alert_templates` | query |
+| 6 | `POST alert_templates` | not in 0.1.0: LibreNMS renders the template with Blade on the server before validating it, so a template is code that runs inside LibreNMS; and the API cannot delete one, so a create would have no inverse |
+| 7 | `PUT alert_templates` | not in 0.1.0: as #6; an edit also wipes and replaces the template's rule mappings |
+| 8 | `GET pollers` | query |
+| 9 | `GET pollers/log` | query |
+| 56 | `GET poller_group/{poller_group_id_or_name?}` | query; planning reads (a device's `poller_group` must exist) |
+
+## Routing
+
+| # | Route | Coverage |
+|---|---|---|
+| 10 | `GET bgp` | query (`?hostname=` resolved) |
+| 11 | `GET bgp/{id}` | query |
+| 12 | `POST bgp/{id}` (`edit_bgp_descr`) | not in 0.1.0: the API cannot clear a description (so setting one where there was none has no inverse), longer values are silently truncated, and LibreNMS defines no permission for it, so by default only an admin may |
+| 13 | `GET ospf` | query (`?hostname=` resolved) |
+| 14 | `GET ospf_ports` | query |
+| 15 | `GET ospfv3` | query (`?hostname=` resolved) |
+| 16 | `GET ospfv3_ports` | query (`?hostname=` resolved) |
+| 48 | `GET routing/vrf/{id}` | query |
+| 49 | `GET routing/ipsec/data/{hostname}` | query |
+| 117 | `GET routing/bgp/cbgp` | query (`?hostname=` resolved) |
+| 118 | `GET routing/vrf` | query (`?hostname=` resolved) |
+| 119 | `GET routing/mpls/services` | query (`?hostname=` resolved) |
+| 120 | `GET routing/mpls/saps` | query (`?hostname=` resolved) |
+
+## Oxidized
+
+| # | Route | Coverage |
+|---|---|---|
+| 17 | `GET oxidized/{hostname?}` | query: the device list Oxidized polls (hostname, os, ip, ports), not configurations. LibreNMS matches the hostname column exactly, so the value is sent as given. The answer is a bare JSON array |
+| 18 | `GET oxidized/config/search/{searchstring}` | refused: it searches every stored device configuration, which would confirm whether a guessed password or community is in use, and LibreNMS does not filter its answer by the token's device access |
+| 19 | `GET oxidized/config/{device_name}` | refused: it returns a device's full stored configuration, secrets included |
+
+## Device groups
+
+| # | Route | Coverage |
+|---|---|---|
+| 20 | `GET devicegroups/{name}` | query; planning reads (static membership) |
+| 21 | `GET devicegroups` | query; planning reads (lookup by name) |
+| 22 | `POST devicegroups` | plan: `device_group` `create` (static with `devices`, or dynamic with `rules`); also the rollback of a delete |
+| 23 | `PATCH devicegroups/{name}` | plan: `device_group` `update` (`name`, `desc`, `rules`, static membership as the full list, with `devices`, `devices_add` or `devices_remove`); also its rollback |
+| 24 | `DELETE devicegroups/{name}` | plan: `device_group` `delete` (`allow_delete`; rollback re-creates it with a new id, and alert rules, user permissions and maintenance linked to the old id are not restored) |
+| 25 | `POST devicegroups/{name}/devices` | not used: membership changes go through #23 with the full list, so one request, one verification and one inverse cover them |
+| 26 | `DELETE devicegroups/{name}/devices` | not used: without a `devices` key it removes every member; #23 is used instead |
+| 27 | `POST devicegroups/{name}/maintenance` | plan: `device_group` `maintenance` (irreversible: the API cannot end maintenance) |
+
+## Port groups
+
+| # | Route | Coverage |
+|---|---|---|
+| 28 | `GET port_groups` | query |
+| 29 | `GET port_groups/{name}` | query |
+| 30 | `GET portgroups/multiport/bits/{id}` | refused: graph image |
+| 31 | `GET portgroups/{group}` | refused: graph image |
+| 32 | `POST port_groups` | not in 0.1.0: the API cannot delete a port group, so a create would have no inverse |
+| 33 | `POST port_groups/{port_group_id}/assign` | not in 0.1.0: port groups are left to the web UI in this release |
+| 34 | `POST port_groups/{port_group_id}/remove` | not in 0.1.0: as #33 |
+
+## Alerts
+
+| # | Route | Coverage |
+|---|---|---|
+| 35 | `GET faults/{id}` | query; planning reads |
+| 36 | `GET faults` | query; planning reads (the other open faults of the same device and rule) |
+| 37 | `PUT faults/{id}` | plan: `alert` `ack` (note tagged `[hermes:<plan id>]`; rollback unmutes, lossy); also the rollback of an unmute |
+| 38 | `PUT faults/unmute/{id}` | plan: `alert` `unmute` (rollback acknowledges again, lossy); also the rollback of an ack |
+| 39 | `GET alerts/{id}` | query (legacy alias of #35) |
+| 40 | `GET alerts` | query (legacy alias of #36) |
+| 41 | `PUT alerts/{id}` | not used: the plugin sends #37 |
+| 42 | `PUT alerts/unmute/{id}` | not used: the plugin sends #38 |
+| 43 | `GET rules/{id}` | query; planning reads (the full rule, for an exact snapshot) |
+| 44 | `GET rules` | query; planning reads (lookup by name, and the id of a rule just created, which the create does not return) |
+| 45 | `POST rules` | plan: `alert_rule` `create` (`alert_operation_id` required, scoped to devices, groups or locations unless `global: true`); also the rollback of a delete |
+| 46 | `PUT rules` | plan: `alert_rule` `update`, always with the rule's full body, never a sparse one (omitted mappings would be cleared); rollback `PUT`s the snapshot body |
+| 47 | `DELETE rules/{id}` | plan: `alert_rule` `delete` (`allow_delete`; rollback re-creates it with a new id, without its alert history and template mappings) |
+
+## Services
+
+Every service operation needs `allow_services`: a service runs a Nagios plugin with its parameters
+on the poller.
+
+| # | Route | Coverage |
+|---|---|---|
+| 50 | `GET services` | query (check parameters masked); planning reads |
+| 51 | `GET services/{hostname}` | query; planning reads |
+| 52 | `POST services/{hostname}` | plan: `service` `create`; also the rollback of a delete |
+| 53 | `DELETE services/{id}` | plan: `service` `delete` (`allow_delete` too; rollback re-creates it with a new id, and its graph history stays with the old one) |
+| 54 | `PATCH services/{id}` | plan: `service` `update` (only the changed columns; LibreNMS answers 500 to an edit that changes nothing) |
+
+## Syslog
+
+| # | Route | Coverage |
+|---|---|---|
+| 55 | `POST syslogsink` | not in 0.1.0: it appends syslog lines that can raise alerts and cannot be removed, and would let the model forge the log it reads |
+
+## Devices
+
+| # | Route | Coverage |
+|---|---|---|
+| 57 | `GET devices/{hostname}` | query (SNMP credentials masked); planning reads |
+| 58 | `GET devices/{hostname}/discover` | refused in `librenms_query`: this GET schedules a rediscovery, a write. plan: `device` `discover` (rollback not needed) |
+| 59 | `GET devices/{hostname}/availability` | query |
+| 60 | `GET devices/{hostname}/outages` | query |
+| 61 | `GET devices/{hostname}/graphs/health/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/health` lists the graphs) |
+| 62 | `GET devices/{hostname}/graphs/wireless/{type}/{sensor_id?}` | refused: graph image (`devices/{hostname}/wireless` lists the graphs) |
+| 63 | `GET devices/{hostname}/vlans` | query |
+| 64 | `GET devices/{hostname}/links` | query |
+| 65 | `GET devices/{hostname}/graphs` | query (the list of graphs, not images) |
+| 66 | `GET devices/{hostname}/fdb` | query |
+| 67 | `GET devices/{hostname}/nac` | query |
+| 68 | `GET devices/{hostname}/health/{type?}/{sensor_id?}` | query |
+| 69 | `GET devices/{hostname}/wireless/{type?}/{sensor_id?}` | query |
+| 70 | `GET devices/{hostname}/wireless-sensors` | query |
+| 71 | `GET devices/{hostname}/ports` | query; planning reads (port lookup by `ifName` or `ifDescr`) |
+| 72 | `GET devices/{hostname}/ip` | query |
+| 73 | `GET devices/{hostname}/port_stack` | query |
+| 74 | `GET devices/{hostname}/transceivers` | query |
+| 75 | `GET devices/{hostname}/components` | query |
+| 76 | `GET devices/{hostname}/groups` | query |
+| 77 | `GET devices/{hostname}/maintenance` | query; read after a maintenance step to verify it |
+| 78 | `GET devices/{hostname}/ports/{ifname}` | refused: LibreNMS misreads interface names that contain `/`; find the `port_id` with #71 (`params: {"columns": "port_id,ifName"}`) and query `ports/{port_id}` |
+| 79 | `GET devices/{hostname}/ports/{ifname}/{type}` | refused: graph image |
+| 80 | `GET devices/{hostname}/services/{id}/graphs/{datasource}` | refused: graph image |
+| 81 | `POST devices/{hostname}/eventlog` | not in 0.1.0: it appends an eventlog row that cannot be removed (LibreNMS accepts it even from a global-read token), and the eventlog is the record plans are linked to |
+| 82 | `GET devices/{hostname}/{type}` | refused: LibreNMS serves every device sub-path it has no other route for as a graph image, so a mistyped sub-path lands here too |
+| 83 | `GET devices` | query (SNMP credentials masked); planning reads (`type=location_id`: the devices at a location) |
+| 84 | `POST devices` | plan: `device` `create` (`allow_device_add`; SNMP credentials only as `{"env": "LIBRENMS_SNMP_…"}` references, resolved at apply time; rollback deletes the device) |
+| 85 | `DELETE devices/{hostname}` | plan: `device` `delete` (`allow_delete`; irreversible: LibreNMS drops the device's RRD history, ports, alerts and group membership, and re-adding makes a new device) |
+| 86 | `PATCH devices/{hostname}` | plan: `device` `update` (`notes`, `purpose`, `location`, `poller_group`, `display_template`, the `disabled`/`ignore`/`disable_notify`/`ignore_status`/`override_sysLocation` flags, `type`, `icon`, and `overwrite_ip` with `allow_device_add`; never SNMP settings, which v0 cannot change); also its rollback |
+| 87 | `PATCH devices/{hostname}/rename/{new_hostname}` | plan: `device` `update` with `hostname` (`allow_device_add`, since it changes which host LibreNMS polls with the device's credentials); also its rollback |
+| 88 | `POST devices/{hostname}/maintenance` | plan: `device` `maintenance` (title tagged `[hermes:<plan id>]`; irreversible: the API cannot end maintenance) |
+| 89 | `POST devices/{id}/parents` | not in 0.1.0: it replaces the device's whole parent set |
+| 90 | `DELETE devices/{id}/parents` | not in 0.1.0: without `parent_ids` it removes every parent |
+| 91 | `PATCH devices/{hostname}/port/{portid}` | not in 0.1.0: port notes cannot be read back through the API, so the write could not be verified, and a body without `notes` erases the existing notes |
+| 92 | `POST devices/{hostname}/components/{type}` | not in 0.1.0: components are discovery data |
+| 93 | `PUT devices/{hostname}/components` | not in 0.1.0: it replaces each component's preferences whole, and a list body edits components by position |
+| 94 | `DELETE devices/{hostname}/components/{component}` | not in 0.1.0: as #92 |
+
+## Logs
+
+| # | Route | Coverage |
+|---|---|---|
+| 95 | `GET logs/eventlog/{hostname?}` | query (paged); read after every apply and rollback to link LibreNMS's eventlog rows to the journal |
+| 96 | `GET logs/syslog/{hostname?}` | query (paged). Any host that can send syslog to LibreNMS writes this text, unauthenticated: it is data, never instructions |
+| 97 | `GET logs/alertlog/{hostname?}` | query (paged) |
+| 98 | `GET logs/authlog` | query (paged): user names and source addresses of LibreNMS logins |
+
+## Ports
+
+| # | Route | Coverage |
+|---|---|---|
+| 99 | `GET ports/{portid}` | query; planning reads (identity, deleted flag) |
+| 100 | `GET ports/{portid}/fdb` | query |
+| 101 | `GET ports/{portid}/ip` | query |
+| 102 | `GET ports/{portid}/transceiver` | query |
+| 103 | `GET ports/search/{field}/{search?}` | query |
+| 104 | `GET ports/mac/{search}` | query |
+| 105 | `GET ports` | query |
+| 106 | `GET ports/{portid}/description` | query; planning reads |
+| 107 | `PATCH ports/{portid}/description` | plan: `port` `update` (`description`; `""` clears it and unpins it, so the poller sets it from the device again; the body always carries the key, since LibreNMS clears the description when the key is missing; rollback restores the text, lossy) |
+
+## Bills
+
+| # | Route | Coverage |
+|---|---|---|
+| 108 | `GET bills` | query |
+| 109 | `GET bills/{bill_id}` | query |
+| 110 | `GET bills/{bill_id}/graphs/{graph_type}` | refused: graph image |
+| 111 | `GET bills/{bill_id}/graphdata/{graph_type}` | query |
+| 112 | `GET bills/{bill_id}/history` | query |
+| 113 | `GET bills/{bill_id}/history/{bill_hist_id}/graphs/{graph_type}` | refused: graph image |
+| 114 | `GET bills/{bill_id}/history/{bill_hist_id}/graphdata/{graph_type}` | query |
+| 115 | `POST bills` | not in 0.1.0: billing is left to the web UI in this release; create and edit share the route, and an edit replaces the bill's port list |
+| 116 | `DELETE bills/{bill_id}` | not in 0.1.0: as #115 |
+
+## Resources
+
+| # | Route | Coverage |
+|---|---|---|
+| 121 | `GET resources/fdb` | query |
+| 122 | `GET resources/fdb/{mac}` | query |
+| 123 | `GET resources/fdb/{mac}/detail` | query |
+| 124 | `GET resources/ip/addresses/{address_family?}` | query |
+| 125 | `GET resources/ip/arp/{query}/{cidr?}` | query |
+| 126 | `GET resources/ip/networks/{address_family?}` | query |
+| 127 | `GET resources/ip/networks/{id}/ip` | query |
+| 128 | `GET resources/links` | query |
+| 129 | `GET resources/links/{id}` | query |
+| 130 | `GET resources/nac` | query |
+| 131 | `GET resources/nac/{mac}` | query |
+| 132 | `GET resources/sensors` | query. LibreNMS ignores every filter on this route and returns the whole table; the result is cut at the row limit. Prefer #68 and #70 for one device |
+| 133 | `GET resources/vlans` | query (`?hostname=` resolved) |
+| 134 | `GET resources/locations` | query; planning reads (lookup by name) |
+
+## Inventory, port security
+
+| # | Route | Coverage |
+|---|---|---|
+| 135 | `GET inventory/{hostname}` | query |
+| 136 | `GET inventory/{hostname}/all` | query |
+| 137 | `GET port_security/port/{portid}` | query |
+| 138 | `GET port_security/device/{hostname}` | query |
+| 139 | `GET port_security` | query |
+
+## Locations
+
+| # | Route | Coverage |
+|---|---|---|
+| 140 | `POST locations` | plan: `location` `create` (`lat` and `lng` required: LibreNMS cannot create a location without coordinates through the API); also the rollback of a delete |
+| 141 | `GET location/{location_id_or_name}` | query; planning reads |
+| 142 | `PATCH locations/{location_id_or_name}` | plan: `location` `update` (`location`, `lat`, `lng`); also its rollback |
+| 143 | `DELETE locations/{location}` | plan: `location` `delete` (`allow_delete`; rollback re-creates it with a new id and points its former devices at it again; alert-rule scoping and maintenance links to the old id are lost) |
+| 144 | `POST locations/{location}/maintenance` | plan: `location` `maintenance` (irreversible: the API cannot end maintenance) |
+
+## Totals
+
+| Coverage | Routes |
+|---|---|
+| query | 89 GET routes |
+| refused | 13 GET routes: 9 graph images (#30, #31, #61, #62, #79, #80, #82, #110, #113), Oxidized configuration and search (#18, #19), the rediscovery GET (#58, a plan operation instead) and the ifName route (#78) |
+| plan | 22 write routes and the rediscovery GET, across 7 resources |
+| not used (another route does the same) | 4 (#25, #26, #41, #42) |
+| not in 0.1.0 | 16 (#6, #7, #12, #32, #33, #34, #55, #81, #89, #90, #91, #92, #93, #94, #115, #116) |
+| catch-all | 1 (#145) |

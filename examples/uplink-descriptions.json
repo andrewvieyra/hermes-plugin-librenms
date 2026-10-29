@@ -1,0 +1,9 @@
+{
+  "description": "Label the transit uplinks on edge-rtr1 with their circuit ids",
+  "operations": [
+    {"op": "update", "resource": "port", "match": {"device": "edge-rtr1.example.net", "ifName": "Gi0/0/0"},
+     "data": {"description": "WAN: transit-a (circuit TA-55012)"}},
+    {"op": "update", "resource": "port", "match": {"device": "edge-rtr1.example.net", "ifName": "Gi0/0/1"},
+     "data": {"description": "WAN: transit-b (circuit TB-90817)"}}
+  ]
+}
