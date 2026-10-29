@@ -759,6 +759,18 @@ class ReportRoutes(_FakeCase):
         self.assertEqual(len(self.call("GET", "bills/transit")[1]["bills"]), 2)  # not a number: every bill
         self.assertEqual(len(self.call("GET", "bills/0")[1]["bills"]), 0)
         self.assertEqual(self.call("GET", "bills/1", {"ref": "TRANSIT-B"})[1]["bills"][0]["bill_id"], 2)
+        # the last period that ended: the history row's columns, its traffic and update time as the current names
+        body = self.call("GET", "bills", {"period": "previous"})[1]
+        self.assertEqual([(b["bill_hist_id"], b["bill_dateto"], b["bill_used"], b["percent"]) for b in body["bills"]],
+                         [(1, "2026-09-30 23:59:59", 1050000000, 105.0), (2, "2026-09-30 23:59:59", 455000000, 91.0)])  # fmt: skip
+        self.assertEqual((body["bills"][0]["total_data"], body["bills"][0]["bill_last_calc"]),
+                         (300000000000000, "2026-10-01 00:05:02"))  # fmt: skip
+        self.fake.seed("bills", {"bill_id": 3, "bill_name": "Backup", "bill_type": "quota", "bill_quota": 2000,
+                                 "total_data": 3000})  # fmt: skip
+        quota = self.call("GET", "bills/3")[1]["bills"][0]
+        self.assertEqual((quota["bill_allowed"], quota["allowed"], quota["used"], quota["percent"], quota["overuse"]),
+                         (2000, "2 kB", "3 kB", 150.0, "1 kB"))  # fmt: skip
+        self.assertEqual(self.call("GET", "bills/3", {"period": "previous"})[1]["bills"], [])  # no closed period
 
     def test_sensors_transceivers_and_components(self):
         body = self.call("GET", "resources/sensors", {"device_id": 3})[1]
@@ -781,6 +793,9 @@ class ReportRoutes(_FakeCase):
         self.assertEqual(([e["id"] for e in body["logs"]], body["total"]), ([2, 3, 1], 3))
         self.assertEqual(body["logs"][0]["details"]["contacts"]["noc@example.net"], "NOC")  # decoded
         self.assertEqual(self.call("GET", "alerts")[1]["alerts"][0]["id"], 4)  # the legacy alias
+        body = self.call("GET", "logs/authlog", {"sortorder": "DESC", "from": "2026-10-28 00:00:00"})[1]
+        self.assertEqual(([e["id"] for e in body["logs"]], body["total"]), ([4, 3, 2], 3))
+        self.assertEqual(list(body["logs"][0]), ["id", "datetime", "user", "address", "result"])  # no device's
 
 
 if __name__ == "__main__":

@@ -25,10 +25,10 @@ v0 route to what the plugin does with it.
 | `redact` | Credential masking by key, error-text scrubbing, clipping that counts escapes, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals, `visible()` and `for_model()` for what the model reads, the untrusted-data marker (`untrusted()`, `mark_untrusted()`) | none |
 | `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` or `start` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; `offset` sent as `start` on the logs routes, which refuse `where` and `sort`; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
 | `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused. Its natural order also orders reports | `redact` |
-| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings and of the port names a view names ports from, partial reasons), scope resolution with ambiguity, argument checks, the result envelope, and how LibreNMS decides a sensor's status and ties it to a port | `client`, `routes`, `listing`, `redact`, `settings` |
+| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings and of the port names a view names ports from, partial reasons; a log read over a window, newest first, a page at a time, up to a view's cap; LibreNMS's clock and its server-local times), scope resolution with ambiguity, argument checks, the result envelope, and how LibreNMS decides a sensor's status and ties it to a port | `client`, `routes`, `listing`, `redact`, `settings` |
 | `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
-| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; sensor units and readings per class, sizes in bytes; zone-safe times, and server-local times read in `librenms_timezone` | none |
-| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts`, `reports/health`, `reports/routing` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness; whether a device's figures are current) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context`, `redact` (`alert_entities`) |
+| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; sensor units and readings per class, sizes in bytes, bytes transferred; zone-safe times, server-local times read in `librenms_timezone`, and their order | none |
+| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts`, `reports/health`, `reports/routing`, `reports/events`, `reports/bills` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness; whether a device's figures are current) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context`, `redact` (`alert_entities`) |
 | `reports/help` | View `help`: what each view answers, its filters (with what they take, read from the view), sorts, row and summary keys and examples, answered without a LibreNMS call | `reports/context` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
@@ -86,10 +86,15 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   0 (unchanged since the SNMP agent started). Fault, alert-log, eventlog and syslog times are server-local
   `Y-m-d H:i:s`, and no API field names the server's zone (`system`'s `local_date` is the date of
   the LibreNMS commit), so `reports/units` reads them only in `librenms_timezone` and otherwise
-  gives them no age; `timezone` says which zone a report used. A window (`alert_history`) is
-  counted back from LibreNMS's clock and sent as server-local text: exact in `librenms_timezone`,
-  and without it from 12 hours earlier still, which holds the window whatever the server's zone
-  (UTC-12 to UTC+14) and may hold up to 26 hours more, as the result says (`exact: false`).
+  gives them no age; `timezone` says which zone a report used. A window (`alert_history`,
+  `events`) is counted back from LibreNMS's clock and sent as server-local text: exact in
+  `librenms_timezone`, and without it from 12 hours earlier still, which holds the window whatever
+  the server's zone (UTC-12 to UTC+14) and may hold up to 26 hours more, as the result says
+  (`exact: false`); `today` needs the zone. A view that places its window before any other read
+  (`events` of the authlog, which needs no device listing) first reads `ping`, LibreNMS's smallest
+  answer, for the clock.
+  The authlog's times and a bill's last calculation (`bill_last_calc`) are server-local too; a
+  billing period's dates are LibreNMS's calendar dates and need no zone.
 - **Views.** `find` ranks devices (names, attributes, management and interface addresses, ARP
   entries for a MAC), ports (an interface name, `ports/search`), locations, device groups and port
   groups, 10 an answer (`count` counts them all), `ambiguous` when the best two score within 10.
@@ -142,10 +147,25 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   `routing` reads `bgp`, `ospf` and `ospfv3` once each (by device id for one device, `remote_asn`
   for a remote AS) and keeps the scope's; `not_established` is LibreNMS's `BgpPeer::inAlarm` (admin
   `start`/`running` and not established) and an OSPF neighbour not `full`; a BGP session's up or
-  down time is its established timer at the last poll plus the time since. LibreNMS's `ospfv3`
+  down time is its established timer at the last poll plus the time since; an OSPF router id is
+  written dotted (LibreNMS stores an OSPFv3 neighbour's as its 32-bit number). LibreNMS's `ospfv3`
   route answers HTTP 500 `Error retrieving ospfv3_nbrs` for no neighbour, read as none (as is the
   404 of a LibreNMS without the route, with a note); any other failure of a protocol leaves it out,
-  partial, unless it is the one asked for.
+  partial, unless it is the one asked for. `events` reads the eventlog, the syslog or the authlog
+  through the same log reader as `alert_history` (`ReportContext.read_log`: from the window's
+  start, newest first, 250 entries a request, at most 2,000, per device for a scope of up to 10;
+  the authlog, LibreNMS's own logins, has no device path and takes no scope), and shows each
+  entry, or counts them per device or, from the eventlog's `interface` entries (`ifOperStatus: up
+  -> down`, the port as the reference), per port: status changes, times it went down, and flaps
+  (back up after going down within the window). Eventlog severities (LibreNMS's `Severity`) and
+  syslog ones (the name or number a collector wrote in `level` or `priority`) are read on one scale
+  for `min_severity`. A message, a program, a user name or an address is text from the devices,
+  from whoever can reach the syslog collector or from people, and is marked untrusted. `bills`
+  reads `bills` once (with `period=previous` for the last period that ended) and gives each bill
+  its 95th percentile against its commit (CDR) or its traffic against its quota, how full and how
+  far over, the period's dates (the current one from the bill's day as LibreNMS's
+  `Billing::getDates` counts it on the day of its last calculation), and its ports; the previous
+  period is measured against the commit it had then (its history row).
 - **Help.** The tool's schema names the views and the contract they share; each view's filters,
   sorts, row keys and examples are view `help`'s (`reports/help`), answered in the handler before a
   client is made. A filter's line says what it takes from the view's own definition, and a test

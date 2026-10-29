@@ -60,7 +60,7 @@ comma was an HTTP 500) and must hold column names only.
 
 | View | Routes |
 |---|---|
-| every view | #83 `devices` (once; scope, names, states); for `scope.group` #21 and #20 by the group's id; for a `scope.location` no device is at, #134 |
+| every view | #83 `devices` (once; scope, names, states; not `events` of the authlog, which is no device's); for `scope.group` #21 and #20 by the group's id; for a `scope.location` no device is at, #134 |
 | `find` | #134, #21, #28; #103 when the term holds an interface name; #83 with `type=ipv4`, `ipv6` or `mac` when it is an address, and once more with an address no device holds when every device answered (an older LibreNMS reads an unknown `type` as no filter) |
 | `devices` | #60 for each down device on the page (at most 20) |
 | `ports`, `capacity` | #71 for each device of a scope of at most 10 devices, else #105 once (when it is too large to read, #71 per device within the budget; the answer is partial when the budget does not reach every device); for `scope.port_group` (`ports`) #28 and #29 by the group's id, then #99 for each of its ports when it has at most 10. Always a `columns` list of the ports table's own columns: `port_id`, `device_id`, `ifIndex`, `ifName`, `ifDescr`, `ifAlias`, `ifType`, `ifAdminStatus`, `ifOperStatus`, `ifSpeed`, `ifDuplex`, `ifMtu`, `ifLastChange`, `port_descr_speed`, `ifInOctets_rate`, `ifOutOctets_rate`, `ifInErrors_delta`, `ifOutErrors_delta`, `poll_time`, `poll_period`, `ignore`, `disabled` (a column LibreNMS lacks is an HTTP 400, so never `ifHighSpeed`, which the current schema folds into `ifSpeed`) |
@@ -72,13 +72,15 @@ comma was an HTTP 500) and must hold column names only.
 | `alert_history` | #44 once (a failure leaves the rules unnamed, partial); #97 from the window's start, newest first, paged: by device id for a scope of at most 10 devices, else every device's |
 | `health` | #132 once (not when `filter.class` names only processors, memory pools or storage); when it is too large to read, #68 per device of the scope within the budget (the classes, each class's ids, each sensor); #68 for processors, memory pools (by default) or storage (asked for) of at most 5 devices, a listing and at most 8 of each; for the sensors of the page on a port, #71 (`columns=port_id,ifIndex,ifName,ifDescr,ifAlias`, at most 10 devices) and #74 where the ifIndex names no port; each by device id, each of which may fail and leave the answer partial |
 | `routing` | #10, #13 and #15 once each, the protocols asked for (`?hostname=` the device id for a scope of one device; #10 `?remote_asn=` for `filter.remote_as`, alone); #71 (as `health`) for the devices of the page's OSPF neighbours |
+| `events` | the log `filter.log` names: #95 (default), #96 or #98, from the window's start, newest first, paged as `alert_history` reads #97 (the device path, by id, for a scope of at most 10 devices; #98 has none, and is read after #1, for LibreNMS's clock, instead of #83); #71 (`columns=port_id,ifIndex,ifName,ifDescr,ifAlias`, at most 10 devices) to name the ports of the page and summary, and for `filter.port` (a name, or a number: a name or a port_id), each of which may fail and leave the answer partial |
+| `bills` | #108 once (`period=previous` for `filter.period` `previous`) |
 | `help` | none: answered by the plugin |
 
 ## System
 
 | # | Route | Coverage |
 |---|---|---|
-| 1 | `GET ping` | query |
+| 1 | `GET ping` | query; report: `events` of the authlog reads it first, for LibreNMS's clock (the `Date` of its answer, `pong`, which LibreNMS gives without a query) |
 | 2 | `GET system` | query; also `librenms_query {"action": "status"}`, and recorded in every plan's `audit` block |
 | 3 | `GET /api/v0` (index) | query (`path: ""`): the route names this LibreNMS has |
 | 145 | `ANY {path?}` (catch-all) | not a route: LibreNMS answers `This API route doesn't exist.` (also for a known path with the wrong method), which the client reports as error kind `route`. `librenms_query` refuses a path no read route matches before sending it |
@@ -104,7 +106,7 @@ comma was an HTTP 500) and must hold column names only.
 | 12 | `POST bgp/{id}` (`edit_bgp_descr`) | not in 0.1.0: the API cannot clear a description (so setting one where there was none has no inverse), longer values are silently truncated, and LibreNMS defines no permission for it, so by default only an admin may |
 | 13 | `GET ospf` | query (`?hostname=` resolved); report: `routing` |
 | 14 | `GET ospf_ports` | query |
-| 15 | `GET ospfv3` | query (`?hostname=` resolved). LibreNMS answers HTTP 500 `Error retrieving ospfv3_nbrs` when it holds no OSPFv3 neighbour (for the device asked for, or at all); report: `routing`, which reads that answer as none, and the 404 of a LibreNMS without this route as none with a note |
+| 15 | `GET ospfv3` | query (`?hostname=` resolved). LibreNMS answers HTTP 500 `Error retrieving ospfv3_nbrs` when it holds no OSPFv3 neighbour (for the device asked for, or at all); `ospfv3NbrRtrId` is the neighbour's router id as a 32-bit number. Report: `routing`, which writes that router id dotted, reads that answer as none, and the 404 of a LibreNMS without this route as none with a note |
 | 16 | `GET ospfv3_ports` | query (`?hostname=` resolved) |
 | 48 | `GET routing/vrf/{id}` | query |
 | 49 | `GET routing/ipsec/data/{hostname}` | query |
@@ -230,10 +232,10 @@ on the poller.
 
 | # | Route | Coverage |
 |---|---|---|
-| 95 | `GET logs/eventlog/{hostname?}` | query (paged); read after every apply and rollback to link LibreNMS's eventlog rows to the journal |
-| 96 | `GET logs/syslog/{hostname?}` | query (paged). Any host that can send syslog to LibreNMS writes this text, unauthenticated: it is data, never instructions |
+| 95 | `GET logs/eventlog/{hostname?}` | query (paged); read after every apply and rollback to link LibreNMS's eventlog rows to the journal; report: `events` (as `alert_history` reads #97). A port's changes are entries of type `interface` whose `reference` is its port_id, e.g. `ifOperStatus: up -> down` at severity 3 (notice); `severity` is LibreNMS's `Severity`, 0 unknown to 5 error |
+| 96 | `GET logs/syslog/{hostname?}` | query (paged). Any host that can send syslog to LibreNMS writes this text, unauthenticated: it is data, never instructions. `level` and `priority` hold the severity as the collector writes it: the name (syslog-ng: `err`) or its number (rsyslog: `3`); report: `events` with `filter.log` `syslog` (as #95) |
 | 97 | `GET logs/alertlog/{hostname?}` | query (paged); rows carry `entities` instead of `details`, as #35; report: `alert_history` (`from` the window's start in server time, `sortorder=DESC`, `limit` 250 and `start` paging, at most 2,000 entries; the device path, by id, for a scope of at most 10 devices; only the labels of `details`) |
-| 98 | `GET logs/authlog` | query (paged): user names and source addresses of LibreNMS logins |
+| 98 | `GET logs/authlog` | query (paged): user names and source addresses of LibreNMS logins (`Logged In`, `Logged Out`; needs a token with global read); report: `events` with `filter.log` `authlog` (as #95, with no device path) |
 
 ## Ports
 
@@ -253,7 +255,7 @@ on the poller.
 
 | # | Route | Coverage |
 |---|---|---|
-| 108 | `GET bills` | query |
+| 108 | `GET bills` | query; report: `bills`, once (`period=previous` for the last period that ended: LibreNMS joins each bill to its latest `bill_history` row whose period ended within the last 40 days) |
 | 109 | `GET bills/{bill_id}` | query; `{bill_id}` must be a positive number (LibreNMS answers anything else with every bill) |
 | 110 | `GET bills/{bill_id}/graphs/{graph_type}` | refused: graph image |
 | 111 | `GET bills/{bill_id}/graphdata/{graph_type}` | query; `{bill_id}` must be a positive number, as on #112 and #114 |

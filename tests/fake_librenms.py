@@ -17,8 +17,8 @@ as no filter (and an unknown ``devices`` ``type`` as none), the ``ipv4``, ``ipv6
 lists checked trimmed but selected as sent, ``with=vlans`` on a device's ports and on one port (each port's ports_vlans
 rows, ``untagged`` as PortVlan reads it, and on one port the port it lazy-loads to do so), ``resources/fdb/{mac}``
 compared exactly, the alert log's details decoded, components as an object keyed by id, a device's health classes,
-ids and single sensors, processors, memory pools and storage volumes, and ``ospfv3``'s HTTP 500 for no neighbour. Bills
-are modelled for CDR bills in the current period only.
+ids and single sensors, processors, memory pools and storage volumes, ``ospfv3``'s HTTP 500 for no neighbour, the
+authlog, and CDR and quota bills in the current period and (``period=previous``) the last one that ended.
 
 Test hooks: :meth:`FakeLibreNMS.fail_on` (a forced answer or exception, optionally after the write took effect),
 :meth:`~FakeLibreNMS.touch` (an edit made outside the plugin), :meth:`~FakeLibreNMS.after` (another client's write
@@ -51,6 +51,7 @@ _TABLES = (
     "port_groups", "links", "sensors", "transceivers", "components", "bgp_peers", "ospf_nbrs", "alert_log", "syslog",
     "vlans", "ports_fdb", "ports_nac", "ipv4_mac", "outages", "availability", "bills", "ipv4_addresses",
     "ipv6_addresses", "ports_statistics", "ports_vlans", "processors", "mempools", "storage", "ospfv3_nbrs",
+    "authlog", "bill_history",
 )  # fmt: skip
 _ID_KEYS = {
     "devices": "device_id", "services": "service_id", "ports": "port_id", "eventlog": "event_id",
@@ -58,6 +59,7 @@ _ID_KEYS = {
     "ports_fdb": "ports_fdb_id", "ports_nac": "ports_nac_id", "availability": "availability_id", "bills": "bill_id",
     "ipv4_addresses": "ipv4_address_id", "ipv6_addresses": "ipv6_address_id", "ports_statistics": "port_id",
     "ports_vlans": "port_vlan_id", "processors": "processor_id", "mempools": "mempool_id", "storage": "storage_id",
+    "bill_history": "bill_hist_id",
 }  # fmt: skip
 
 # App\Http\Resources\Device, in its key order (dependency_parent_* only where list_devices loads parents).
@@ -149,12 +151,13 @@ _OSPF_COLUMNS = (
     "ospfNbrOptions", "ospfNbrPriority", "ospfNbrState", "ospfNbrEvents", "ospfNbrLsRetransQLen",
     "ospfNbmaNbrStatus", "ospfNbmaNbrPermanence", "ospfNbrHelloSuppressed", "context_name",
 )  # fmt: skip
+# ospfv3_nbrs as db_schema.yaml has it (the model's $fillable also names two NBMA columns the table does not have):
+# ospfv3NbrRtrId is an `int unsigned`, the router id as its 32-bit number, where ospf_nbrs.ospfNbrRtrId is dotted.
 _OSPFV3_COLUMNS = (
     "id", "device_id", "ospfv3_instance_id", "port_id", "router_id", "ospfv3NbrIfIndex", "ospfv3NbrIfInstId",
     "ospfv3NbrRtrId", "ospfv3NbrAddressType", "ospfv3NbrAddress", "ospfv3NbrOptions", "ospfv3NbrPriority",
-    "ospfv3NbrState", "ospfv3NbrEvents", "ospfv3NbrLsRetransQLen", "ospfv3NbmaNbrStatus", "ospfv3NbmaNbrPermanence",
-    "ospfv3NbrHelloSuppressed", "ospfv3NbrIfId", "ospfv3NbrRestartHelperStatus", "ospfv3NbrRestartHelperAge",
-    "ospfv3NbrRestartHelperExitReason", "context_name",
+    "ospfv3NbrState", "ospfv3NbrEvents", "ospfv3NbrLsRetransQLen", "ospfv3NbrHelloSuppressed", "ospfv3NbrIfId",
+    "ospfv3NbrRestartHelperStatus", "ospfv3NbrRestartHelperAge", "ospfv3NbrRestartHelperExitReason", "context_name",
 )  # fmt: skip
 # processors, mempools and storage: what devices/{hostname}/health/device_<kind>/{id} returns of one (toArray()).
 _PROCESSOR_COLUMNS = (
@@ -180,6 +183,7 @@ _HEALTH_KINDS = {
 }
 _ALERT_LOG_COLUMNS = ("id", "rule_id", "device_id", "fault_id", "state", "details", "time_logged")
 _SYSLOG_COLUMNS = ("device_id", "facility", "priority", "level", "tag", "timestamp", "program", "msg", "seq")
+_AUTHLOG_COLUMNS = ("id", "datetime", "user", "address", "result")
 _VLAN_COLUMNS = ("vlan_id", "device_id", "vlan_vlan", "vlan_domain", "vlan_name", "vlan_type", "vlan_state")
 # ports_vlans (PortVlan): a port's membership of a VLAN, tagged or not, as with=vlans returns it.
 _PORT_VLAN_COLUMNS = (
@@ -196,6 +200,13 @@ _BILL_COLUMNS = (
     "bill_id", "bill_name", "bill_type", "bill_cdr", "bill_day", "bill_quota", "rate_95th_in", "rate_95th_out",
     "rate_95th", "dir_95th", "total_data", "total_data_in", "total_data_out", "rate_average_in",
     "rate_average_out", "rate_average", "bill_last_calc", "bill_custid", "bill_ref", "bill_notes", "bill_autoadded",
+)  # fmt: skip
+# bill_history: a billing period's figures, written by billing-calculate.php (bill_used is the 95th in bit/s for a CDR
+# bill, the bytes transferred for a quota bill; pdf is a longblob nobody fills).
+_BILL_HISTORY_COLUMNS = (
+    "bill_hist_id", "bill_id", "updated", "bill_datefrom", "bill_dateto", "bill_type", "bill_allowed", "bill_used",
+    "bill_overuse", "bill_percent", "rate_95th_in", "rate_95th_out", "rate_95th", "dir_95th", "rate_average",
+    "rate_average_in", "rate_average_out", "traf_in", "traf_out", "traf_total", "bill_peak_out", "bill_peak_in", "pdf",
 )  # fmt: skip
 # Component::getComponents: each component's own columns but its id and device, then its preferences.
 _COMPONENT_COLUMNS = ("type", "label", "status", "ignore", "disabled", "error")
@@ -250,7 +261,10 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
     "ipv4_mac": {"context_name": ""},
     "outages": {"up_again": None},
     "bills": {**dict.fromkeys(_BILL_COLUMNS), "bill_type": "cdr", "bill_day": 1, "bill_quota": 0, "dir_95th": "in",
-              "bill_autoadded": 0, "ports": []},
+              "bill_autoadded": 0, "bill_notes": "", "total_data": 0, "total_data_in": 0, "total_data_out": 0,
+              "rate_average": 0, "rate_average_in": 0, "rate_average_out": 0, "ports": []},
+    "bill_history": {**dict.fromkeys(_BILL_HISTORY_COLUMNS), "bill_type": "cdr", "dir_95th": "in", "bill_overuse": 0},
+    "authlog": {"address": "", "result": "Logged In"},
 }  # fmt: skip
 
 # The parameter of a route that takes the rest of the path (``->where('search', '.*')``).
@@ -310,6 +324,7 @@ _ROUTES = (
     ("GET", "logs/eventlog/{hostname?}", "list_eventlog", "_list_logs"),
     ("GET", "logs/syslog/{hostname?}", "list_syslog", "_list_logs"),
     ("GET", "logs/alertlog/{hostname?}", "list_alertlog", "_list_logs"),
+    ("GET", "logs/authlog", "list_authlog", "_list_logs"),
     ("GET", "ports/{portid}", "get_port_info", "_get_port_info"),
     ("GET", "ports/{portid}/transceiver", "get_port_transceiver", "_get_port_transceiver"),
     ("GET", "ports/search/{field}/{search?}", "search_ports", "_search_ports"),
@@ -1489,11 +1504,12 @@ class FakeLibreNMS:
 
     # -- eventlog, ports ----------------------------------------------------------------------------
     def _list_logs(self, r: _Req) -> FakeResponse:
-        """``list_logs`` behind eventlog, syslog and alertlog: a path hostname LibreNMS does not know filters
+        """``list_logs`` behind eventlog, syslog, alertlog and authlog: a path hostname LibreNMS does not know filters
         nothing, ``from``/``to`` bound the id when numeric and the time otherwise, the order is ascending unless
-        ``sortorder`` is exactly ``DESC``, and ``limit`` is cast with ``(int)`` (a negative one is no limit)."""
+        ``sortorder`` is exactly ``DESC``, and ``limit`` is cast with ``(int)`` (a negative one is no limit). The
+        authlog is no device's: its rows are the table's columns alone."""
         table, timestamp, id_field = _LOGS[r.name]
-        ref, p = r.args["hostname"], r.params
+        ref, p = r.args.get("hostname"), r.params
         device_id = self._device_ref(ref)
         rows = [e for e in self.tables[table].values() if device_id is None or e["device_id"] == device_id]
         for name, keep in (("from", lambda a, b: a >= b), ("to", lambda a, b: a <= b)):
@@ -1505,6 +1521,9 @@ class FakeLibreNMS:
         rows.sort(key=lambda e: (e[timestamp], e[id_field]), reverse=p.get("sortorder") == "DESC")
         start, limit = max(0, _php_int(p.get("start", 0))), _php_int(p.get("limit", 50))
         rows = rows[start:] if limit < 0 else rows[start : start + limit]
+        if table == "authlog":
+            out = [{k: copy.deepcopy(e[k]) for k in _AUTHLOG_COLUMNS} for e in rows]
+            return _api_success(out, "logs", array=True, extra={"total": total})
         devices = self.tables["devices"]
         out = []
         for e in rows:
@@ -1792,7 +1811,10 @@ class FakeLibreNMS:
 
     def _list_bills(self, r: _Req) -> FakeResponse:
         """``list_bills`` behind ``bills`` and ``bills/{bill_id}``: ``custid``, then ``ref``, then a numeric id
-        filter; a ``bill_id`` that is not a number filters nothing. CDR bills only, current period only."""
+        filter; a ``bill_id`` that is not a number filters nothing. ``period=previous`` joins each bill to its latest
+        history row whose period ended within the last 40 days (a bill without one is left out) and answers with
+        that row's columns, its traffic and update time under the current period's names; ``allowed``, ``used``,
+        ``percent`` and ``overuse`` are worked out from the bill's commit or quota as it is now, as LibreNMS does."""
         ref, p = r.args.get("bill_id"), r.params
         bills = sorted(self.tables["bills"].values(), key=lambda b: b["bill_name"].lower())
         if _truthy(p.get("custid")):
@@ -1801,25 +1823,52 @@ class FakeLibreNMS:
             bills = [b for b in bills if _same(b["bill_ref"], p["ref"])]
         elif _numeric(ref):
             bills = [b for b in bills if b["bill_id"] == _php_float(ref)]
-        return _api_success([self._bill_out(b) for b in bills], "bills", array=True)
+        if p.get("period") == "previous":
+            rows = [row for row in (self._last_period(b) for b in bills) if row is not None]
+        else:
+            rows = [{k: b[k] for k in _BILL_COLUMNS} for b in bills]
+            for row in rows:
+                row["bill_allowed"] = row["bill_cdr"] if row["bill_type"] == "cdr" else row["bill_quota"]
+        return _api_success([self._bill_out(row) for row in rows], "bills", array=True)
 
-    def _bill_out(self, b: Dict[str, Any]) -> Dict[str, Any]:
-        out = {k: b[k] for k in _BILL_COLUMNS}
-        cdr, rate = b["bill_cdr"] or 0, b["rate_95th"] or 0
-        over = rate - cdr
+    def _last_period(self, b: Dict[str, Any]) -> Dict[str, Any] | None:
+        """The bill joined to its latest history row (``MAX(bill_hist_id)``) among those with ``bill_dateto`` before
+        NOW() and after 40 days before it, as the ``period=previous`` query selects it."""
+        now = _raw(self.now)
+        earliest = _raw(self.now - timedelta(days=40))
+        ended = [h for h in self.tables["bill_history"].values()
+                 if h["bill_id"] == b["bill_id"] and earliest < h["bill_dateto"] < now]  # fmt: skip
+        if not ended:
+            return None
+        history = max(ended, key=lambda h: h["bill_hist_id"])
+        out = {k: b[k] for k in ("bill_autoadded", "bill_cdr", "bill_custid", "bill_day", "bill_name", "bill_notes",
+                                 "bill_quota", "bill_ref")}  # fmt: skip
+        out.update({k: copy.deepcopy(history[k]) for k in _BILL_HISTORY_COLUMNS})
+        out.update(total_data=history["traf_total"], total_data_in=history["traf_in"],
+                   total_data_out=history["traf_out"], bill_last_calc=history["updated"])  # fmt: skip
+        return out
+
+    def _bill_out(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """A bill row with what list_bills works out: for a CDR bill the 95th against the commit (bit/s), for a quota
+        bill the bytes transferred against the quota; the percent rounded to 2 places, or ``-`` without a commit
+        or quota; the overuse, or ``-`` when there is none; and the bill's ports."""
+        out = dict(row)
+        quota = str(row["bill_type"]).lower() == "quota"  # Billing::formatBytes, at billing.base 1000, for a quota
+        allowed, used = (row["bill_quota"], row["total_data"]) if quota else (row["bill_cdr"], row["rate_95th"])
+        allowed, used, unit = allowed or 0, used or 0, "B" if quota else "bps"
+        over = used - allowed
         out.update(
-            bill_allowed=cdr,
-            allowed=_si(cdr) + "bps",
-            used=_si(rate) + "bps",
-            percent=round(rate / cdr * 100, 2) if cdr > 0 else "-",
-            overuse="-" if over <= 0 else _si(over),
+            allowed=_si(allowed) + unit,
+            used=_si(used) + unit,
+            percent=round(used / allowed * 100, 2) if allowed > 0 else "-",
+            overuse="-" if over <= 0 else _si(over) + ("B" if quota else ""),
             ports=[
                 {
                     "device_id": self.tables["ports"][i]["device_id"],
                     "port_id": i,
                     "ifName": self.tables["ports"][i]["ifName"],
                 }
-                for i in b["ports"]
+                for i in self.tables["bills"][row["bill_id"]]["ports"]
                 if i in self.tables["ports"]
             ],
         )
@@ -1925,6 +1974,7 @@ _LOGS = {
     "list_eventlog": ("eventlog", "datetime", "event_id"),
     "list_syslog": ("syslog", "timestamp", "seq"),
     "list_alertlog": ("alert_log", "time_logged", "id"),
+    "list_authlog": ("authlog", "datetime", "id"),
 }
 
 
@@ -2342,8 +2392,8 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
     (one past its limit, an optic), a transceiver, processors (one past its warning limit), a memory pool and a flash
     volume, NTP components, BGP sessions (one idle, one without a state), OSPF neighbours (no OSPFv3 ones),
     alert-log rows whose details carry contacts, syslog, VLANs and the trunk that carries them, a MAC
-    learned on an access port and on the uplink, a NAC session, ARP entries, outages and availability, and two CDR
-    bills (one over its commit)."""
+    learned on an access port and on the uplink, a NAC session, ARP entries, outages and availability, two CDR
+    bills (one over its commit) with their September and October history, and LibreNMS logins (the authlog)."""
     seed = fake.seed
     seed("port_groups", {"id": 1, "name": "uplinks", "desc": "Core and WAN uplinks", "ports": [1, 5, 6]})
     seed("ports_statistics", {"port_id": 1, "ifInDiscards": 120, "ifInDiscards_prev": 120, "ifInDiscards_delta": 0,
@@ -2523,3 +2573,26 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
          "bill_last_calc": "2026-10-28 11:50:02", "ports": [6]},
     ):  # fmt: skip
         seed("bills", row)
+    # each bill's September, closed (Transit A went over its commit), and October so far, which is not yet closed
+    for row in (
+        {"bill_hist_id": 1, "bill_id": 1, "updated": "2026-10-01 00:05:02", "bill_datefrom": "2026-09-01 00:00:00",
+         "bill_dateto": "2026-09-30 23:59:59", "bill_allowed": 1000000000, "bill_used": 1050000000,
+         "bill_overuse": 50000000, "bill_percent": 105.0, "rate_95th": 1050000000, "rate_95th_in": 1050000000,
+         "rate_95th_out": 380000000, "traf_in": 210000000000000, "traf_out": 90000000000000,
+         "traf_total": 300000000000000},
+        {"bill_hist_id": 2, "bill_id": 2, "updated": "2026-10-01 00:05:02", "bill_datefrom": "2026-09-01 00:00:00",
+         "bill_dateto": "2026-09-30 23:59:59", "bill_allowed": 500000000, "bill_used": 455000000,
+         "bill_percent": 91.0, "rate_95th": 455000000, "rate_95th_in": 455000000, "rate_95th_out": 120000000,
+         "traf_total": 120000000000000},
+        {"bill_hist_id": 3, "bill_id": 1, "updated": "2026-10-28 11:50:02", "bill_datefrom": "2026-10-01 00:00:00",
+         "bill_dateto": "2026-10-31 23:59:59", "bill_allowed": 1000000000, "bill_used": 812000000,
+         "bill_percent": 81.2, "rate_95th": 812000000},
+    ):  # fmt: skip
+        seed("bill_history", row)
+    for row in (
+        {"datetime": "2026-10-26 17:40:00", "user": "jane", "address": "198.51.100.7", "result": "Logged Out"},
+        {"datetime": "2026-10-28 08:00:00", "user": "admin", "address": "192.0.2.200"},
+        {"datetime": "2026-10-28 09:30:00", "user": "jane", "address": "198.51.100.7"},
+        {"datetime": "2026-10-28 10:15:00", "user": "admin", "address": "192.0.2.200", "result": "Logged Out"},
+    ):  # fmt: skip
+        seed("authlog", row)

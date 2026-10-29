@@ -11,13 +11,13 @@ holds no label is named from its device's port names (:meth:`.context.ReportCont
 come with LibreNMS's ``details`` (every column of every table the rule joins, and the alert's contacts): no row and
 no summary carries any of it but those labels. An answer too large to read is read again one severity at a time.
 
-``alert_history`` reads the alert log over ``window`` (``logs/alertlog``, newest first, :data:`PAGE` entries a
-request and at most :data:`MAX_ENTRIES` a report; the device path for a scope of at most
-:data:`.ports.DEVICE_READS` devices) and ``rules`` for the rules' names and settings. ``filter.by`` shapes the rows:
-``rule`` (the default: per rule; for the whole fleet every rule, also those that logged nothing, so disabled rules
-and rules that notify no one are listed), ``device``, or ``event`` (each entry, newest first). Counts: ``fired``
-(entries that raised an alert, state 1), ``cleared`` (it recovered), ``flaps`` (an object that alerted again after
-it had cleared, within the window), ``last_fired`` and its age.
+``alert_history`` reads the alert log over ``window`` (``logs/alertlog``, newest first, :data:`.context.LOG_PAGE`
+entries a request and at most :data:`MAX_ENTRIES` a report; the device path for a scope of at most
+:data:`.ports.DEVICE_READS` devices; :meth:`.context.ReportContext.read_log`) and ``rules`` for the rules' names and
+settings. ``filter.by`` shapes the rows: ``rule`` (the default: per rule; for the whole fleet every rule, also those
+that logged nothing, so disabled rules and rules that notify no one are listed), ``device``, or ``event`` (each
+entry, newest first). Counts: ``fired`` (entries that raised an alert, state 1), ``cleared`` (it recovered),
+``flaps`` (an object that alerted again after it had cleared, within the window), ``last_fired`` and its age.
 
 Fault and alert-log times are the server's local ``Y-m-d H:i:s``: read in ``librenms_timezone`` they become ISO-8601
 with an age; without it they are shown as LibreNMS wrote them, with no age, and a window is read from a bound early
@@ -26,7 +26,6 @@ enough to hold it in any zone (:meth:`.context.ReportContext.since`).
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
@@ -36,16 +35,16 @@ from ..redact import alert_entities
 from . import units
 from .context import (
     FAULT_STATES,
+    LOGS,
     OPEN_FAULT_STATES,
-    CallBudget,
     One,
     ReportContext,
     Request,
     Scope,
     View,
-    brief,
     hostname_order,
     port_label,
+    row_device,
     rows_of,
     truthy,
 )
@@ -65,14 +64,11 @@ BY = One(("rule", "device", "event"))
 PORT_ENTITIES = frozenset({"interface", "port"})  # LibreNMS's morph name for a Port is "interface"
 TOP = 5  # rules and devices a history summary names
 RULES_SHOWN = 10  # rules the alerts summary counts by name
-PAGE = 250  # alert-log entries one request asks for
-MIN_PAGE = 25  # the fewest a request asks for while LibreNMS's answer is too large to read
 MAX_ENTRIES = 2000  # alert-log entries one report reads
 ALERT_TEXT = ("hostname", "display", "rule", "entity", "entities", "note", "procedure")
 HISTORY_TEXT = ("hostname", "display", "rule", "entity", "top_rule")
 _SEVERITY_ORDER = {severity: number for number, severity in enumerate(SEVERITIES)}
 _STATE_ORDER = {"active": 0, "worse": 0, "better": 0, "changed": 0, "acknowledged": 1, "recovered": 2}
-_SERVER_TIME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 # What names an alerted object other than a port, from the label keys a rule's rows may hold: the name, and the key
 # whose value is added in parentheses.
 _LABELS = (
@@ -106,31 +102,6 @@ def _labels(details: Any) -> Tuple[List[Dict[str, Any]], List[str], int]:
     return labels, [name for name in (entity_label(item) for item in labels) if name], total
 
 
-def _device(devices: Dict[int, Dict[str, Any]], row: Dict[str, Any]) -> Dict[str, Any]:
-    """The device a fault or log row is about, as rows name it; one the token cannot see (or that is gone) by the id
-    and hostname the row carries."""
-    device_id = int(row["device_id"]) if is_digits(row.get("device_id")) else None
-    if device_id in devices:
-        return brief(devices[device_id])
-    return {"device_id": device_id, "hostname": row.get("hostname")}
-
-
-def _moment(value: Any) -> int:
-    """A fault or log time as an order key: a server-local ``Y-m-d H:i:s`` as the number its digits make (the
-    times share the server's zone, so they order as they read); 0, first, for none."""
-    found = _SERVER_TIME_RE.match(value) if isinstance(value, str) else None
-    return int("".join(found.groups())) if found else 0
-
-
-def _when(ctx: ReportContext, value: Any, prefix: str) -> Dict[str, Any]:
-    """``<prefix>`` (ISO-8601 in ``librenms_timezone``; without it as LibreNMS wrote it), its age in seconds and in
-    words (none without a zone)."""
-    moment = units.server_time(value, ctx.zone)
-    age = units.age(moment, ctx.now)
-    shown = units.iso(moment) if moment is not None else (value or None)
-    return {prefix: shown, f"{prefix}_age_s": age, f"{prefix}_age": units.duration(age)}
-
-
 def _rule_wanted(wanted: str, rule_id: Any, name: Any) -> bool:
     """filter.rule: a rule's id, or part of its name in any case."""
     if is_digits(wanted):
@@ -157,7 +128,7 @@ class _Alert:
     row: Dict[str, Any]
     state: str
     severity: str
-    seen: int  # first seen, as an order key (_moment)
+    seen: int  # first seen, as an order key (units.server_order)
     names: List[str]  # what alerted, every label
     port_id: int | None = None  # a port fault that holds no label, to name from its device's ports
 
@@ -239,7 +210,7 @@ def _alert(ctx: ReportContext, devices: Dict[int, Dict[str, Any]], fault: Dict[s
     number = int(fault["state"]) if is_digits(fault.get("state")) else None
     state = FAULT_STATES.get(number, str(fault.get("state")))
     severity = str(fault.get("severity") or "")
-    row: Dict[str, Any] = {"alert_id": fault.get("id"), **_device(devices, fault)}
+    row: Dict[str, Any] = {"alert_id": fault.get("id"), **row_device(devices, fault)}
     row.update(rule_id=fault.get("rule_id"), rule=fault.get("name"), severity=severity or None, state=state)
     row["acked"] = state == "acknowledged"
     kind = fault.get("entity_type") or None
@@ -253,10 +224,10 @@ def _alert(ctx: ReportContext, devices: Dict[int, Dict[str, Any]], fault: Dict[s
     if total > 1:
         row.update(entities=names, entities_total=total)
     seen = fault.get("first_seen") or fault.get("timestamp")  # older faults have no first_seen
-    row.update(_when(ctx, seen, "first_seen"))
+    row.update(ctx.when(seen, "first_seen"))
     row.update(note=fault.get("note") or None, procedure=fault.get("proc") or None)
     unnamed = row["entity_type"] == "port" and entity_id is not None and not names
-    return _Alert(row, state, severity, _moment(seen), names, port_id=entity_id if unnamed else None)
+    return _Alert(row, state, severity, units.server_order(seen), names, port_id=entity_id if unnamed else None)
 
 
 def _name_ports(ctx: ReportContext, alerts: List[_Alert]) -> None:
@@ -454,78 +425,10 @@ def _notifies(rule: Dict[str, Any]) -> bool:
 
 
 def _read_log(ctx: ReportContext, scope: Scope, bound: str) -> Tuple[List[Dict[str, Any]], int | None]:
-    """The alert-log entries from *bound* (server-local time) on, newest first: each device's for a scope of at most
-    :data:`DEVICE_READS` devices, else every device's; at most :data:`MAX_ENTRIES`. Also how many entries LibreNMS
-    holds there for the scope (None when it read every device's for a narrower scope, left a device unread, or a
-    read did not say). What the cap, the request budget or a failed read leaves out makes the answer partial."""
-    devices = ctx.devices()
-    whole = scope.ids is None or len(scope.ids) > DEVICE_READS  # every device's log (then kept to the scope)
-    if whole:
-        targets: List[Tuple[Any, ...]] = [("logs", "alertlog")]
-    else:  # none for a scope of no device (an empty group, a location or os no device has): nothing to read
-        ids = sorted(scope.ids or (), key=lambda i: hostname_order(devices[i]))
-        targets = [("logs", "alertlog", i) for i in ids]
-    out: Dict[Any, Dict[str, Any]] = {}
-    logged: int | None = 0
-    unread = []
-    for segments in targets:
-        if len(out) >= MAX_ENTRIES or ctx.calls >= ctx.call_budget:
-            unread.append(str(segments[-1]))
-            continue
-        holds = _read_pages(ctx, segments, bound, out, required=len(targets) == 1)
-        logged = None if logged is None or holds is None else logged + holds
-    rows = sorted(out.values(), key=lambda row: (_moment(row.get("time_logged")), _id(row.get("id"))), reverse=True)
-    if logged is not None and len(rows) < logged:
-        ctx.partial(
-            f"the alert log holds {logged} entries from {bound} (server time) on for what was read; the newest "
-            f"{len(rows)} were read (a report reads at most {MAX_ENTRIES}, {PAGE} a request): narrow the window or "
-            "the scope"
-        )
-    if unread:
-        ctx.partial(
-            f"the alert log of devices {', '.join(unread)} was not read: the report had read its {MAX_ENTRIES} "
-            f"entries or used its {ctx.call_budget} requests; narrow the window or the scope"
-        )
-    narrower = whole and scope.ids is not None  # LibreNMS's count is every device's, not the scope's
-    return rows, None if narrower or unread else logged
-
-
-def _read_pages(
-    ctx: ReportContext, segments: Tuple[Any, ...], bound: str, out: Dict[Any, Dict[str, Any]], *, required: bool
-) -> int | None:
-    """Read one alert-log path page by page into *out*, by entry id (an entry logged while it is paged moves the
-    rest on, so one may come twice), until the path is read, *out* holds :data:`MAX_ENTRIES` or the request budget
-    is spent. Returns LibreNMS's total for the path (None when not known). A failure fails the report when the path
-    is *required* and nothing was read from it; otherwise it leaves the answer partial."""
-    size, start, total = PAGE, 0, None
-    while len(out) < MAX_ENTRIES:
-        params = {"from": bound, "sortorder": "DESC", "limit": min(size, MAX_ENTRIES - len(out)), "start": start}
-        try:
-            rows, holds = ctx.page(*segments, params=params)
-        except CallBudget:
-            ctx.partial(
-                f"the alert log was not read past entry {start} of {'/'.join(map(str, segments))}: the report used "
-                f"its {ctx.call_budget} requests; narrow the window or the scope"
-            )
-            break
-        except LibreNMSError as exc:
-            if exc.kind == "too_large" and size > MIN_PAGE:
-                size = max(MIN_PAGE, size // 2)  # entries carry every row their rule matched: read fewer at a time
-                continue
-            if exc.kind == "auth" or (required and not start):
-                raise
-            ctx.partial(
-                f"the alert log of {'/'.join(map(str, segments))} was not read past entry {start}: LibreNMS answered "
-                f"{exc.kind}"
-            )
-            break
-        total = holds if total is None else total
-        for row in rows:
-            out.setdefault(row.get("id"), _slim(row))
-        start += len(rows)
-        if len(rows) < params["limit"] or (total is not None and start >= total):
-            break
-    return total
+    """The alert-log entries from *bound* (server-local time) on, newest first, without their details
+    (:meth:`ReportContext.read_log`: each device's for a scope of at most :data:`DEVICE_READS` devices, else every
+    device's; at most :data:`MAX_ENTRIES`), and how many LibreNMS holds there for the scope when that is known."""
+    return ctx.read_log(LOGS["alertlog"], scope, bound, max_entries=MAX_ENTRIES, device_reads=DEVICE_READS, keep=_slim)
 
 
 def _slim(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,7 +449,7 @@ def _entry(devices: Dict[int, Dict[str, Any]], row: Dict[str, Any]) -> _Entry:
         fault_id=row.get("fault_id"),
         state=LOG_STATES.get(number, str(row.get("state"))),
         logged=row.get("time_logged"),
-        device=_device(devices, row),
+        device=row_device(devices, row),
         entity=row.get("entity"),
     )
 
@@ -584,7 +487,7 @@ def _flaps(entries: List[_Entry]) -> Set[int]:
     releases without faults) that had cleared since it was last raised, within the window."""
     cleared: Set[Any] = set()
     out: Set[int] = set()
-    for entry in sorted(entries, key=lambda entry: (_moment(entry.logged), entry.id)):
+    for entry in sorted(entries, key=lambda entry: (units.server_order(entry.logged), entry.id)):
         key = ("fault", entry.fault_id) if entry.fault_id not in (None, "", 0) else (entry.rule_id, entry.device_id)
         if entry.state == "recovered":
             cleared.add(key)
@@ -603,7 +506,7 @@ def _tally(entries: Iterable[_Entry], flaps: Set[int]) -> _Tally:
             tally.fired += 1
             tally.flaps += entry.id in flaps
             tally.rules[entry.rule_id] = tally.rules.get(entry.rule_id, 0) + 1
-            if _moment(entry.logged) > _moment(tally.last_fired):
+            if units.server_order(entry.logged) > units.server_order(tally.last_fired):
                 tally.last_fired = entry.logged
         elif entry.state == "recovered":
             tally.cleared += 1
@@ -620,7 +523,7 @@ def _grouped(entries: List[_Entry], key: Callable[[_Entry], Any]) -> Dict[Any, L
 def _counts(ctx: ReportContext, tally: _Tally) -> Dict[str, Any]:
     out: Dict[str, Any] = {"entries": tally.entries, "fired": tally.fired, "cleared": tally.cleared}
     out["flaps"] = tally.flaps
-    out.update(_when(ctx, tally.last_fired, "last_fired"))
+    out.update(ctx.when(tally.last_fired, "last_fired"))
     return out
 
 
@@ -688,13 +591,13 @@ def _event_rows(
     raised (or every other entry)."""
     if "fired" in req.filters:
         entries = [entry for entry in entries if (entry.state == "alerted") == req.filters["fired"]]
-    ordered = sorted(entries, key=lambda entry: (_moment(entry.logged), entry.id), reverse=True)
+    ordered = sorted(entries, key=lambda entry: (units.server_order(entry.logged), entry.id), reverse=True)
     if req.sort == "name":
         ordered.sort(key=lambda entry: hostname_order(entry.device))  # stable: newest first per device
     out = []
     for entry in ordered:
         rule = _rule_of(rules, entry.rule_id) or {}
-        row: Dict[str, Any] = {"entry_id": entry.id, **_when(ctx, entry.logged, "time"), **entry.device}
+        row: Dict[str, Any] = {"entry_id": entry.id, **ctx.when(entry.logged, "time"), **entry.device}
         row.update(rule_id=entry.rule_id, rule=rule.get("name"), severity=rule.get("severity"), state=entry.state)
         row.update(alert_id=entry.fault_id, entity=entry.entity)
         out.append(row)
@@ -712,7 +615,7 @@ def _tally_order(sort: str, name: Callable[[Dict[str, Any]], Tuple[Any, ...]]) -
         if sort == "flaps":
             return (-tally.flaps, -tally.fired, *name(row))
         if sort == "last_fired":
-            return (-_moment(tally.last_fired), *name(row))
+            return (-units.server_order(tally.last_fired), *name(row))
         return name(row)
 
     return order

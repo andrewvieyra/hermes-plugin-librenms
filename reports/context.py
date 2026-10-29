@@ -6,7 +6,9 @@ and result envelope.
   does (:func:`routes.match`, so a refused route stays unreachable), counts it against :data:`CALL_BUDGET`, reads
   LibreNMS's 404-for-an-empty-list as no rows and takes the rows from the route's result key. The devices,
   locations and group listings, and the port names of a device a view names ports on
-  (:meth:`ReportContext.ports_by_device`), are read at most once per report; nothing is kept between calls.
+  (:meth:`ReportContext.ports_by_device`), are read at most once per report; nothing is kept between calls. A log
+  over a window (:data:`LOGS`: the alert log, eventlog, syslog, authlog) is read by :meth:`ReportContext.read_log`,
+  newest first, a page at a time, up to the entries a view reads.
 - Scope: :meth:`ReportContext.scope` turns ``scope`` into a set of device ids (and a port group into its port ids).
   A device given by a phrase rather than its id or hostname is ranked (:mod:`.fuzzy`) and resolves only when one
   device matches exactly, or only one matches every word; otherwise the report answers ``ambiguous`` with the
@@ -45,8 +47,10 @@ SCOPE_SHOWN = 10  # devices a scope lists by name
 SCOPE_LIST = 50  # most entries scope.devices takes
 TIMEZONE_UNKNOWN = "unknown — set librenms_timezone"
 TERM_VIEWS = "find and locate"  # the views that take a term
-WINDOW_VIEWS = "alert_history"  # the views that take a window
+WINDOW_VIEWS = "alert_history and events"  # the views that take a window
 TODAY = "today"
+LOG_PAGE = 250  # log entries one request asks for
+LOG_MIN_PAGE = 25  # the fewest a request asks for while LibreNMS's answer is too large to read
 # How far a server-local clock may be from UTC (UTC-12 to UTC+14): without librenms_timezone, a window's start in
 # LibreNMS's time is read this much earlier, so it holds the whole window whatever the server's zone.
 EARLIEST_OFFSET_S = 12 * 3600
@@ -126,6 +130,31 @@ class Since:
 
 
 @dataclass(frozen=True)
+class Log:
+    """A LibreNMS log a view reads over a window (``logs/<name>``, which LibreNMS pages with ``start`` and ``limit``):
+    what a partial reason calls it, the time column LibreNMS orders it by and bounds with ``from`` (server-local
+    ``Y-m-d H:i:s``), its id column, and whether it has a path per device (``logs/<name>/<device_id>``; the authlog,
+    LibreNMS's own logins, has none)."""
+
+    name: str
+    what: str
+    time_key: str
+    id_key: str
+    per_device: bool = True
+
+
+LOGS = {
+    log.name: log
+    for log in (
+        Log("alertlog", "the alert log", "time_logged", "id"),
+        Log("eventlog", "the eventlog", "datetime", "event_id"),
+        Log("syslog", "the syslog", "timestamp", "seq"),
+        Log("authlog", "the authlog", "datetime", "id", per_device=False),
+    )
+}
+
+
+@dataclass(frozen=True)
 class View:
     """A report view: its builder and the arguments it takes. ``filters`` maps each filter name to its kind
     (``bool``, ``duration``, ``number``, ``text``, or a tuple of the values a ``choice`` takes, one or a list of
@@ -183,6 +212,20 @@ def brief(device: Dict[str, Any]) -> Dict[str, Any]:
 
 def hostname_order(device: Dict[str, Any]) -> Tuple[Any, ...]:
     return natural_key(device.get("hostname")), _id(device.get("device_id"))
+
+
+def log_order(log: Log, row: Dict[str, Any]) -> Tuple[int, int]:
+    """A log entry's place in time: its server-local time, then its id (entries logged in the same second)."""
+    return units.server_order(row.get(log.time_key)), _id(row.get(log.id_key))
+
+
+def row_device(devices: Dict[int, Dict[str, Any]], row: Dict[str, Any]) -> Dict[str, Any]:
+    """The device a fault or log row is about, as rows name it (:func:`brief`); one the token cannot see (or that is
+    gone) by the id and hostname the row carries."""
+    device_id = int(row["device_id"]) if is_digits(row.get("device_id")) else None
+    if device_id in devices:
+        return brief(devices[device_id])
+    return {"device_id": device_id, "hostname": row.get("hostname")}
 
 
 def _id(value: Any) -> int:
@@ -287,7 +330,7 @@ def window_arg(view: View, value: Any, settings: Any) -> str | None:
     ``24h``, ``7d`` or ``30d`` (at most a year), for a view that takes one; its default when absent."""
     if view.window is None:
         if value not in (None, ""):
-            raise ArgumentError(f"window is for view {WINDOW_VIEWS}; view {view.name} reads what LibreNMS holds now")
+            raise ArgumentError(f"window is for views {WINDOW_VIEWS}; view {view.name} reads what LibreNMS holds now")
         return None
     if value is None or value == "":
         return view.window
@@ -394,12 +437,14 @@ def abbreviates(text: str, *names: str) -> bool:
     return False
 
 
-def names_port(text: str, port: Dict[str, Any]) -> bool:
-    """Whether *text* names *port* (a ports row) by its ifName or ifDescr in any case, a short form of one
-    (:func:`abbreviates`), or its port_id."""
+def names_port(text: str, port: Dict[str, Any], *, by_id: bool = True) -> bool:
+    """Whether *text* names *port* (a ports row) by its ifName or ifDescr in any case (a number too: HP and Aruba
+    switches name their ports ``5``), a short form of one (:func:`abbreviates`), or (*by_id*) its port_id."""
     wanted = text.strip().casefold()
     name, descr = folded(port, "ifName"), folded(port, "ifDescr")
-    return wanted in (name, descr) or abbreviates(wanted, name, descr) or wanted == str(port.get("port_id"))
+    if wanted in (name, descr) or abbreviates(wanted, name, descr):
+        return True
+    return by_id and wanted == str(port.get("port_id"))
 
 
 class ReportContext:
@@ -489,6 +534,19 @@ class ReportContext:
             self._now = datetime.now(timezone.utc)
         return self._now
 
+    def clock(self) -> datetime:
+        """LibreNMS's clock, for a view that must place a window before its first read: the ``Date`` of its smallest
+        answer (``ping``: ``pong``, which any token may read and LibreNMS answers without a query) when no read has
+        given one yet. A failed read still carries one; an answer without a ``Date`` leaves the plugin's clock. A
+        rejected token fails the report."""
+        if self._now is None and not self.calls:
+            try:
+                self.get("ping")
+            except LibreNMSError as exc:
+                if exc.kind == "auth":
+                    raise
+        return self.now
+
     def since(self, window: str) -> Since:
         """Where *window* (``today`` or a duration, :func:`window_arg`) starts in LibreNMS's server-local time, counted
         back from :attr:`now`. Without ``librenms_timezone`` that time cannot be placed exactly: the bound is then
@@ -508,6 +566,103 @@ class ReportContext:
             "before it; set librenms_timezone for an exact window"
         )
         return Since(window, bound, False)
+
+    def when(self, value: Any, prefix: str) -> Dict[str, Any]:
+        """``<prefix>``: a fault, log or bill time, ISO-8601 in ``librenms_timezone`` (without it as LibreNMS wrote
+        it), and its age in seconds (``<prefix>_age_s``) and in words (``<prefix>_age``), none without a zone."""
+        moment = units.server_time(value, self.zone)
+        age = units.age(moment, self.now)
+        shown = units.iso(moment) if moment is not None else (value or None)
+        return {prefix: shown, f"{prefix}_age_s": age, f"{prefix}_age": units.duration(age)}
+
+    def read_log(
+        self,
+        log: Log,
+        scope: Scope,
+        bound: str,
+        *,
+        max_entries: int,
+        device_reads: int,
+        keep: Callable[[Dict[str, Any]], Dict[str, Any]] = dict,
+    ) -> Tuple[List[Dict[str, Any]], int | None]:
+        """*log*'s entries from *bound* (server-local time) on, newest first, each as *keep* makes it once its page is
+        read: each device's for a scope of at most *device_reads* devices, else every device's (the caller keeps the
+        scope's); at most *max_entries*. Also how many entries LibreNMS holds there for the scope (None when it read
+        every device's for a narrower scope, left a device unread, or a read did not say). What the cap, the request
+        budget or a failed read leaves out makes the answer partial."""
+        whole = not log.per_device or scope.ids is None or len(scope.ids) > device_reads  # every device's log
+        if whole:
+            targets: List[Tuple[Any, ...]] = [("logs", log.name)]
+        else:  # none for a scope of no device (an empty group, a location or os no device has): nothing to read
+            devices = self.devices()
+            ids = sorted(scope.ids or (), key=lambda i: hostname_order(devices[i]))
+            targets = [("logs", log.name, i) for i in ids]
+        out: Dict[Any, Dict[str, Any]] = {}
+        logged: int | None = 0
+        unread = []
+        for segments in targets:
+            if len(out) >= max_entries or self.calls >= self.call_budget:
+                unread.append(str(segments[-1]))
+                continue
+            holds = self._log_pages(log, segments, bound, out, max_entries, keep, required=len(targets) == 1)
+            logged = None if logged is None or holds is None else logged + holds
+        rows = sorted(out.values(), key=lambda row: log_order(log, row), reverse=True)
+        if logged is not None and len(rows) < logged:
+            self.partial(
+                f"{log.what} holds {logged} entries from {bound} (server time) on for what was read; the newest "
+                f"{len(rows)} were read (a report reads at most {max_entries}, {LOG_PAGE} a request): narrow the "
+                "window or the scope"
+            )
+        if unread:
+            self.partial(
+                f"{log.what} of devices {', '.join(unread)} was not read: the report had read its {max_entries} "
+                f"entries or used its {self.call_budget} requests; narrow the window or the scope"
+            )
+        narrower = whole and scope.ids is not None  # LibreNMS's count is every device's, not the scope's
+        return rows, None if narrower or unread else logged
+
+    def _log_pages(
+        self,
+        log: Log,
+        segments: Tuple[Any, ...],
+        bound: str,
+        out: Dict[Any, Dict[str, Any]],
+        max_entries: int,
+        keep: Callable[[Dict[str, Any]], Dict[str, Any]],
+        *,
+        required: bool,
+    ) -> int | None:
+        """Read one log path page by page into *out*, by entry id (an entry logged while it is paged moves the rest
+        on, so one may come twice), until the path is read, *out* holds *max_entries* or the request budget is spent.
+        Returns LibreNMS's total for the path (None when not known). A failure fails the report when the path is
+        *required* and nothing was read from it; otherwise it leaves the answer partial."""
+        size, start, total = LOG_PAGE, 0, None
+        where = "/".join(map(str, segments))
+        while len(out) < max_entries:
+            params = {"from": bound, "sortorder": "DESC", "limit": min(size, max_entries - len(out)), "start": start}
+            try:
+                rows, holds = self.page(*segments, params=params)
+            except CallBudget:
+                self.partial(
+                    f"{log.what} was not read past entry {start} of {where}: the report used its {self.call_budget} "
+                    "requests; narrow the window or the scope"
+                )
+                break
+            except LibreNMSError as exc:
+                if exc.kind == "too_large" and size > LOG_MIN_PAGE:
+                    size = max(LOG_MIN_PAGE, size // 2)  # an alert-log entry carries every row its rule matched
+                    continue
+                if exc.kind == "auth" or (required and not start):
+                    raise
+                self.partial(f"{log.what} of {where} was not read past entry {start}: LibreNMS answered {exc.kind}")
+                break
+            total = holds if total is None else total
+            for row in rows:
+                out.setdefault(row.get(log.id_key), keep(row))
+            start += len(rows)
+            if len(rows) < params["limit"] or (total is not None and start >= total):
+                break
+        return total
 
     def devices(self) -> Dict[int, Dict[str, Any]]:
         """Every device the token can see, by id, in LibreNMS's order (hostname): one ``devices`` listing."""

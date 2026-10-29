@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
-description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, neighbours, VLANs, where a MAC or IP address is, alerts, alert rules, sensors, optics, CPU, BGP or OSPF sessions, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.8.0
+description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, neighbours, VLANs, where a MAC or IP address is, alerts, alert rules, sensors, optics, CPU, BGP or OSPF sessions, locations, device groups, services, maintenance windows, the eventlog, syslog, logins or bills in LibreNMS.
+version: 0.9.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -14,7 +14,7 @@ Six tools, one rule: **nothing is written to LibreNMS without a plan the user ha
 | Tool | Writes? | Use it to |
 |---|---|---|
 | `librenms_query` | no | Read any allowed API v0 GET path (devices, ports, faults, rules, logs, ...); `{"action": "status"}` for connectivity, version and write mode |
-| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), `port` (one port in depth), `capacity` (free ports), `neighbours` (LLDP/CDP links and mismatches), `locate` (where an IP or MAC is), `vlans` (VLANs and their ports), `alerts` (what is alerting now), `alert_history` (what alerted over a window), `health` (sensors, optics, CPU, memory against their limits), `routing` (BGP and OSPF sessions), with a summary and named rows; `help` (with `topic`, a view) says what a view takes and returns |
+| `librenms_report` | no | Answer a question in one call: view `find` (what a name, IP or phrase could mean), `devices` (state, down since, uptime, last poll, naming checks), `ports` (state, speed, utilisation, errors, last change), `port` (one port in depth), `capacity` (free ports), `neighbours` (LLDP/CDP links and mismatches), `locate` (where an IP or MAC is), `vlans` (VLANs and their ports), `alerts` (what is alerting now), `alert_history` (what alerted over a window), `health` (sensors, optics, CPU, memory against their limits), `routing` (BGP and OSPF sessions), `events` (the eventlog, syslog or logins over a window; port flaps), `bills` (95th percentile against the commit), with a summary and named rows; `help` (with `topic`, a view) says what a view takes and returns |
 | `librenms_plan` | no | Turn desired changes into a diff, preconditions and a `plan_id` |
 | `librenms_apply` | yes | Execute a reviewed plan step by step; automatic rollback on failure; `dry_run` re-checks only |
 | `librenms_rollback` | yes | Revert an applied or failed plan from its journal, newest step first |
@@ -121,6 +121,26 @@ answer small.
   (`{"remote_as": "AS65001"}`: `up_for`; `down_for` and `last_error` for one that is down) and "which
   OSPF neighbours are not Full" (`{"protocol": "ospf", "not_established": true}`). `twoWay` is normal
   between two routers that are neither DR nor BDR: say so rather than call it down.
+- View `events` answers "what changed on sw1 in the last hour" (`scope` the device, `window` `1h`:
+  the eventlog, newest first, with the port an entry is about and `username` when a person or API
+  token made the change), "how many ports flapped today" (`window` `today`, `filter` `{"type":
+  "interface", "by": "port"}`, `sort` `most`: per port `status_changes`, `went_down` and `flaps`, back up
+  after going down; `summary.ports_flapped`), "when did Gi1/0/5 on sw1 last change state" (`filter`
+  `{"port": "Gi1/0/5", "by": "port"}` with the device and a long enough window: `last_status`,
+  `last_change`; view `port` gives `last_change_age` from the device's own counter too), "syslog
+  errors from edge-rtr1 today" (`filter` `{"log": "syslog", "min_severity": "error"}`: err and worse;
+  `min_severity` puts eventlog and syslog severities on one scale), "which ports went err-disabled"
+  (`{"log": "syslog", "text": "err-disable"}`: only devices that send syslog say so) and "who logged
+  into LibreNMS today" (`{"log": "authlog"}`, no scope: `summary.users` with logins and addresses; API
+  token use is not in it). LibreNMS reads a port's state every poll, about five minutes apart, so a
+  shorter bounce may not be logged; it logs port changes at severity notice, so `min_severity`
+  warning or above leaves them out. `window` is as `alert_history`'s, and so is `exact`.
+- View `bills` answers "95th percentile versus commit for the transit bill" (`filter` `{"text":
+  "transit"}`: `rate_95th`, `commit`, `used_pct`), "which bills are over their commit" (`{"over":
+  true}`; `overuse`), and the same for last month (`{"period": "previous"}`: the last billing period
+  that ended, against the commit it had then). A quota bill counts bytes (`used`, `quota`). The 95th
+  percentile is of the bill's ports together over its billing period (`period_from`, `period_to`),
+  as of `last_calculated`; it is the only traffic history the API keeps.
 - `stale: true` on a health or routing row means its device was not polled lately: the reading or
   state is the last LibreNMS saw, say so.
 - View `help` lists the views; with `topic` (a view's name) it gives that view's filters, sorts, row
@@ -139,11 +159,11 @@ answer small.
   down or unreachable): its figures are old, say so. `state` `disabled` is a port shut down on purpose,
   not a fault. `last_change_age` "over 100d 0h" means it has not changed since the device booted.
 - What LibreNMS's API cannot tell: a port's traffic history, averages or 95th percentile over a week (only
-  bills have that), a sensor's or CPU's history (only the last reading), what a state sensor's number
-  means, which ports are err-disabled (LibreNMS shows them as down), how often a port
-  flapped (the eventlog, `librenms_query` `logs/eventlog/<hostname>`, has the changes), which ports
-  could run faster than they do (it keeps the speed a port runs at, not what it or its optic can do)
-  and IPv6 neighbours. Say so rather than guess.
+  bills have that, for their ports over their billing period: view `bills`), a sensor's or CPU's history
+  (only the last reading), what a state sensor's number means, which ports are err-disabled (LibreNMS
+  shows them as down; only the device's syslog says so, when it sends syslog: view `events`), which
+  ports could run faster than they do (it keeps the speed a port runs at, not what it or its optic can
+  do) and IPv6 neighbours. Say so rather than guess.
 - Reading raw port rows with `librenms_query` instead, name the columns in `params.columns` (LibreNMS
   sends only `ifName` without them), e.g. `port_id,ifName,ifAlias,ifAdminStatus,ifOperStatus,ifSpeed,`
   `port_descr_speed,ifInOctets_rate,ifOutOctets_rate,ifInErrors_delta,ifOutErrors_delta`, and mind the

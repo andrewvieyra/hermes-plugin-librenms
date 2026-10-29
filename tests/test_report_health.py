@@ -340,14 +340,23 @@ class Routing(HealthCase):
         self.assertEqual((out["count"], self.paths()[-1]), (0, "resources/locations"))
 
     def test_ospfv3_neighbours_and_a_failure(self):
+        # LibreNMS stores an OSPFv3 neighbour's router id as an unsigned int (198.51.100.2), unlike OSPF's dotted one
         self.fake.seed("ospfv3_nbrs", {
-            "device_id": 1, "port_id": 2, "ospfv3NbrRtrId": "198.51.100.2", "ospfv3NbrState": "full",
-            "ospfv3NbrAddress": "fe80:0000:0000:0000:0000:0000:0000:0002", "ospfv3NbrPriority": 1, "ospfv3NbrEvents": 6,
+            "device_id": 1, "port_id": 2, "router_id": "198.51.100.1", "ospfv3NbrRtrId": 3325256706,
+            "ospfv3NbrState": "full", "ospfv3NbrAddress": "fe80:0000:0000:0000:0000:0000:0000:0002",
+            "ospfv3NbrPriority": 1, "ospfv3NbrEvents": 6,
         })  # fmt: skip
         out = self.report(view="routing", filter={"protocol": "ospfv3"})
         [row] = out["rows"]
         self.assertEqual((row["peer"], row["router_id"], row["established"], row["port"]),
                          ("fe80::2", "198.51.100.2", True, "Gi1/0/2"))  # fmt: skip
+        out = self.report(view="routing", filter={"protocol": "ospfv3", "text": "198.51.100.2"})
+        self.assertEqual(self.ids(out, "neighbour_id"), [row["neighbour_id"]])  # found by the router id as written
+        self.assertEqual(self.report(view="routing", filter={"text": "198.51.100.1"})["count"], 0)  # the device's own
+        # a driver that hands the integer column back as a string; none and 0 are no router id; OSPF's is dotted
+        cases = (("3325256706", "198.51.100.2"), (0, None), (None, None), ("198.51.100.2", "198.51.100.2"))
+        for stored, shown in cases:
+            self.assertEqual(routing_mod._router_id(stored), shown, stored)
         self.fake.fail_on("GET", "ospfv3", 500)  # a real failure, not LibreNMS's word for none
         out = self.report(view="routing")
         self.assertEqual(

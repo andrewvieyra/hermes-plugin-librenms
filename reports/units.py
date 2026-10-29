@@ -8,13 +8,14 @@ which older LibreNMS releases also kept, is Mbit/s); ``port_descr_speed`` is the
 description, ``egress/ingress`` when it differs by direction (:func:`circuit_speeds`); ``ifLastChange`` is the
 device's sysUpTime, in hundredths of a second, when the port last went up or down. A sensor's ``sensor_current`` and
 its four limits are in the unit of its class (:data:`SENSOR_UNITS`: °C, dBm, V, ...); memory and storage sizes are
-bytes, shown with binary prefixes (:func:`size`).
+bytes, shown with binary prefixes (:func:`size`); bytes a bill counts, with decimal ones as LibreNMS's billing shows
+them (:func:`volume`).
 
 LibreNMS stamps times two ways: the device API in ISO-8601 UTC (``2026-10-28T11:55:02.000000Z``) and unix seconds
-(outages, port poll times), which are exact anywhere; the fault, alert-log, eventlog and syslog tables as the
-server's local ``Y-m-d H:i:s`` with no zone, which no API v0 field names (``system``'s ``local_date`` is the date of
-the LibreNMS commit). :func:`server_time` reads those in the operator's ``librenms_timezone`` and gives no time at
-all without one.
+(outages, port poll times), which are exact anywhere; the fault, alert-log, eventlog, syslog, authlog and bills tables
+as the server's local ``Y-m-d H:i:s`` with no zone, which no API v0 field names (``system``'s ``local_date`` is the
+date of the LibreNMS commit). :func:`server_time` reads those in the operator's ``librenms_timezone`` and gives no
+time at all without one; :func:`server_order` orders them either way.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ _SPEED_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(?:bit/s|bps|b)?\s*$", r
 _DURATION_RE = re.compile(r"^\s*(\d{1,6})\s*([smhdw])\s*$", re.IGNORECASE)
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 _SERVER_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+_ORDER_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 # LibreNMS's Number::toBytes: a number, an SI prefix and any unit after it, whose first letter "i" means powers of 1024
 _CIRCUIT_RE = re.compile(r"^([\d.]+)([KMGTPEZY]?)(\w?)\w*$", re.IGNORECASE | re.ASCII)
 _SI_POWERS = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6, "Z": 7, "Y": 8}
@@ -124,6 +126,13 @@ def size(value: Any) -> str | None:
             shown = found / factor
             return f"{shown:.3g} {name}" if shown < 1000 else f"{shown:.0f} {name}"  # 1023.9 MiB, never 1.02e+03
     return f"{found:.0f} B"
+
+
+def volume(value: Any) -> str | None:
+    """Bytes transferred with a decimal prefix, as LibreNMS's billing shows them (its default ``billing.base``,
+    1000): ``300 TB``; None for no number or a negative one."""
+    found = number(value)
+    return None if found is None or found < 0 else _scaled(found, "B")
 
 
 def parse_speed(text: Any) -> int | None:
@@ -251,6 +260,13 @@ def server_time(value: Any, zone: tzinfo | None) -> datetime | None:
         except ValueError:
             return None
     return utc_time(value)
+
+
+def server_order(value: Any) -> int:
+    """A fault or log time as an order key: a server-local ``Y-m-d H:i:s`` as the number its digits make (the times
+    of one LibreNMS share its zone, so they order as they read, zone known or not); 0, first, for none."""
+    found = _ORDER_RE.match(value) if isinstance(value, str) else None
+    return int("".join(found.groups())) if found else 0
 
 
 def age(moment: datetime | None, now: datetime) -> int | None:

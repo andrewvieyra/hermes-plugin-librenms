@@ -6,6 +6,81 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-29
+
+### Added
+- View `events` of `librenms_report`: what LibreNMS logged over `window` (`1h`, `24h` by default, `7d`, `30d`, any
+  duration up to a year, or `today` with `librenms_timezone`), newest first, from the log `filter.log` names: the
+  eventlog (the default), the syslog, or the authlog (logins to LibreNMS's web interface, which belong to no
+  device: no scope, and the window is placed by LibreNMS's clock from a `ping` read). Rows per entry (`filter.by`
+  `event`: `entry_id`, `time` with its age, the device; eventlog `type`, `severity` (LibreNMS's `Severity`,
+  `unknown` to `error`), `message`, `port_id` and `port` for an `interface` entry (named for the page),
+  `reference`, `username`; syslog `severity` (`emerg` to `debug`, from `level`, else `priority`, as the name
+  syslog-ng writes or the number rsyslog writes), `facility`, `program`, `tag` (when it differs from the program),
+  `message`; authlog `user`, `address`, `result`), per `device` (entries, `by_severity`, `top_type` or
+  `top_program`, the latest entry), or per `port` from the eventlog's `ifOperStatus: up -> down` entries:
+  `status_changes`, `went_down`, `flaps` (back up after going down within the window), `last_status`, `last_change`
+  with its age, `last_message`. Filters `log`, `by`, `min_severity` (eventlog and syslog on one scale: `debug`,
+  `info`, `notice`, `warning`, `error`, `critical`; an eventlog entry of unknown severity passes none), `type`
+  (eventlog), `program` (syslog, part of the program or tag), `port` (eventlog: a name, long or short, on the
+  devices whose ports logged a change, or a port_id; a number is both, as HP and Aruba switches name their ports
+  `5`, and with one device in scope it is that device's port of that name, as in view `port`; a note says when it
+  matched no port, or both a port_id and ports of that name), `text`; a filter, scope or `by` that does not apply
+  to the log asked for is refused, naming the log it is for. Sorts `newest`, `oldest`, `most`, `name`. `summary`:
+  the window and the bound sent (`from`, `exact`), `logged`, `entries`, `devices`, `by_severity`, `top_devices`,
+  `by_type`, `by_program` or `by_result`; for the eventlog `ports_changed`, `ports_went_down`, `ports_flapped` and
+  `top_ports`, for the authlog `users_logged_in` and `users` (logins, entries, addresses, the last login). Notes
+  say that LibreNMS reads a port's state once a poll (a shorter bounce may not be logged), that it logs a port's
+  changes at notice (a higher `min_severity` leaves them out), that the authlog holds web logins and not token use,
+  and where syslog comes from. With `librenms_timezone` times are ISO-8601 with the offset and an age, and the
+  window starts exactly; without it they are shown as LibreNMS wrote them, with no age, the window is read from a
+  bound early enough for any zone (`exact: false`, with a note), and `today` is refused. A log's text (`message`,
+  `type`, `program`, `tag`, `username`, a login's `user` and `address`) is named in `untrusted_fields`, per log,
+  escaped and clipped to 200 characters.
+- View `bills`: each bill LibreNMS keeps, from one `bills` read (`period=previous` for `filter.period`
+  `previous`: the last billing period that ended within 40 days, measured against the commit or quota it had then,
+  from its history row, where LibreNMS's own `percent` for it uses today's). CDR rows: `commit_bps`/`commit`,
+  `rate_95th_bps`/`rate_95th` (the one billed), inbound and outbound, `direction` (`in`, `out`, `aggregate`);
+  quota rows: `quota_bytes`/`quota`, `used_bytes`/`used` (decimal prefixes, as LibreNMS's billing shows bytes);
+  both: `used_pct` (to two places, as LibreNMS rounds it), `over`, `overuse_bps` or `overuse_bytes` with
+  `overuse`, the average rate, the bytes `transferred`, `period_from` and `period_to` (the current period from the
+  bill's day of the month as LibreNMS's `Billing::getDates` counts it on the day of its last calculation, PHP's
+  date roll-over included), `last_calculated` with its age, and the bill's ports with their devices (10 at most,
+  then `ports_total`), and its `customer`, `reference` and `note` (its notes: text from people, named in
+  `untrusted_fields`). A bill without a commit or quota has `used_pct` and `over` null, with a note. A scope keeps
+  the bills with a port on a device in it. Filters `period`, `over`, `type` (`cdr`, `quota`), `used_above_pct`,
+  `text` (name, customer id, reference, notes, ports, their devices); sorts `used_pct` (fullest first), `name`,
+  `rate_95th`. `summary`: `period`, `bills`, `over`, `by_type`, `without_commit`, `fullest`.
+- View `help` explains both (filters, sorts, rows, summary, examples, which the tests run); its `units` line names
+  `*_bytes` and its `window` line `events`.
+- The operator questions of the conversational audit about recent changes, flaps, syslog errors, logins, the 95th
+  percentile and bills, each answered in one or two calls and tested as such (tests/test_report_events.py): what
+  changed on sw1 in the last hour (55), how many ports flapped today (6), when a port last changed state (5),
+  syslog errors from a device today (56), which ports went err-disabled (7, from syslog), who logged into LibreNMS
+  today (57), the 95th percentile against commit for the transit bill (13), the bills over commit in this period
+  and the last (54), and a port's 95th percentile, which only a bill holds, over its billing period (12).
+- The fake LibreNMS answers `logs/authlog` (its own columns, no device's) and `bills` for quota bills and with
+  `period=previous` (each bill joined to its latest history row that ended within 40 days, with that row's
+  traffic and update time under the current period's names, and LibreNMS's `percent` against today's commit),
+  from new `authlog` and `bill_history` tables.
+
+### Changed
+- `alert_history` and `events` read their log through one shared reader, `ReportContext.read_log` (the paging,
+  the halving while an answer is too large to read, the caps and the partial reasons `alert_history` had; its
+  paging constants are now `reports.context.LOG_PAGE` and `LOG_MIN_PAGE`); every view shows a server-local time
+  through `ReportContext.when` (the `port` view's open faults too) and names the device of a log row through
+  `row_device`. `ReportContext.clock()` reads LibreNMS's clock from `ping`, its smallest answer, for a view that
+  places its window before any other read. `names_port` can leave the port_id out (`by_id=False`).
+- The refusal of a `window` names both views that take one.
+- The tool description names `events` and `bills` and the `*_bytes` unit; the six schemas take 14,518 of their
+  16,384 bytes.
+
+### Fixed
+- View `routing` writes an OSPFv3 neighbour's router id dotted (`198.51.100.2`): LibreNMS stores
+  `ospfv3NbrRtrId` as its 32-bit number (an `int unsigned`, `3325256706`), which 0.8.0 showed as it was, and
+  `filter.text` now finds the neighbour by its dotted router id. The fake's `ospfv3_nbrs` holds the columns the
+  table has, and the router id as that integer.
+
 ## [0.8.0] - 2026-10-29
 
 ### Added

@@ -146,9 +146,10 @@ class ReportRoutes(HandlerCase):
         self.assertFalse(out["success"])
         self.assertEqual((out["librenms"]["status"], out["librenms"]["body"]["message"]),
                          (500, "Error retrieving ospfv3_nbrs"))  # fmt: skip
-        self.fake.seed("ospfv3_nbrs", {"device_id": 1, "ospfv3NbrRtrId": "198.51.100.2", "ospfv3NbrState": "full"})
+        # the router id as LibreNMS stores it, an unsigned int (198.51.100.2); librenms_query returns it as read
+        self.fake.seed("ospfv3_nbrs", {"device_id": 1, "ospfv3NbrRtrId": 3325256706, "ospfv3NbrState": "full"})
         out = self.query("ospfv3", params={"hostname": "core-sw1.example.net"}, fields=["ospfv3NbrRtrId"])
-        self.assertEqual(out["results"], [{"ospfv3NbrRtrId": "198.51.100.2"}])
+        self.assertEqual(out["results"], [{"ospfv3NbrRtrId": 3325256706}])
 
     def test_syslog_and_the_alert_log_page_with_a_total(self):
         out = self.query("logs/syslog/edge-rtr1.example.net", limit=1, fields=["seq", "msg"])

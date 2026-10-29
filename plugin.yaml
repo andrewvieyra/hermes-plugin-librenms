@@ -1,5 +1,5 @@
 name: librenms
-version: 0.8.0
+version: 0.9.0
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"
@@ -75,7 +75,7 @@ config_schema:
   librenms_timezone:
     type: str
     default: ""
-    description: "The IANA time zone LibreNMS runs in (its PHP date.timezone), e.g. Europe/Amsterdam. LibreNMS writes fault, alert-log, eventlog and syslog times in that zone without saying which, and no API field names it. Every librenms_report result names this zone (timezone), or says it is unknown while this is empty; the views that show fault and log times (alerts, alert_history, the port view's open faults, and events in a later release) read them in it, and give them no age without it (alert_history then reads its window from a bound early enough for any zone, and refuses today). Every other time a report shows (device times in ISO UTC, outages and port polls in unix seconds, uptimes, the age of a port's last change) is exact either way. A name this host's zone database does not hold is refused."
+    description: "The IANA time zone LibreNMS runs in (its PHP date.timezone), e.g. Europe/Amsterdam. LibreNMS writes fault, alert-log, eventlog, syslog, authlog and billing times in that zone without saying which, and no API field names it. Every librenms_report result names this zone (timezone), or says it is unknown while this is empty; the views that show fault, log and billing times (alerts, alert_history, the port view's open faults, events, a bill's last calculation) read them in it, and give them no age without it (alert_history and events then read their window from a bound early enough for any zone, and refuse today). Every other time a report shows (device times in ISO UTC, outages and port polls in unix seconds, uptimes, the age of a port's last change) is exact either way. A name this host's zone database does not hold is refused."
   max_plan_age_hours:
     type: int
     default: 24

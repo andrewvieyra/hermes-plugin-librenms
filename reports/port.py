@@ -302,17 +302,13 @@ def _alerts(ctx: ReportContext, port_id: int) -> List[Dict[str, Any]] | None:
     for fault in rows_of(faults):
         if fault.get("entity_type") not in PORT_ENTITIES or str(fault.get("entity_id")) != str(port_id):
             continue
-        seen = units.server_time(fault.get("first_seen"), ctx.zone)
-        age = units.age(seen, ctx.now)
         state = int(fault["state"]) if is_digits(fault.get("state")) else None
         out.append({
             "alert_id": fault.get("id"),
             "rule": fault.get("name"),
             "severity": fault.get("severity"),
             "state": FAULT_STATES.get(state, fault.get("state")),
-            "first_seen": units.iso(seen) if seen is not None else fault.get("first_seen"),
-            "first_seen_age_s": age,
-            "first_seen_age": units.duration(age),
+            **ctx.when(fault.get("first_seen"), "first_seen"),
             "note": fault.get("note") or None,
         })  # fmt: skip
     out.sort(key=lambda item: natural_key(str(item["alert_id"])))

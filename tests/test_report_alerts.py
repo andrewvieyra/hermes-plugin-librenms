@@ -120,14 +120,15 @@ class Help(AlertCase):
             self.assertFalse(out["success"], args)
             self.assertIn(said, out["error"])
         self.assertIn("view must be one of find, devices, ports, port, capacity, neighbours, locate, vlans, alerts, "
-                      "alert_history, health, routing, help", self.report(view="graphs")["error"])  # fmt: skip
+                      "alert_history, health, routing, events, bills, help",
+                      self.report(view="graphs")["error"])  # fmt: skip
 
 
 class Window(AlertCase):
     def test_a_window_only_where_a_view_takes_one(self):
         for args, said in (
-            ({"view": "alerts", "window": "24h"}, "window is for view alert_history; view alerts reads what LibreNMS "
-                                                  "holds now"),
+            ({"view": "alerts", "window": "24h"}, "window is for views alert_history and events; view alerts reads "
+                                                  "what LibreNMS holds now"),
             ({"view": "alert_history", "window": "yesterday"}, "window takes today or a duration such as 1h, 24h"),
             ({"view": "alert_history", "window": "400d"}, "window takes today or a duration"),
             ({"view": "alert_history", "window": "today"}, "window today needs librenms_timezone"),

@@ -15,7 +15,9 @@ established, or since it last went down; 0 when it never was since the router bo
 plus the time since that poll; ``last_error`` (LibreNMS's text, else the name of the BGP error code: it may predate
 the current session); addresses as IPv6 is written short. OSPF: ``established`` is ``full``; ``twoWay`` is the
 steady state between two routers that are neither DR nor BDR on a broadcast network, which a note says when one
-shows. The interface an OSPF neighbour is on is named from its device's port names, for the rows of the page.
+shows; the router id dotted, as OSPF writes it (LibreNMS stores an OSPFv3 neighbour's as its 32-bit number, and its
+peer address is link-local, so the router id is what names it). The interface an OSPF neighbour is on is named from
+its device's port names, for the rows of the page.
 
 ``not_established`` keeps what LibreNMS alarms on (``BgpPeer::inAlarm``): a BGP session that is enabled and not
 established, an OSPF neighbour that is not full. ``stale``: the device has not been polled lately, so its sessions'
@@ -238,13 +240,24 @@ def _ospf(ctx: ReportContext, devices: Dict[int, Dict[str, Any]], nbr: Dict[str,
     address = nbr.get("ospfNbrIpAddr") if protocol == "ospf" else nbr.get("ospfv3NbrAddress")
     port_id = _id(nbr.get("port_id")) or None
     row: Dict[str, Any] = {**brief(device), "protocol": protocol, "neighbour_id": nbr.get("id")}
-    row.update(peer=_address(address), router_id=nbr.get(f"{prefix}RtrId") or None, state=state)
+    row.update(peer=_address(address), router_id=_router_id(nbr.get(f"{prefix}RtrId")), state=state)
     row.update(established=state == "full", port_id=port_id, port=None, priority=_whole(nbr.get(f"{prefix}Priority")))
     row.update(events=_whole(nbr.get(f"{prefix}Events")), retransmit_queue=_whole(nbr.get(f"{prefix}LsRetransQLen")))
     if nbr.get("context_name"):
         row["context"] = nbr["context_name"]
     row["stale"] = device_stale(device, ctx.now)
     return _Session(row, state != "full", _folded(row))
+
+
+def _router_id(value: Any) -> Any:
+    """An OSPF router id dotted, as it is written: LibreNMS stores an OSPFv3 neighbour's as the 32-bit number
+    (``167797515``, 10.0.99.11) and an OSPF one's dotted already; None for none (0 is not a router id)."""
+    if is_digits(value):
+        number = int(value)
+        if not number:
+            return None
+        return str(ipaddress.IPv4Address(number)) if number <= 0xFFFFFFFF else value
+    return value or None
 
 
 def _folded(row: Dict[str, Any]) -> str:

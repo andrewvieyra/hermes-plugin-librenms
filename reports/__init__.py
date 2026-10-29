@@ -12,16 +12,18 @@ in use and free per device), :mod:`.port` (one port in depth), :mod:`.neighbours
 ports and mismatch checks), :mod:`.locate` (where an IP or MAC address is: the switch port and the ARP entries),
 :mod:`.vlans` (VLANs per device, and the ports in one), :mod:`.alerts` (``alerts``: what is alerting now;
 ``alert_history``: what alerted over a window), :mod:`.health` (sensors, optics, processors, memory and storage
-against their limits) and :mod:`.routing` (BGP sessions and OSPF neighbours). View ``help`` (:mod:`.help`) says what
-each view takes and returns, without a LibreNMS call. Shared pieces: :mod:`.context` (reads, budgets, scope,
-envelope), :mod:`.fuzzy` (ranking) and :mod:`.units` (units and times).
+against their limits), :mod:`.routing` (BGP sessions and OSPF neighbours), :mod:`.events` (the eventlog, syslog or
+authlog over a window: each entry, or per device or port) and :mod:`.bills` (each bill's 95th percentile or traffic
+against its commit or quota). View ``help`` (:mod:`.help`) says what each view takes and returns, without a
+LibreNMS call. Shared pieces: :mod:`.context` (reads, budgets, scope, envelope), :mod:`.fuzzy` (ranking) and
+:mod:`.units` (units and times).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from . import alerts, devices, find, health, help, locate, neighbours, port, ports, routing, vlans
+from . import alerts, bills, devices, events, find, health, help, locate, neighbours, port, ports, routing, vlans
 from .context import Ambiguous, ArgumentError, CallBudget, ReportContext, ReportError, View, request
 
 __all__ = ["HELP", "VIEWS", "ArgumentError", "ReportError", "help_answer", "is_help", "run"]
@@ -31,7 +33,7 @@ VIEWS: Dict[str, View] = {
     view.name: view
     for view in (
         find.VIEW, devices.VIEW, ports.VIEW, port.VIEW, ports.CAPACITY, neighbours.VIEW, locate.VIEW, vlans.VIEW,
-        alerts.ALERTS, alerts.HISTORY, health.VIEW, routing.VIEW,
+        alerts.ALERTS, alerts.HISTORY, health.VIEW, routing.VIEW, events.VIEW, bills.VIEW,
     )
 }  # fmt: skip
 
