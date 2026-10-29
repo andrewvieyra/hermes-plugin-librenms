@@ -17,10 +17,10 @@ How the plugin maps onto the LibreNMS API v0, route by route: all 145 registrati
   #109, #111, #112, #114, #127, #137: `0`, a negative or a non-number; `poller_group/0` on #56),
   and a MAC that the exact-match routes compare with the stored 12 hex digits is sent in that form
   (#122, #131). Results are capped at `max_query_results` rows and `max_result_chars` characters
-  (rows past that are cut, saying how to see them), strings are clipped, and every
+  (rows past that are cut, with the `next_offset` to read them from), strings are clipped, and every
   credential-bearing key (SNMP communities and v3 passwords, service check parameters, tokens,
   keys) is masked at any depth. An answer larger than the client reads (16 MiB) is refused with
-  how to narrow that route: `limit` only on the logs routes, which LibreNMS pages.
+  how to narrow that route: `limit` and `offset` only on the logs routes, which LibreNMS pages.
 - **plan**: written only through a reviewed plan (`librenms_plan`, then `librenms_apply`), as the
   resource operation named. Every write path uses numeric ids, is verified by re-reading and has a
   journaled inverse or an explicit inverse kind. Operations behind a gate say which.
@@ -33,9 +33,16 @@ verifying a write or rolling back. Unknown paths are refused before anything is 
 does, so a path that would reach a refused route by shadowing (a mistyped device sub-path, for
 example) is refused as that route.
 
-Logs routes (`logs/*`) are paged: `limit` (default 50, at most `max_query_results`), `start`,
+Logs routes (`logs/*`) are paged by LibreNMS: `limit` (default 50, at most `max_query_results`),
+`offset` (sent as `start`; `params.start` is read alike, and refused when the two disagree),
 `sortorder` (`asc`/`desc`, sent as `ASC`/`DESC`; default `DESC`), `from`, `to`. A result is
-`truncated` while `total` exceeds `start` plus the rows returned. In every query,
+`truncated`, with `next_offset`, while `total` exceeds the offset plus the rows returned; `where` and
+`sort` are refused there, since they would see one page. Every other route sends all its rows, of
+which the query keeps those `where` holds for, orders them by `sort`, and shows `limit` of them from
+`offset` on (`get_device_ports` orders by `ifIndex` and `list_devices` by hostname, but
+`get_all_ports`, `list_sensors`, `list_links` and `list_fdb` have no `ORDER BY`, so their pages line
+up only when sorted by id); `params.start`, which only `list_logs` reads, is refused there, and
+`params.offset`, which no route reads, everywhere. In every query,
 `params` values must be text, numbers, booleans or lists of them (joined with commas), and
 `api_token` and `_method` are refused in any case, and also spelled with `.`, a space or `[`,
 which PHP turns into `_`. Every other name must be one PHP reads as written: a leading or inner

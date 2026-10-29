@@ -74,8 +74,8 @@ class StubClient:
         )
 
 
-def prepare(path, params=None, limit=None, client=None, settings=SETTINGS):
-    return routes.prepare(client or StubClient(), path, params, limit, settings)
+def prepare(path, params=None, limit=None, client=None, settings=SETTINGS, **paging):
+    return routes.prepare(client or StubClient(), path, params, limit, settings, **paging)
 
 
 def names():
@@ -195,11 +195,11 @@ class TooLargeHint(unittest.TestCase):
 
     def test_limit_is_offered_only_where_librenms_pages(self):
         self.assertEqual(
-            self.hint("logs/syslog"), "ask for fewer rows at a time with a smaller limit, and page with start"
+            self.hint("logs/syslog"), "ask for fewer rows at a time with a smaller limit, and page with offset"
         )
         for path in ("devices", "ports", "resources/sensors", "faults", "devices/sw1/ports", "resources/vlans"):
-            self.assertTrue(self.hint(path).endswith("(limit does not help here: LibreNMS sends every row and the "
-                                                     "limit applies after)"), path)  # fmt: skip
+            self.assertTrue(self.hint(path).endswith("(limit, offset, where and sort do not help here: LibreNMS sends "
+                                                     "every row and they apply after)"), path)  # fmt: skip
 
     def test_each_route_gets_the_narrowing_it_takes(self):
         self.assertIn("filter with params type and query", self.hint("devices"))
@@ -704,6 +704,61 @@ class Prepare(unittest.TestCase):
         with self.assertRaises(routes.QueryError):
             prepare("devices", limit="many")
 
+    def test_offset_is_sent_as_start_on_a_logs_route_and_kept_for_the_handler_elsewhere(self):
+        query = prepare("logs/syslog/sw1", offset=40, limit=10)
+        self.assertEqual((query.offset, query.params["start"], query.params["limit"]), (40, "40", "10"))
+        self.assertEqual(prepare("logs/syslog", {"start": "40"}).offset, 40)  # LibreNMS's own name pages too
+        self.assertEqual(prepare("logs/syslog", {"start": "40"}, offset="40").params["start"], "40")  # agreeing
+        self.assertEqual((prepare("logs/syslog").offset, prepare("logs/syslog", offset=0).params["start"]), (0, "0"))
+        query = prepare("devices/sw1/ports", offset=" 500 ")
+        self.assertEqual((query.offset, query.params), (500, {}))  # applied to the rows read, never sent
+        self.assertEqual(prepare("ports").offset, 0)
+        for path, params, offset, message in (
+            ("devices", None, -1, "offset must be 0 or more (got -1): it counts the rows to skip"),
+            ("logs/eventlog", None, "-3", "offset must be 0 or more (got -3): it counts the rows to skip"),
+            ("devices", None, "next", "offset must be an integer (got 'next')"),
+            ("devices", None, 2.5, "offset must be an integer (got '2.5')"),
+            ("logs/eventlog", {"start": 10}, 20, "offset 20 and params.start 10 disagree; page with offset alone"),
+            (
+                "devices/sw1/ports",
+                {"start": 500},
+                None,
+                "LibreNMS's get_device_ports does not read params.start (it pages the logs routes only), so it would "
+                "answer with the first rows again; page with offset, which is applied to the rows read",
+            ),
+            (
+                "logs/eventlog",
+                {"offset": 5},
+                None,
+                "LibreNMS reads no params.offset; page with the offset argument (a result's next_offset)",
+            ),
+        ):
+            with self.assertRaises(routes.QueryError, msg=(path, params, offset)) as caught:
+                prepare(path, params, offset=offset)
+            self.assertEqual(str(caught.exception), message)
+
+    def test_where_and_sort_are_refused_on_a_logs_route_which_librenms_pages(self):
+        for row_args in (("where",), ("sort",), ("where", "sort")):
+            with self.assertRaises(routes.QueryError) as caught:
+                prepare("logs/syslog", row_args=row_args)
+            self.assertEqual(
+                str(caught.exception),
+                f"{' and '.join(row_args)} cannot apply to logs/syslog: LibreNMS pages the logs routes itself, so "
+                "they would see one page only; narrow with the device path (logs/syslog/<hostname>) and params "
+                "from/to (a time or an id), order with params.sortorder (asc/desc), and page with offset",
+            )
+        # the device path where the route has one and the query is not on it yet (logs/authlog has none)
+        for path, device in (
+            ("logs/alertlog", "the device path (logs/alertlog/<hostname>) and "),
+            ("logs/eventlog/", "the device path (logs/eventlog/<hostname>) and "),
+            ("logs/syslog/sw1", ""),
+            ("logs/authlog", ""),
+        ):
+            with self.assertRaises(routes.QueryError, msg=path) as caught:
+                prepare(path, row_args=("sort",))
+            self.assertIn(f"; narrow with {device}params from/to (a time or an id), ", str(caught.exception))
+        self.assertEqual(prepare("devices/sw1/ports", row_args=("where", "sort")).request_path, "devices/12/ports")
+
     def test_refusals_come_before_any_lookup(self):
         client = StubClient()
         for path, params, limit in (
@@ -711,9 +766,13 @@ class Prepare(unittest.TestCase):
             ("devices/sw1/ports", {"api_token": "x"}, None),
             ("logs/eventlog/sw1", None, "x"),
             ("logs/eventlog/sw1", {"sortorder": "sideways"}, None),
+            ("devices/sw1/ports", {"start": 50}, None),
         ):
             with self.assertRaises(routes.QueryError):
                 routes.prepare(client, path, params, limit, SETTINGS)
+        for offset, row_args in ((-1, ()), ("x", ()), (None, ("where",))):
+            with self.assertRaises(routes.QueryError):
+                routes.prepare(client, "logs/eventlog/sw1", None, None, SETTINGS, offset=offset, row_args=row_args)
         self.assertEqual(client.asked, [])
 
 

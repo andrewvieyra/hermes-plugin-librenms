@@ -292,7 +292,9 @@ class TooLarge(HandlerCase):
             )
         )
         self.assertTrue(
-            out["error"].endswith("(limit does not help here: LibreNMS sends every row and the limit applies after)")
+            out["error"].endswith(
+                "(limit, offset, where and sort do not help here: LibreNMS sends every row and they apply after)"
+            )
         )
         self.assertNotIn("columns", out["error"])
         out = self.call("librenms_query", path="devices/core-sw1.example.net/ports", params={"columns": "port_id"})
@@ -301,6 +303,6 @@ class TooLarge(HandlerCase):
         out = self.call("librenms_query", path="logs/eventlog/core-sw1.example.net")
         self.assertTrue(
             out["error"].endswith(
-                "narrow the query: ask for fewer rows at a time with a smaller limit, and page with start"
+                "narrow the query: ask for fewer rows at a time with a smaller limit, and page with offset"
             )
         )

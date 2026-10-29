@@ -11,7 +11,8 @@ and refuses a ``hostname`` param on a route that does not read it: LibreNMS answ
 filters, and a param a route ignores, with every device's rows. Likewise it refuses an object id LibreNMS would read
 as no filter (``faults/0``, ``poller_group/0``) or as another id (``ports/1abc``), a params name PHP would read as
 another name (`` limit``, ``hostname[]``), and a MAC that the exact-match MAC routes could never find; and it trims
-the column lists LibreNMS would otherwise fail on.
+the column lists LibreNMS would otherwise fail on. It sends ``offset`` as ``start`` on the logs routes, the only ones
+LibreNMS pages, and refuses a ``start`` param on any other, which would answer with its first rows again.
 """
 
 from __future__ import annotations
@@ -50,13 +51,15 @@ class Route:
 
 @dataclass
 class PreparedQuery:
-    """What :func:`prepare` hands the handler: ``client.get(request_path, params)``, then at most ``limit`` rows."""
+    """What :func:`prepare` hands the handler: ``client.get(request_path, params)``, then at most ``limit`` rows from
+    ``offset`` on (sent as ``start`` on a logs route, which LibreNMS pages)."""
 
     route: Route
     request_path: str  # encoded segments, device references replaced by ids
     params: Dict[str, str]
     limit: int
     path: str = ""  # the normalised path as the model gave it (hostnames, not ids)
+    offset: int = 0
 
 
 _DEVICE = ("hostname",)
@@ -451,6 +454,13 @@ def _limit(value: Any, cap: int) -> int:
     return max(1, min(DEFAULT_LIMIT if value is None else _integer("limit", value), cap))
 
 
+def _offset(value: Any) -> int:
+    number = _integer("offset", value)
+    if number < 0:
+        raise QueryError(f"offset must be 0 or more (got {number}): it counts the rows to skip")
+    return number
+
+
 def _sortorder(value: str | None) -> str:
     """``ASC`` or ``DESC`` exactly: LibreNMS sorts descending only for the exact string ``DESC``."""
     if value is None:
@@ -521,9 +531,10 @@ def _unknown_hostname(client: Any, value: str) -> str:
 
 def too_large_hint(route: Route, normalised: str) -> str:
     """How to get *route*'s answer under the client's size cap. ``limit`` helps only on the logs routes, which LibreNMS
-    pages; everywhere else it sends every row and the limit applies to what was read, so a smaller one fails alike."""
+    pages; everywhere else it sends every row and the limit applies to what was read, as do ``offset``, ``where`` and
+    ``sort``, so asking with them fails alike."""
     if route.paginated:
-        return "ask for fewer rows at a time with a smaller limit, and page with start"
+        return "ask for fewer rows at a time with a smaller limit, and page with offset"
     hints = []
     if route.columns:
         hints.append("select fewer columns with params.columns (e.g. port_id,ifName,ifOperStatus)")
@@ -536,7 +547,9 @@ def too_large_hint(route: Route, normalised: str) -> str:
         hints.append(f"query the path '{where}' for one device's rows")
     if not hints:
         hints.append("read one object's or one device's path instead")
-    return "; ".join(hints) + " (limit does not help here: LibreNMS sends every row and the limit applies after)"
+    return "; ".join(hints) + (
+        " (limit, offset, where and sort do not help here: LibreNMS sends every row and they apply after)"
+    )
 
 
 # Where a fleet-wide route has a per-device counterpart elsewhere in the tree.
@@ -577,13 +590,24 @@ def _request_path(route: Route, values: Dict[str, str]) -> str:
     return "/".join(pieces)
 
 
-def prepare(client: Any, path_: Any, params: Any, limit: Any, settings: Any) -> PreparedQuery:
-    """Everything between the model's ``path``/``params``/``limit`` and the request: normalise and match the path,
-    check and join the params, apply the logs defaults and every clamp, check object ids, normalise MACs and column
-    lists, resolve device references (path params and ``?hostname=``) to ids, and build the request path from
+def prepare(
+    client: Any,
+    path_: Any,
+    params: Any,
+    limit: Any,
+    settings: Any,
+    offset: Any = None,
+    row_args: Tuple[str, ...] = (),
+) -> PreparedQuery:
+    """Everything between the model's ``path``/``params``/``limit``/``offset`` and the request: normalise and match
+    the path, check and join the params, apply the logs defaults and every clamp, check object ids, normalise MACs and
+    column lists, resolve device references (path params and ``?hostname=``) to ids, and build the request path from
     encoded segments. A ``hostname`` param on a route that does not read it is refused: LibreNMS would ignore it and
-    return every device's rows. Local checks run before any lookup is sent. Every refusal is a QueryError; a failed
-    lookup other than 403/404 raises the LibreNMSError."""
+    return every device's rows. ``offset`` is sent as ``start`` on a logs route and applied by the handler to the rows
+    read elsewhere, where a ``start`` param, which LibreNMS ignores there, is refused; *row_args* names the other
+    arguments the handler applies to the rows read (``where``, ``sort``), which a logs route refuses: LibreNMS pages
+    it, so they would see one page. Local checks run before any lookup is sent. Every refusal is a QueryError; a
+    failed lookup other than 403/404 raises the LibreNMSError."""
     normalised = normalise(path_)
     route, values = match(normalised)
     query = _query(params)
@@ -593,6 +617,8 @@ def prepare(client: Any, path_: Any, params: Any, limit: Any, settings: Any) -> 
             f"LibreNMS's {route.name} does not read params.hostname, so it would return every device's rows"
             + (f"; query the path '{where}' for one device's rows" if where else "")
         )
+    if "offset" in query:
+        raise QueryError("LibreNMS reads no params.offset; page with the offset argument (a result's next_offset)")
     for name in route.id_params:
         if name in values:
             values[name] = _object_id(route, name, values[name])
@@ -610,16 +636,34 @@ def prepare(client: Any, path_: Any, params: Any, limit: Any, settings: Any) -> 
         if not values["field"]:
             raise QueryError("ports/search/{field}/{search} needs column names in {field}, e.g. ifAlias,ifName")
     cap = settings.max_query_results
+    skip = None if offset is None else _offset(offset)
     if route.paginated:
+        if row_args:
+            device = _device_filter_path(normalised)  # logs/syslog/<hostname>; none on logs/authlog or a device's path
+            raise QueryError(
+                f"{' and '.join(row_args)} cannot apply to {normalised}: LibreNMS pages the logs routes itself, so "
+                "they would see one page only; narrow with "
+                + (f"the device path ({device}) and " if device else "")
+                + "params from/to (a time or an id), order with params.sortorder (asc/desc), and page with offset"
+            )
         count = _limit(query.get("limit") if limit is None else limit, cap)
+        start = max(0, _integer("start", query["start"])) if query.get("start") else None
+        if skip is not None and start is not None and skip != start:
+            raise QueryError(f"offset {skip} and params.start {start} disagree; page with offset alone")
+        skip = start if skip is None else skip
         query["limit"] = str(count)
-        query["start"] = str(max(0, _integer("start", query.get("start") or 0)))
+        query["start"] = str(skip or 0)
         query["sortorder"] = _sortorder(query.get("sortorder"))
     else:
+        if "start" in query:
+            raise QueryError(
+                f"LibreNMS's {route.name} does not read params.start (it pages the logs routes only), so it would "
+                "answer with the first rows again; page with offset, which is applied to the rows read"
+            )
         count = _limit(limit, cap)
     for name in route.device_params:
         if name in values:
             values[name] = _device_id(client, values[name])
     if "hostname" in query:
         query["hostname"] = _device_id(client, query["hostname"])
-    return PreparedQuery(route, _request_path(route, values), query, count, normalised)
+    return PreparedQuery(route, _request_path(route, values), query, count, normalised, skip or 0)

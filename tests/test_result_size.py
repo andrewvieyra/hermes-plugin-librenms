@@ -5,6 +5,7 @@ rollback are shown a range of steps at a time with ``next_offset``; the operator
 
 import json
 import re
+import unittest
 
 from .helpers import submodule
 from .test_handlers import HandlerCase
@@ -39,23 +40,63 @@ class Listings(HandlerCase):
         self.assertEqual(
             out["note"],
             f"cut at {out['returned']} of 1004 rows to stay within max_result_chars ({BUDGET} characters): name only "
-            "the keys you need in fields, or narrow the query (a smaller limit returns the same first rows)",
+            f"the keys you need in fields, or read on with offset {out['returned']}",
         )
+        self.assertEqual(out["next_offset"], out["returned"])  # the first row not shown
+        self.assertEqual(list(out)[list(out).index("truncated") + 1], "next_offset")
+        cut = self.raw(path="devices", limit=500, offset=7)  # past limit, then cut by the budget
+        self.assertEqual((cut["truncated"], cut["next_offset"]), (True, 7 + cut["returned"]))
+        self.assertLess(cut["returned"], 500)
         out = self.raw(path="devices", limit=5000, fields=["hostname", "status"])
         self.assertEqual((out["returned"], out["truncated"]), (1004, False))
         self.assertNotIn("note", out)
+        self.assertNotIn("next_offset", out)
 
     def test_a_logs_page_cut_by_the_budget_says_where_to_read_on(self):
         for i in range(1000):
             self.fake.seed("eventlog", {"device_id": 1, "datetime": f"2026-10-28 {i // 60 % 24:02d}:{i % 60:02d}:00",
                                         "message": f"event {i} " + "z" * 300})  # fmt: skip
+        every = [row["event_id"] for row in self.raw(path="logs/eventlog", limit=5000, fields=["event_id"])["results"]]
         first = self.raw(path="logs/eventlog", limit=500)
         kept = first["returned"]
         self.assertTrue(first["truncated"])
-        self.assertTrue(first["note"].endswith(f"or read on with params start={kept}"), first["note"])
-        after = self.raw(path="logs/eventlog", limit=500, params={"start": kept})
-        self.assertGreater(after["results"][0]["event_id"], 0)
-        self.assertNotIn(after["results"][0]["event_id"], [row["event_id"] for row in first["results"]])
+        self.assertEqual(first["next_offset"], kept)
+        self.assertTrue(first["note"].endswith(f"or read on with offset {kept}"), first["note"])
+        self.assertEqual([row["event_id"] for row in first["results"]], every[:kept])
+        for after in (
+            self.raw(path="logs/eventlog", limit=500, offset=kept),
+            self.raw(path="logs/eventlog", limit=500, params={"start": kept}),  # the LibreNMS name still pages
+        ):
+            self.assertEqual(after["offset"], kept)
+            shown = [row["event_id"] for row in after["results"]]
+            self.assertEqual(shown, every[kept : kept + len(shown)])  # no row skipped or shown twice
+            self.assertEqual(after["next_offset"], kept + len(shown))
+
+    def test_a_row_too_large_on_its_own_gives_no_offset_to_read_on_from(self):
+        # strings are clipped and lists are not: a fault's details (fields ['details']) can hold many matched rows
+        self.settings_mod.set_settings(self.settings_mod.Settings(max_query_results=5000, max_result_chars=8000))
+        wide = ("ifAlias", "ifDescr", "ifPhysAddress", "ifType")
+        for i in range(3):
+            self.fake.seed("ports", {"device_id": 1, "ifIndex": 5000 + i, "ifName": f"X{i}",
+                                     **{key: key[2] * 1900 for key in wide}})  # fmt: skip
+        args = {
+            "path": "devices/core-sw1.example.net/ports",
+            "params": {"columns": "port_id,ifName," + ",".join(wide)},
+            "where": [{"key": "ifName", "op": "contains", "value": "X"}],
+        }
+        for offset in (0, 2):
+            raw = self.handlers.librenms_query({**args, "offset": offset})
+            self.assertLessEqual(len(raw), 8000)
+            out = json.loads(raw)
+            self.assertEqual((out["matched"], out["returned"], out["truncated"]), (3, 0, True))
+            self.assertNotIn("next_offset", out)  # it pointed at the same row again: a loop
+            self.assertEqual(
+                out["note"],
+                f"the row at offset {offset} does not fit within max_result_chars (8000 characters) on its own: name "
+                f"only the keys you need in fields (offset {offset + 1} reads on past it)",
+            )
+        out = self.call("librenms_query", **args, fields=["ifName", "ifAlias"])
+        self.assertEqual((out["returned"], out["truncated"]), (3, False))
 
     def test_a_single_object_too_large_is_refused_with_the_fields_advice(self):
         self.settings_mod.set_settings(self.settings_mod.Settings(max_result_chars=8000))
@@ -263,3 +304,24 @@ class IrreversiblePlan(HandlerCase):
         whole = json.loads(self.handlers.librenms_plans({"plan_id": self.pid}, _actor={"kind": "operator"}))
         self.assertEqual(len(whole["checks"]), 200)
         self.assertNotIn("check_count", whole)
+
+
+class FitRows(unittest.TestCase):
+    """``_fit_rows`` on its own, at every budget: a cut fits, and one more row would not."""
+
+    def test_a_cut_keeps_every_row_that_fits_and_no_more(self):
+        handlers = submodule("handlers")
+        rows = [{"id": i, "name": "x" * (i * 37 % 90)} for i in range(30)]
+        payload = {"success": True, "count": 30, "returned": 30, "truncated": False, "results": rows}
+        offset = 95  # next_offset and the note's offset grow a digit at 100, returned and the count of kept at 10
+        for budget in range(100, handlers._size(payload)):  # where the estimate overshoots too (cut back)
+            note = handlers._query_note(budget, offset)
+            out = handlers._fit_rows(payload, "results", budget, note, offset)
+            kept = out["returned"]
+            self.assertEqual(out["results"], rows[:kept])
+            if kept:
+                self.assertLessEqual(handlers._size(out), budget, budget)
+                self.assertEqual(out["next_offset"], offset + kept)
+            more = {**payload, "results": rows[: kept + 1], "returned": kept + 1, "truncated": True}
+            more = handlers._read_on({**more, "note": note(kept + 1, len(rows))}, offset)
+            self.assertGreater(handlers._size(more), budget, budget)  # the next row would not have fit

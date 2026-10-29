@@ -6,6 +6,66 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-29
+
+### Security
+- `where` and `sort` (below) compare a credential key as the result shows it (`<redacted>` when set), and an object
+  or a list (a fault's `details`, which holds the alert's contacts) matches no condition but `ne` and sorts in the
+  order read. Compared raw, `where community contains "pub"` or a sort on `authpass` would tell the model, a bit at
+  a time, what the masked value holds.
+
+### Added
+- `librenms_query` takes `offset`, and a listing that leaves rows out says where the next one is (`next_offset`).
+  Only the log routes page in LibreNMS; every other route sends all its rows, and the tool showed the first `limit`
+  of them (at most `max_query_results`, 500 by default) with no way to the rest. On a switch with 600 ports,
+  `devices/core-sw1/ports` came back `truncated` at 500 and ports 501-600 could not be read at all; `params.start`
+  of 500 returned port 1 again, since LibreNMS ignores `start` there. `offset` is now applied to the rows read on
+  those routes and sent as `start` on the log routes. `next_offset` is the first row not shown, also when
+  `max_result_chars` cut the page short: it is counted within that budget, and the note of a cut listing names it
+  (it named `params start=` on a log route and "narrow the query" elsewhere). A row that does not fit on its own
+  gets no `next_offset`, which would name it again; the note names its offset and says to ask for fewer keys with
+  `fields`. An `offset` past the last row says how many rows there are.
+- `where` and `sort`, applied to every row read before `offset` and `limit`, so "the ten busiest ports", "the ports
+  that are down" and "the open alerts on device 12" are answered from all of them rather than the first page in
+  LibreNMS's order: `get_all_ports` has no filter and no order, `list_alerts` no device filter, and `ports`,
+  `resources/sensors`, `resources/links` and `resources/fdb` come in no set order. `where` is a list of at most 10
+  conditions on top-level keys (`eq`, `ne`, `contains`, `gt`, `lt`; no expressions), all of which must hold; `sort`
+  is one key, `asc` or `desc`. Numbers compare by value, also when LibreNMS writes them as text (`"750000000"` above
+  `5000`, `"0.1"` equal to `0.1`; one whose exponent has more than four digits, such as a port description of
+  `1e99999999999999999999`, which Decimal refuses to read, is text, and refused as the value of `gt` or `lt`); text
+  compares ignoring case, in natural order (`Gi1/0/2` before `Gi1/0/10`, `10.0.0.2` before `10.0.0.10`); `gt` and
+  `lt` compare a number and a text as two texts when both start with a digit, so `version` `lt` `16` keeps
+  `15.2(4)E` and leaves out `16.12.4` (LibreNMS stores versions as text), and never hold between a number and other
+  text (`N/A`, `Gi1/0/1`); a missing key, `null` and `""` are empty (`eq null` matches them, `gt`, `lt` and
+  `contains` never do, a sort puts them last in either order); numbers sort before text, and ties keep LibreNMS's
+  order. A listing with `where` says how many rows it kept (`matched`) beside how many LibreNMS returned (`count`);
+  `total` stays the log routes' count of every row LibreNMS holds for the query. A key no row has is an error naming
+  the keys the rows do have (a misspelt one would have kept no row, or left the order as read, and looked like an
+  answer). On the ports routes it also says to add the key to `params.columns`: LibreNMS returns only the columns
+  named there, and without it a default few (`ifName` alone on `devices/<hostname>/ports`, `port_id` and `ifName`
+  on `ports`).
+- `listing.py` holds the filter and the sort, for the report views to reuse.
+- Tests: the audit's 600 ports read whole across two pages; the busiest down ports paged with `where`, `sort` and
+  `offset`; fleet-wide top talkers with rates written as numbers and as text; the open faults of one device;
+  pages cut by an 8,000-character budget read on from `next_offset` until every row was seen once, in order; a
+  cut at every budget keeping the rows that fit and no more, and a row too large on its own; log routes paged
+  with `offset` (also cut by the budget); `offset` past the end; every operator, natural and numeric order,
+  versions against numbers, a description that reads as a number too large to hold, stable ties in both
+  directions, empty values last, and the refusals of malformed arguments, unknown keys (on ports with and
+  without `params.columns`), `where` and `sort` on a log route, and `start` or `offset` params.
+
+### Changed
+- `params.start` on a route LibreNMS does not page is refused, saying to page with `offset`: LibreNMS ignored it
+  and answered with the first rows again, which read as the next ones. `params.offset`, which no route reads, is
+  refused alike. On a log route `params.start` still pages; given with an `offset` that differs, it is refused.
+- `where` and `sort` are refused on the log routes, which LibreNMS pages: they would see one page. The refusal
+  names what narrows a log route instead (its own device path where it has one, such as
+  `logs/syslog/<hostname>`, `from`/`to`, `sortorder`).
+- `where`, `sort` and `offset` on a path that answers with one object (`location/1`) are an error rather than
+  ignored.
+- An answer too large to read (16 MiB) says that `limit`, `offset`, `where` and `sort` do not help on a route
+  LibreNMS does not page, and to page a log route with `offset`.
+
 ## [0.2.0] - 2026-10-29
 
 ### Security

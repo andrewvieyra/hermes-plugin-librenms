@@ -5,8 +5,8 @@ third-party product integrations into its core tree, so this is the place for Li
 
 ## Ground rules
 
-- Keep the engine (`client`, `redact`, `routes`, `diff`, `resources/*`, `planner`, `executor`,
-  `store`) free of Hermes imports at module load. Hermes imports are lazy and guarded with
+- Keep the engine (`client`, `redact`, `routes`, `listing`, `diff`, `resources/*`, `planner`,
+  `executor`, `store`) free of Hermes imports at module load. Hermes imports are lazy and guarded with
   `try/except Exception`. That is what keeps the engine testable without a Hermes checkout.
 - Import only what Hermes documents for plugins (`hermes plugins validate` lists the rest). Two
   private imports remain, because Hermes offers no public way to the same data:

@@ -27,7 +27,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Tuple
 
-from . import audit, sinks
+from . import audit, listing, sinks
 from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
 from .executor import (
     EVENTLOG_MESSAGE_CHARS,
@@ -40,7 +40,7 @@ from .executor import (
 from .planner import DESCRIPTION_CHARS, PlanError, build_plan, render_plan
 from .redact import clip, for_model, mark_untrusted, mask, one_line, visible
 from .resources import get_resource
-from .routes import QueryError, Route, prepare, too_large_hint
+from .routes import PreparedQuery, QueryError, Route, prepare, too_large_hint
 from .settings import Settings, get_settings
 from .store import PlanStore, get_store, plan_status, profile_key
 from .version import __version__
@@ -93,6 +93,12 @@ _RULE_KEY_RE = re.compile(
 _COUNTED = ("create", "update", "delete", "action")
 # Envelope keys that carry no data of their own: LibreNMS's api_success puts them around every result.
 _ENVELOPE_KEYS = frozenset({"status", "message", "count", "total"})
+# After a where or sort key no row of a ports route has: LibreNMS returns only the columns asked for there, and
+# without params.columns a default few (ifName on devices/{hostname}/ports, port_id and ifName on ports).
+_COLUMNS_HINT = (
+    "; on this route LibreNMS returns only the columns params.columns names (a default few without it): add the key "
+    "there, e.g. params.columns=port_id,ifName,ifAlias"
+)
 # What a fault or alert-log row shows of the rows its rule matched (``details.rule``): the keys that name the port,
 # sensor, processor, storage, service or BGP peer it is about, at most ENTITY_ROWS rows of ENTITY_CHARS each as
 # escaped (redact.clip), so a label of characters that show as nothing cannot take a listing's room.
@@ -487,22 +493,36 @@ def _size(value: Any) -> int:
     return len(_json(value))
 
 
-def _fit_rows(payload: Dict[str, Any], key: str, budget: int | None, note: Callable[[int, int], str]) -> Dict[str, Any]:
+def _fit_rows(
+    payload: Dict[str, Any],
+    key: str,
+    budget: int | None,
+    note: Callable[[int, int], str],
+    offset: int | None = None,
+) -> Dict[str, Any]:
     """*payload* with as many leading entries of its list *key* as keep it within *budget* characters serialised (all
     of them without a budget). When some are left out, ``returned`` is the number kept, ``truncated`` is true and
-    ``note`` says how to see the rest: *note* is given the number kept and the number there were."""
+    ``note`` says how to see the rest: *note* is given the number kept and the number there were. Given the *offset*
+    of the first entry in the whole listing, ``next_offset`` is that of the first one left out, unless that is the
+    first entry, which does not fit on its own (:func:`_read_on`)."""
     rows = payload.get(key)
     if budget is None or not isinstance(rows, list) or _size(payload) <= budget:
         return payload
-    out = {**payload, key: [], "returned": 0, "truncated": True, "note": note(len(rows), len(rows))}
-    room, kept = budget - _size(out), 0
+
+    def cut(kept: int) -> Dict[str, Any]:
+        out = {**payload, key: rows[:kept], "returned": kept, "truncated": True, "note": note(kept, len(rows))}
+        return out if offset is None else _read_on(out, offset)
+
+    # The room for rows, measured with one kept: every cut but the empty one has that shape, and the empty one's note
+    # may be longer (_query_note), which would leave out rows that fit. Digits that grow with kept are cut back below.
+    room, kept = (budget - _size(cut(1)) + _size(rows[0]) if rows else -1), 0
     for row in rows:
         room -= _size(row) + (2 if kept else 0)  # json.dumps separates list items with ", "
         if room < 0:
             break
         kept += 1
     while True:
-        out.update({key: rows[:kept], "returned": kept, "note": note(kept, len(rows))})
+        out = cut(kept)
         if kept == 0 or _size(out) <= budget:
             return out
         kept -= 1
@@ -526,17 +546,32 @@ def _plans_note(kept: int, of: int) -> str:
     return f"{kept} of {of} plans shown, to stay within max_result_chars; filter by status or ask for fewer with limit"
 
 
-def _query_note(route: Route, budget: int | None, start: int) -> Callable[[int, int], str]:
+def _query_note(budget: int | None, offset: int) -> Callable[[int, int], str]:
     def note(kept: int, of: int) -> str:
-        text = (
+        if not kept:  # reading on from the same offset would show nothing again
+            return (
+                f"the row at offset {offset} does not fit within max_result_chars ({budget} characters) on its own: "
+                f"name only the keys you need in fields (offset {offset + 1} reads on past it)"
+            )
+        return (
             f"cut at {kept} of {of} rows to stay within max_result_chars ({budget} characters): name only the keys "
-            "you need in fields"
+            f"you need in fields, or read on with offset {offset + kept}"
         )
-        if route.paginated:
-            return text + f", or read on with params start={start + kept}"
-        return text + ", or narrow the query (a smaller limit returns the same first rows)"
 
     return note
+
+
+def _read_on(listing: Dict[str, Any], offset: int) -> Dict[str, Any]:
+    """*listing*, cut by :func:`_fit_rows`, with ``next_offset`` right after ``truncated``: the first row it no longer
+    shows, also when it was cut at ``limit`` already. Without one when it shows no row: the first one does not fit on
+    its own, and reading on from there would show nothing again (the note says so)."""
+    out: Dict[str, Any] = {}
+    for key, value in listing.items():
+        if key != "next_offset":
+            out[key] = value
+        if key == "truncated" and listing["returned"]:
+            out["next_offset"] = offset + listing["returned"]
+    return out
 
 
 def _alert_row(row: Any, keep_details: bool) -> Any:
@@ -576,22 +611,45 @@ def _keyed_rows(value: Any) -> List[Dict[str, Any]] | None:
 
 
 def _listing(
-    rows: List[Any], body: Any, fields: List[str] | None, limit: int, start: int, route: Route
+    rows: List[Any],
+    body: Any,
+    fields: List[str] | None,
+    prepared: PreparedQuery,
+    where: List[listing.Condition],
+    sort: listing.Order | None,
 ) -> Dict[str, Any]:
-    """*rows* as a tool result. ``truncated`` says whether more rows exist than were shown: past the client-side
-    limit, or (logs routes) past *start* plus what this page returned."""
+    """*rows* as a tool result: those that pass *where*, in *sort*'s order (:func:`listing.select`), at most
+    ``limit`` of them from ``offset`` on. On a logs route LibreNMS has paged them already (``start``). ``count`` is
+    the rows LibreNMS returned, ``matched`` those that pass *where*, ``total`` (logs routes) every row LibreNMS
+    holds for the query. ``truncated`` and ``next_offset`` say whether rows follow those shown: past the limit, or
+    (logs routes) past the offset plus what this page returned. Raises :class:`listing.UnknownKey`."""
+    route, offset, limit = prepared.route, prepared.offset, prepared.limit
     if len(rows) == 1 and isinstance(rows[0], list):  # LibreNMS wraps service rows in one more list
         rows = rows[0]
-    shown = rows[:limit]
-    if route.alert_rows:
-        shown = [_alert_row(row, bool(fields) and "details" in fields) for row in shown]
-    shown = [_project(row, fields) for row in shown]
+    kept = listing.select(rows, where, sort)
     out: Dict[str, Any] = {"count": len(rows)}
+    if where:
+        out["matched"] = len(kept)
     total = body.get("total") if isinstance(body, dict) else None
     if is_digits(total):  # logs routes: every matching row, of which ``count`` were returned from ``start`` on
         out["total"] = int(total)
-    more = "total" in out and out["total"] > start + len(rows)
-    out.update(returned=len(shown), truncated=len(shown) < len(rows) or more, results=for_model(shown))
+    if route.paginated:
+        shown = kept[:limit]
+        every = out.get("total", offset + len(rows))
+    else:
+        shown = kept[offset : offset + limit]
+        every = len(kept)
+    if offset:
+        out["offset"] = offset
+    if route.alert_rows:
+        shown = [_alert_row(row, bool(fields) and "details" in fields) for row in shown]
+    shown = [_project(row, fields) for row in shown]
+    out.update(returned=len(shown), truncated=every > offset + len(shown))
+    if out["truncated"]:
+        out["next_offset"] = offset + len(shown)
+    elif every and offset >= every:
+        out["note"] = f"offset {offset} is past the last row: there are {every}, from offset 0"
+    out["results"] = for_model(shown)
     return out
 
 
@@ -730,11 +788,21 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
     fields = args.get("fields")
     if fields is not None and not (isinstance(fields, list) and all(isinstance(f, str) for f in fields)):
         return _fail("fields must be a list of key names")
+    try:
+        where, sort = listing.conditions(args.get("where")), listing.order(args.get("sort"))
+    except listing.ListingError as exc:
+        return _fail(str(exc))
     client = make_client(settings)
     raw_path = args.get("path")
     try:
         prepared = prepare(
-            client, "" if raw_path is None else raw_path, args.get("params"), args.get("limit"), settings
+            client,
+            "" if raw_path is None else raw_path,
+            args.get("params"),
+            args.get("limit"),
+            settings,
+            offset=args.get("offset"),
+            row_args=tuple(name for name, given in (("where", where), ("sort", sort)) if given),
         )
     except QueryError as exc:
         audit.emit(
@@ -747,7 +815,7 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
         )
         return _fail(str(exc), refused=True)
     route = prepared.route
-    where = {"path": prepared.path, "route": route.name}
+    named = {"path": prepared.path, "route": route.name}
     try:
         body = client.get(prepared.request_path, prepared.params or None)
     except LibreNMSError as exc:
@@ -757,23 +825,31 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
             raise
         # LibreNMS answers an empty list with a 404 and a message ("No ports found")
         note = exc.body.get("message") if isinstance(exc.body, dict) else None
-        empty = {"success": True, **where, "count": 0, "returned": 0, "truncated": False, "results": []}
+        empty = {"success": True, **named, **_listing([], None, fields, prepared, where, sort)}
         return _json(mark_untrusted({**empty, "note": for_model(note or str(exc))}, "note"))
     budget = _budget(settings, kwargs)
     value = LibreNMSClient.result(body, route.list_key) if route.list_key else body
     rows = value if isinstance(value, list) else _keyed_rows(value)
     if rows is not None:
-        start = int(prepared.params["start"]) if route.paginated else 0
-        listing = {"success": True, **where, **_listing(rows, body, fields, prepared.limit, start, route)}
-        listing = mark_untrusted({**listing, **_extra(body, route)}, "results", "extra")
-        return _json(_fit_rows(listing, "results", budget, _query_note(route, budget, start)))
-    payload = {"success": True, **where, "result": for_model(_project(value, fields)), **_extra(body, route)}
+        try:
+            result = {"success": True, **named, **_listing(rows, body, fields, prepared, where, sort)}
+        except listing.UnknownKey as exc:  # on a ports route the key may be a column not asked for
+            columns = route.columns and exc.alike is None
+            return _fail(str(exc) + (_COLUMNS_HINT if columns else ""), **named)
+        result = mark_untrusted({**result, **_extra(body, route)}, "results", "extra")
+        return _json(_fit_rows(result, "results", budget, _query_note(budget, prepared.offset), prepared.offset))
+    if where or sort or prepared.offset:
+        return _fail(
+            f"where, sort and offset apply to listings, and {prepared.path} answers with one object; ask without them",
+            **named,
+        )
+    payload = {"success": True, **named, "result": for_model(_project(value, fields)), **_extra(body, route)}
     payload = mark_untrusted(payload, "result", "extra")
     if budget is not None and _size(payload) > budget:
         return _fail(
             f"the result is {_size(payload)} characters, more than max_result_chars allows ({budget}); name only the "
             "keys you need in fields",
-            **where,
+            **named,
         )
     return _json(payload)
 

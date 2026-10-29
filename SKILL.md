@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.2.0
+version: 0.3.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -39,9 +39,26 @@ is `read_only` (see Write modes).
    `rules`, `faults` (open alerts; `"params": {"state": "1,2,3,4,5"}` adds acknowledged ones),
    `logs/eventlog/<hostname>`. Use `fields` and `limit` to keep results small. For one device's rows use
    the path form (`logs/eventlog/<hostname>`, `services/<hostname>`): a `hostname` param on a route that
-   ignores it is refused. A result is cut to fit `max_result_chars`: when it says `truncated`, read its
-   `note` and ask again with `fields` (or the next `start` on a log route) before you answer from part of
-   the rows. `limit` shortens what LibreNMS sends only on the log routes. To find where a MAC is, use
+   ignores it is refused. A result that says `truncated` holds only part of the rows: read on with
+   `offset` set to its `next_offset` (and the same `where` and `sort`), or ask again with `fields` as its
+   `note` says, before you answer from part of them; `count`, `matched` and `total` say how many there
+   are. `limit` and `offset` shorten what LibreNMS sends only on the log routes; elsewhere every row is
+   read and `where`, `sort`, `offset` and `limit` apply to all of them, so answer "which", "how many" and
+   "top N" questions with them rather than from the first page: `where` keeps rows whose top-level key
+   is `eq`, `ne`, `contains`, `gt` or `lt` a value (every condition must hold; `eq null` matches a
+   missing, null or empty value; `gt`/`lt` compare a version such as `15.2(4)E` with `16` as text),
+   `sort` orders by one key (`asc`/`desc`; numbers by value, text in natural order, empty values
+   last). Examples: the busiest ports, path `ports` with
+   `"params": {"columns": "port_id,device_id,ifName,ifInOctets_rate"}`,
+   `"sort": {"key": "ifInOctets_rate", "order": "desc"}`, `"limit": 10`; the open alerts on one device,
+   `faults` with `"where": [{"key": "device_id", "op": "eq", "value": 12}]`; ports without a
+   description, `devices/<hostname>/ports` with `"params": {"columns": "port_id,ifName,ifAlias"}` and
+   `ifAlias` `eq` `""`. A key no row has is an error naming the keys there are: on ports LibreNMS
+   returns only the columns `params.columns` names (`ifName` alone without it), so name every key you
+   filter or sort by there. Log routes take neither `where` nor `sort` (narrow them with the device
+   path and `params` `from`/`to`). When you page `ports`,
+   `resources/sensors`, `resources/links` or `resources/fdb`, sort by their id (`port_id`, `sensor_id`,
+   `id`, `ports_fdb_id`): LibreNMS returns them in no set order. To find where a MAC is, use
    `resources/fdb/<mac>/detail` (any MAC format; it also names the vendor under `extra`) or
    `ports/mac/<mac>` with `"params": {"filter": "first"}` for the likely edge port. Fault and alert-log
    rows name what alerted in `entities`.
@@ -205,9 +222,9 @@ window early, so keep it as short as the work.
 
 - Gates: `allow_delete`, `allow_device_add`, `allow_services`. A refused plan names the setting; tell the
   user, do not work around it. `allow_insecure_transport` concerns the connection, not you.
-- Limits: `max_operations` per plan, `max_query_results` per query, `max_result_chars` per result (past it
-  rows are cut and plans are shown a range of steps at a time), `max_plan_age_hours`,
-  `max_maintenance_hours`.
+- Limits: `max_operations` per plan, `max_query_results` per query (read the rest with `offset`),
+  `max_result_chars` per result (past it rows are cut and plans are shown a range of steps at a time),
+  `max_plan_age_hours`, `max_maintenance_hours`.
 - Writes: `write_mode` and `require_approval`, above.
 - Record keeping, not yours to change: `plan_retention_days`, `audit_log`, `audit_log_path`,
   `audit_include_request` (your user's message is recorded with each plan), `link_eventlog`, `audit_sinks`.

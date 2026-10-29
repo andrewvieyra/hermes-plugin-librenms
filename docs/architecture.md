@@ -23,7 +23,8 @@ v0 route to what the plugin does with it.
 |---|---|---|
 | `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`) | `requests` (lazy), `redact` |
 | `redact` | Credential masking by key, error-text scrubbing, clipping that counts escapes, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals, `visible()` and `for_model()` for what the model reads, the untrusted-data marker (`untrusted()`, `mark_untrusted()`) | none |
-| `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
+| `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` or `start` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; `offset` sent as `start` on the logs routes, which refuse `where` and `sort`; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
+| `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused | `redact` |
 | `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
@@ -34,12 +35,12 @@ v0 route to what the plugin does with it.
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
 | `settings` | Operator settings with fail-closed coercion | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |
-| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam; result shaping (alert rows, envelope extras, keyed objects) and the result budget, with plans shown a range of steps at a time | everything above |
+| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
 | `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
 | `__init__` | `register(ctx)` | all |
 
-Dependencies point downward only. The engine (`client`, `redact`, `routes`, `diff`, `resources`,
-`planner`, `executor`, `store`) imports nothing from Hermes at module load; Hermes imports are lazy
+Dependencies point downward only. The engine (`client`, `redact`, `routes`, `listing`, `diff`,
+`resources`, `planner`, `executor`, `store`) imports nothing from Hermes at module load; Hermes imports are lazy
 and guarded, which is why the whole engine is testable with plain `unittest` against
 `tests/fake_librenms.py`.
 
@@ -509,8 +510,9 @@ for the re-read to settle, not a second request.
   a larger one to a file and shows the model a 1,500-character preview of it (past 100,000
   characters, or 15% of the context window on a smaller model), and `register_tool` offers a plugin
   no per-tool threshold. A listing keeps as many leading rows as fit and says so (`returned`,
-  `truncated`, a `note` naming `fields` or, on the logs routes, the next `start`); a single object
-  that does not fit is refused with the same advice. A plan, its journal, and the results of
+  `truncated`, `next_offset` at the first row left out, counted in the budget, and a `note` naming
+  `fields` and that offset; none when the first row does not fit on its own, whose offset the note
+  names); a single object that does not fit is refused with the same advice. A plan, its journal, and the results of
   `librenms_plan`, `librenms_plans`, `librenms_apply` and `librenms_rollback` are cut by steps:
   each shows the steps from `offset` on that fit (at least one), the diff, warnings, irreversible
   step indexes, conflicts, journal and eventlog rows of those steps, and `next_offset` for

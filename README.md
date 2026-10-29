@@ -131,7 +131,7 @@ plugins:
         allow_services: false        # service operations are refused unless true
         allow_insecure_transport: false  # http://, LIBRENMS_VERIFY_SSL=false, plain or unverified audit sinks
         max_operations: 100          # cap per plan (at most 1000)
-        max_query_results: 500       # cap per librenms_query call (at most 5000)
+        max_query_results: 500       # rows per librenms_query call, the rest by offset (at most 5000)
         max_result_chars: 60000      # characters per tool result for the model (8000 to 90000)
         max_plan_age_hours: 24       # older plans are refused by librenms_apply
         max_maintenance_hours: 72    # longest maintenance window a plan may schedule
@@ -192,9 +192,10 @@ whenever the plugin is enabled, tells the model to reach deferred tools through 
 approval prompt is unaffected: Hermes unwraps `tool_call` before its `pre_tool_call` hooks run.
 
 `librenms_query` takes a `path` relative to `/api/v0` (`devices`, `devices/core-sw1.example.net/ports`,
-`faults`, `rules`, `logs/syslog/edge-rtr1.example.net`), optional `params`, `fields` and `limit`. Only
-the GET routes of an allow-list are called; graph images, Oxidized configuration backups, the GET that
-schedules a rediscovery and the port-by-ifName route are refused with the reason. Hostnames in a path or
+`faults`, `rules`, `logs/syslog/edge-rtr1.example.net`), optional `params`, `fields` and `limit`, and
+`offset`, `where` and `sort` (below). Only the GET routes of an allow-list are called; graph images,
+Oxidized configuration backups, the GET that schedules a rediscovery and the port-by-ifName route are
+refused with the reason. Hostnames in a path or
 a `hostname` filter are resolved to device ids first, and ids are checked to exist, because several
 LibreNMS routes answer an unknown device with every device's rows; `0` is refused for the same reason.
 A `hostname` filter on a route that ignores it is refused, naming the path that filters by device
@@ -215,14 +216,44 @@ is data from the monitored network, not instructions; the `error` of an error or
 quote LibreNMS without one. Characters that would not show as written reach the model escaped
 (`\u202e`, `\u200b`), and limits count the escapes; see [Untrusted content](#untrusted-content).
 
-Every result the model reads stays within `max_result_chars`: a listing past it keeps its first
-rows and says so (`truncated`, and a `note` naming `fields`, or the next `start` on a log route), and
-a plan is shown a range of steps at a time, with `next_offset` for `librenms_plans` to show the
-next range, its irreversible steps among them (`irreversible_count` counts them all) and its latest
-dry-run check. `librenms_plan` returns the diff without the steps (`librenms_plans` with `detail`
-has them). An answer too large to read at all (16 MiB) is refused naming what narrows that route:
-`limit` narrows only the log routes, which LibreNMS pages; elsewhere it applies after every row is
-read.
+LibreNMS pages only the log routes, and filters and orders most other listings little or not at all:
+`ports` takes no filter and no order, `faults` no device, and ports, sensors, links and FDB entries
+come in no set order. Elsewhere it sends every row, so `librenms_query` works on all of them:
+`where` keeps the rows every condition holds for (`eq`, `ne`, `contains`, `gt`, `lt` on a top-level
+key; no expressions), `sort` orders them by one key (`asc` or `desc`), and then `offset` and `limit`
+take a page. Numbers compare by value, also when LibreNMS writes them as text; text compares
+ignoring case, in natural order (`Gi1/0/2` before `Gi1/0/10`); `gt` and `lt` compare a number with a
+text as text when both start with a digit, as versions do (`version` `lt` `16` keeps `15.2(4)E`, not
+`16.12.4`), and never with other text; a missing key, `null` and `""` are empty (`eq null` matches
+them, a sort puts them last); ties keep LibreNMS's order. A listing says what it holds: `count` (the
+rows LibreNMS returned), `matched` (those `where` kept), `total` (log routes: every row LibreNMS
+holds for the query), `offset`, `returned`, and while rows follow, `truncated` and `next_offset`,
+which is the `offset` to read on with. On a log route `offset` is sent as LibreNMS's `start` and
+`where` and `sort` are refused (they would see one page); `params.start` on any other route, which
+LibreNMS ignores there, is refused. A `where` or `sort` key no row has is an error naming the keys
+there are (on the ports routes LibreNMS returns only the columns `params.columns` names, `ifName`
+alone on `devices/<hostname>/ports` without it, so name the key there), and a credential key
+compares as masked. For example, the ten busiest ports of the fleet:
+
+```json
+{"path": "ports", "params": {"columns": "port_id,device_id,ifName,ifInOctets_rate"},
+ "sort": {"key": "ifInOctets_rate", "order": "desc"}, "limit": 10}
+```
+
+and the open alerts on device 12: `{"path": "faults", "where": [{"key": "device_id", "op": "eq",
+"value": 12}]}`. Pages of `ports`, `resources/sensors`, `resources/links` and `resources/fdb` line
+up only when sorted by their id (`port_id`, `sensor_id`, `id`, `ports_fdb_id`), since LibreNMS may
+return them in another order on the next call.
+
+Every result the model reads stays within `max_result_chars`: a listing past it keeps its first rows
+and says so (`truncated`, `next_offset` at the first row left out, and a `note` naming `fields`; a
+row that does not fit on its own gets no `next_offset`, and the note names its offset), and a plan
+is shown a range of steps at a time, with `next_offset` for `librenms_plans` to show the next range,
+its irreversible steps among them (`irreversible_count` counts them all) and its latest dry-run
+check. `librenms_plan` returns the diff without the steps (`librenms_plans` with `detail` has them).
+An answer too large to read at all (16 MiB) is refused naming what narrows that route: `limit` and
+`offset` narrow only the log routes, which LibreNMS pages; elsewhere they, `where` and `sort` apply
+after every row is read.
 [docs/api-coverage.md](docs/api-coverage.md) maps every v0 route to a query, a plan operation, or the
 reason it is refused.
 
@@ -476,6 +507,7 @@ handlers.py   tool handlers, the write_mode gate, the approval and request hooks
 commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query
+listing.py    librenms_query's where and sort over the rows read
 redact.py     credential masking, clipping, terminal-safe text
 diff.py       value normalisation and field-level diffs
 resources/    one module per resource: validate, resolve, diff, execute, verify, revert
