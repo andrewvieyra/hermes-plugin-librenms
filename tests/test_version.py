@@ -21,6 +21,8 @@ SCHEMA_BUDGET_BYTES = 16 * 1024
 # (verify=False sticking to a pooled connection).
 REQUESTS = "requests>=2.32.4,<3"
 SCHEMA_TYPES = {"bool": bool, "int": int, "str": str, "list": list}
+# config_schema entries of type secret: the Desktop stores them in the profile's .env under this name
+SECRET_FIELDS = {"audit_sink_secret": "LIBRENMS_AUDIT_SINK_SECRET"}
 # What the skill's untrusted-content section must name: text that devices and strangers, not users, write.
 UNTRUSTED_SOURCES = (
     "syslog",
@@ -179,7 +181,18 @@ class Manifest(unittest.TestCase):
     def test_every_setting_has_a_schema_entry_with_its_type_default_and_description(self):
         schema = manifest()["config_schema"]
         defaults = settings_defaults()
-        self.assertEqual(list(schema), list(defaults))  # the Desktop settings form follows this order
+        # the Desktop settings form follows this order; the secret fields, which the plugin never reads (Hermes
+        # expands their ${VAR} in the settings that name them), come last
+        self.assertEqual(list(schema), [*defaults, *SECRET_FIELDS])
+        sinks = submodule("sinks")  # what status tells an operator to use for a collector token
+        self.assertEqual(SECRET_FIELDS, {sinks.SECRET_FIELD: sinks.SECRET_ENV})
+        for name, env in SECRET_FIELDS.items():
+            entry = schema[name]
+            self.assertEqual((entry["type"], entry["env"]), ("secret", env), name)
+            self.assertEqual(set(entry), {"type", "env", "description"}, name)  # no default: it lives in .env
+            self.assertIn(f"${{{env}}}", entry["description"], name)
+            # a name Hermes masks whenever the agent's terminal prints the environment
+            self.assertRegex(env, r"^LIBRENMS_[A-Z0-9_]+_(SECRET|PASS|PASSWORD)$", name)
         for name, default in defaults.items():
             entry = schema[name]
             self.assertIs(SCHEMA_TYPES[entry["type"]], type(default), name)
@@ -271,7 +284,7 @@ class Examples(PluginTestCase):
     names the examples use."""
 
     def test_every_example_plans(self):
-        for name in ("LIBRENMS_SNMP_V3_USER", "LIBRENMS_SNMP_V3_AUTH", "LIBRENMS_SNMP_V3_PRIV"):
+        for name in ("LIBRENMS_SNMP_V3_USER", "LIBRENMS_SNMP_V3_AUTH_PASS", "LIBRENMS_SNMP_V3_PRIV_PASS"):
             self.addCleanup(_restore_env, name, os.environ.get(name))
             os.environ[name] = f"example value of {name}"
         planner = submodule("planner")

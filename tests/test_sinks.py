@@ -7,11 +7,14 @@ import json
 import os
 import socket
 import socketserver
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from .helpers import submodule
 
@@ -209,25 +212,145 @@ class Formats(unittest.TestCase):
 
 
 class HeaderSecrets(EnvCase):
-    def test_placeholders_read_through_the_profile_secret_scope(self):
-        os.environ["LN_TEST_TOKEN"] = "s3cret"
-        os.environ.pop("LN_MISSING_VAR", None)
-        self.assertEqual(sinks.expand_env("Splunk ${LN_TEST_TOKEN}"), "Splunk s3cret")
-        self.assertEqual(sinks.expand_env("${LN_MISSING_VAR}"), "")
-        self.assertEqual(sinks.expand_env("no placeholder $HOME"), "no placeholder $HOME")
+    """Hermes' config loader replaces ``${VAR}`` in the settings under the emitting profile's secrets; the plugin
+    never resolves one itself, least of all on the sink thread, where no profile is bound."""
 
-    def test_an_unbound_secret_scope_fails_the_send_without_a_value(self):
-        def unscoped(name):
-            raise client_mod.ConfigError(f"no secret scope is bound for this Hermes profile; cannot read {name}")
+    def rejected(self, spec):
+        with self.assertLogs("hermes_plugins.librenms.sinks", level="WARNING") as logs:
+            self.assertIsNone(sinks.build_sink(spec, False, 2))
+        return logs.output[0]
 
+    def test_a_placeholder_hermes_left_unset_refuses_the_sink_naming_only_the_variable(self):
+        os.environ["SPLUNK_HEC_TOKEN"] = "launch-profile-token"  # another profile's value, in the environment
+        for spec, where, shown in (
+            (
+                {
+                    "type": "http",
+                    "url": "https://c.example.com",
+                    "headers": {"Authorization": "Splunk ${SPLUNK_HEC_TOKEN}"},
+                },
+                "header Authorization",
+                "${SPLUNK_HEC_TOKEN}",
+            ),
+            (
+                {"type": "http", "url": "https://c.example.com", "headers": {"X-Token": "${env:SPLUNK_HEC_TOKEN}"}},
+                "header X-Token",
+                "${SPLUNK_HEC_TOKEN}",
+            ),
+            ({"type": "http", "url": "https://c.example.com/${SINK_PATH}"}, "url", "${SINK_PATH}"),
+            ({"type": "syslog", "host": "${SIEM_HOST}", "protocol": "tls"}, "host", "${SIEM_HOST}"),
+        ):
+            message = self.rejected(spec)
+            self.assertIn("audit_sinks[2] (", message)
+            self.assertIn(f"{where} holds {shown}, which is not set for this Hermes profile; set it in ", message)
+            self.assertNotIn("launch-profile-token", message)
+            self.assertNotIn("c.example.com", message)
+
+    def test_a_placeholder_hermes_cannot_read_is_not_quoted(self):
+        spec = {"type": "http", "url": "https://c.example.com", "headers": {"Authorization": "${vault:kv/hec s3cret}"}}
+        message = self.rejected(spec)
+        self.assertIn("header Authorization holds a ${...} placeholder that Hermes could not read", message)
+        self.assertNotIn("s3cret", message)
+        self.assertNotIn("vault", message)
+
+    def test_headers_go_out_as_the_settings_hold_them_and_the_sink_thread_reads_no_secret(self):
+        server = _serve(_HTTP(("127.0.0.1", 0), _HTTPHandler))
+        read = []
         real = client_mod.secret
-        client_mod.secret = unscoped
+        client_mod.secret = lambda name: read.append(name)  # what 0.1.0 called on the sink thread
         try:
-            with self.assertRaises(sinks.SinkError) as caught:
-                sinks.expand_env("Splunk ${SPLUNK_HEC_TOKEN}")
+            url = f"http://127.0.0.1:{server.server_address[1]}/c"
+            worker = sinks.SinkWorker([sinks.HttpSink(url, headers={"Authorization": "Splunk profile-B-token"})])
+            worker.enqueue(_record())
+            self.assertTrue(worker.flush(5))
+            self.assertTrue(_wait(lambda: len(server.received) == 1))
+            self.assertEqual(server.received[0]["headers"]["Authorization"], "Splunk profile-B-token")
+            self.assertEqual(read, [])
+            self.assertFalse(hasattr(sinks, "expand_env"))
+            worker.close(1)
         finally:
             client_mod.secret = real
-        self.assertIn("${SPLUNK_HEC_TOKEN}", str(caught.exception))
+            _stop(server)
+
+
+class LiteralCredentials(EnvCase):
+    """A credential written into config.yaml as a literal header value is found in config.yaml as written (the
+    settings hold resolved placeholders, which look the same) and reported without the value."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved = {name: sys.modules.get(name) for name in ("hermes_cli", "hermes_cli.config")}
+
+    def tearDown(self):
+        for name, module in self.saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        settings_mod.set_settings(None)
+        super().tearDown()
+
+    def install_config(self, raw):
+        package = types.ModuleType("hermes_cli")
+        config = types.ModuleType("hermes_cli.config")
+        config.read_raw_config_readonly = lambda: raw
+        package.config = config
+        sys.modules["hermes_cli"] = package
+        sys.modules["hermes_cli.config"] = config
+
+    SPECS = [
+        {"type": "http", "url": "https://a.example.com", "headers": {"Authorization": "Splunk 3f2a9c1e-7b4d-4e8a"}},
+        "not a mapping",
+        {
+            "type": "HTTP",
+            "url": "https://b.example.com",
+            "headers": {
+                "X-Splunk-Token": "s3cret",
+                "X-Api-Key": "${HEC_KEY}",
+                "Proxy-Authorization": "Basic ${env:PROXY_BASIC}",
+                "Content-Type": "application/json",
+                "X-Empty-Secret": " ",
+            },
+        },
+        {"type": "syslog", "host": "siem.example.com", "headers": {"Authorization": "never sent"}},
+    ]
+
+    def test_literal_credential_headers_are_found_by_place_and_name(self):
+        self.assertEqual(
+            sinks.literal_credentials(self.SPECS),
+            ["audit_sinks[0] header Authorization", "audit_sinks[2] header X-Splunk-Token"],
+        )
+        self.assertEqual(sinks.literal_credentials("not a list"), [])
+
+    def test_outside_hermes_the_settings_are_read_and_the_warning_says_where_the_credential_belongs(self):
+        sys.modules["hermes_cli"] = sys.modules["hermes_cli.config"] = None  # importing it raises ImportError
+        settings_mod.set_settings(Settings(audit_sinks=[self.SPECS[0]]))
+        warnings = sinks.literal_credential_warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(
+            warnings[0].startswith(
+                "audit_sinks[0] header Authorization holds a credential written into config.yaml; put it in "
+            )
+        )
+        self.assertTrue(
+            warnings[0].endswith(
+                "(the Desktop's audit_sink_secret setting stores one there as LIBRENMS_AUDIT_SINK_SECRET) and write "
+                "${LIBRENMS_AUDIT_SINK_SECRET} in its place, in config.yaml itself: the Desktop's form shows "
+                "audit_sinks with each ${...} replaced by its value, and saving it there writes the credential back"
+            )
+        )
+        self.assertNotIn("3f2a9c1e", warnings[0])
+
+    def test_under_hermes_config_yaml_as_written_decides_not_the_resolved_settings(self):
+        resolved = {"type": "http", "url": "https://a.example.com", "headers": {"Authorization": "Splunk B-token"}}
+        settings_mod.set_settings(Settings(audit_sinks=[resolved]))
+        written = dict(resolved, headers={"Authorization": "Splunk ${SPLUNK_HEC_TOKEN}"})
+        self.install_config({"plugins": {"entries": {"librenms": {"settings": {"audit_sinks": [written]}}}}})
+        self.assertEqual(sinks.literal_credential_warnings(), [])
+        self.install_config({"plugins": {"entries": {"librenms": {"config": {"audit_sinks": [resolved]}}}}})
+        self.assertEqual(len(sinks.literal_credential_warnings()), 1)  # the legacy subtree ctx.get_config reads
+        self.install_config({"plugins": "garbled"})
+        self.assertEqual(sinks.literal_credential_warnings(), [])
 
 
 class EntryParsing(unittest.TestCase):
@@ -428,11 +551,10 @@ class Delivery(EnvCase):
 
     def test_http_sink_json_and_hec_with_a_secret_header(self):
         server = _serve(_HTTP(("127.0.0.1", 0), _HTTPHandler))
-        os.environ["LN_TEST_HEC"] = "tok-123"
         try:
             url = f"http://127.0.0.1:{server.server_address[1]}/services/collector/event"
-            plain = sinks.HttpSink(url, headers={"Authorization": "Splunk ${LN_TEST_HEC}"})
-            hec = sinks.HttpSink(url, headers={"Authorization": "Splunk ${LN_TEST_HEC}"}, fmt="hec")
+            plain = sinks.HttpSink(url, headers={"Authorization": "Splunk tok-123"})
+            hec = sinks.HttpSink(url, headers={"Authorization": "Splunk tok-123"}, fmt="hec")
             worker = sinks.SinkWorker([plain, hec])
             worker.enqueue(_record("apply_finished", outcome="applied"))
             self.assertTrue(worker.flush(5))
@@ -455,12 +577,11 @@ class Delivery(EnvCase):
         target = _serve(_HTTP(("127.0.0.1", 0), _HTTPHandler))
         redirector = _serve(_HTTP(("127.0.0.1", 0), _HTTPHandler))
         redirector.location = f"http://127.0.0.1:{target.server_address[1]}/elsewhere"
-        os.environ["LN_TEST_HEC"] = "tok-123"
         try:
             for code in (301, 302, 303, 307, 308):
                 redirector.status = code
                 sink = sinks.HttpSink(
-                    f"http://127.0.0.1:{redirector.server_address[1]}/c", headers={"Authorization": "${LN_TEST_HEC}"}
+                    f"http://127.0.0.1:{redirector.server_address[1]}/c", headers={"Authorization": "tok-123"}
                 )
                 with self.assertRaises(Exception) as caught:  # Python 3.10 has no 308 handler: a plain HTTPError
                     sink.send(_record())
@@ -479,11 +600,10 @@ class Delivery(EnvCase):
         for name in [name for name in os.environ if name.lower().endswith("_proxy")]:
             del os.environ[name]  # no no_proxy either: nothing in the environment exempts loopback
         os.environ["http_proxy"] = f"http://127.0.0.1:{proxy.server_address[1]}"
-        os.environ["LN_TEST_HEC"] = "tok-123"
         try:
             for host in ("127.0.0.1", "localhost"):
                 url = f"http://{host}:{collector.server_address[1]}/c"
-                sinks.HttpSink(url, headers={"Authorization": "Splunk ${LN_TEST_HEC}"}).send(_record())
+                sinks.HttpSink(url, headers={"Authorization": "Splunk tok-123"}).send(_record())
             self.assertEqual(len(collector.received), 2)
             self.assertEqual(proxy.received, [])  # neither the event nor the token went to the proxy
             sinks.HttpSink("http://collector.example.com/c", allow_insecure=True).send(_record())
@@ -610,6 +730,31 @@ class ThroughAuditLog(EnvCase):
         self.assertEqual([s.port for s in second.sinks], [2])
         self.assertIs(sinks.get_worker(), second)
         self.assertTrue(_wait(lambda: not first._thread.is_alive()))
+
+    def test_each_profile_keeps_its_own_worker(self):
+        # a gateway serving two profiles with different sinks: no rebuild at every switch, no shared queue
+        sinks.set_worker(None)
+        profile_a = {"audit_sinks": [{"type": "syslog", "host": "127.0.0.1", "port": 1}]}
+        profile_b = {"audit_sinks": [{"type": "syslog", "host": "127.0.0.1", "port": 2}]}
+        built = {}
+        for home, raw in (("a", profile_a), ("b", profile_b), ("a", profile_a), ("b", profile_b)):
+            os.environ["HERMES_HOME"] = os.path.join(self._tmp.name, home)
+            settings_mod.set_settings(Settings.from_mapping(raw))
+            worker = sinks.get_worker()
+            self.assertIs(built.setdefault(home, worker), worker, home)
+        self.assertEqual([s.port for s in built["a"].sinks], [1])
+        self.assertEqual([s.port for s in built["b"].sinks], [2])
+        self.assertTrue(built["a"]._thread.is_alive() and built["b"]._thread.is_alive())
+
+    def test_the_exit_hook_is_registered_once_however_many_workers_are_built(self):
+        sinks.set_worker(None)
+        self.addCleanup(setattr, sinks, "_exit_hooked", sinks._exit_hooked)
+        sinks._exit_hooked = False
+        with mock.patch.object(sinks.atexit, "register") as register:
+            for port in (1, 2, 3):
+                settings_mod.set_settings(Settings(audit_sinks=[{"type": "syslog", "host": "127.0.0.1", "port": port}]))
+                self.assertEqual([s.port for s in sinks.get_worker().sinks], [port])
+        self.assertEqual(register.call_args_list, [mock.call(sinks._close_all, 2.0)])
 
     def test_settings_coercion_keeps_only_mappings(self):
         raw = {"audit_sinks": [{"type": "http", "url": "https://x"}, "junk", 3]}

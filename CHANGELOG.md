@@ -6,6 +6,63 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-29
+
+### Security
+- Audit sink placeholders are no longer read on the sink thread. Hermes' config loader already replaces `${VAR}` in
+  `audit_sinks` (headers and url) with the active profile's secret when the settings are read; the plugin then
+  read any placeholder left over again on the background thread, where no profile is bound, and so sent the launch
+  profile's value of a variable the routed profile does not set to that profile's collector. A placeholder still
+  present now means the variable is unset for the profile: the sink is not built, and the log names only the
+  variable.
+- `LIBRENMS_PROXY` must be a scheme, host and port with a percent-encoded user name and password. An unencoded `#`,
+  `/`, `?` or `@` in the password, or a port that is no number, passed validation and made `requests` log the whole
+  proxy URL, password included, past Hermes' log and `hermes debug share` redaction. The proxy's user info and
+  password (as written and decoded) are also scrubbed from every log line and error the client writes, and with
+  `LIBRENMS_PROXY` unset so are those of the environment's `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY`, which
+  `requests` uses instead and nothing validates.
+- A malformed `LIBRENMS_URL` is no longer quoted in the error the model reads: swapped `LIBRENMS_URL` and
+  `LIBRENMS_TOKEN`, or a scheme-less URL with `?api_token=`, put the token in the tool result. A value shaped like
+  an API token is named as such ("are LIBRENMS_URL and LIBRENMS_TOKEN swapped?").
+- `audit.jsonl` is never opened through a symlink, nor written when it is not a regular file owned by the account
+  Hermes runs as with no other hard link (any account may hard-link a file it can reach, a shell's rc file among
+  them, at the log's name in a shared directory). The name is looked up again after the open, so a link removed in
+  between is caught, and a rotation at that moment has the event written to the new file. A FIFO no longer blocks
+  the write. A refused event still reaches the sinks, and Hermes' log says why.
+- `plugin-data/librenms`, which Hermes' helper creates under the process umask (usually `0755`), is kept `0700`, so
+  other accounts cannot list plans or watch the audit log grow.
+- Status no longer shows `audit_log_path` (a path that names the OS account) to the model, only whether one is set
+  (`custom`). The configuration digest is unchanged.
+- SNMP credentials shorter than four characters are scrubbed from step errors too, where they stand alone.
+
+### Fixed
+- `plan_retention_days` is applied per profile and not only when a plan is created: listing plans, status and
+  every `/librenms` and `hermes librenms` command sweep as well, at most once an hour per profile (the throttle was
+  per process, so one profile's sweep held off every other's).
+- Messages and docs name the active profile's `.env` (`~/.hermes/profiles/<name>/.env` under a named profile), as
+  Hermes' own install prompt does, rather than `~/.hermes/.env`.
+- A relative `audit_log_path` resolved against each process's working directory; it is now a settings error and the
+  default path is used.
+- A gateway serving several profiles keeps one audit sink worker per profile instead of rebuilding a shared one at
+  every switch, and registers its exit hook once instead of once per rebuilt worker.
+
+### Added
+- Status (and the log at registration) warns about a credential header in `audit_sinks` (`Authorization`, or a name
+  with `token`, `key`, `secret`, `auth` or `pass`) written into `config.yaml` as a literal value, reading
+  `config.yaml` as written through Hermes, and names where the credential belongs instead.
+- `audit_sink_secret`, a `type: secret` setting the Desktop shows as a masked field and stores in the profile's
+  `.env` as `LIBRENMS_AUDIT_SINK_SECRET`, for a collector token written as `${LIBRENMS_AUDIT_SINK_SECRET}`. Hermes
+  fills the Desktop's form with `audit_sinks` expanded and saves it that way, so the setting descriptions, docs and
+  the status warning say to edit `audit_sinks` in `config.yaml` once it holds a placeholder.
+
+### Changed
+- A community, `authpass` or `cryptopass` reference must name a variable ending in `_SECRET`, `_PASS` or
+  `_PASSWORD` (`LIBRENMS_SNMP_COMMUNITY_SECRET`, `LIBRENMS_SNMP_V3_AUTH_PASS`, `LIBRENMS_SNMP_V3_PRIV_PASS`):
+  Hermes masks only such names when the agent's terminal prints the environment. 0.1.0 suggested
+  `LIBRENMS_SNMP_COMMUNITY`, and its SNMPv3 example used `LIBRENMS_SNMP_V3_AUTH` and `LIBRENMS_SNMP_V3_PRIV`; plans
+  naming them are refused with the rule, so rename those variables. The SNMPv3 user name may keep any
+  `LIBRENMS_SNMP_` name.
+
 ## [0.1.0] - 2026-10-28
 
 ### Added

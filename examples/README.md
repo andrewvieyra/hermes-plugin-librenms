@@ -11,7 +11,7 @@ one up with `librenms_query` `faults` first.
 | `ensure-location-and-group.json` | Idempotent creates: a location and a static device group whose member is named by hostname | |
 | `uplink-descriptions.json` | Port descriptions set by device and `ifName`; the plan warns that they stay pinned until cleared | |
 | `ack-alert.json` | Acknowledging one fault with a note; `until_clear: false` lets LibreNMS raise it again if it gets worse or better | |
-| `add-device-snmpv3.json` | Adding a device over SNMPv3 with its credentials named as environment variables, never written into the plan | `allow_device_add: true`; `LIBRENMS_SNMP_V3_USER`, `LIBRENMS_SNMP_V3_AUTH`, `LIBRENMS_SNMP_V3_PRIV` set |
+| `add-device-snmpv3.json` | Adding a device over SNMPv3 with its credentials named as environment variables, never written into the plan | `allow_device_add: true`; `LIBRENMS_SNMP_V3_USER`, `LIBRENMS_SNMP_V3_AUTH_PASS`, `LIBRENMS_SNMP_V3_PRIV_PASS` set |
 
 Try the slash command inside a Hermes session first:
 

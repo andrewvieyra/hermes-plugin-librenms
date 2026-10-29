@@ -32,11 +32,38 @@ plugins:
             timeout: 5
 ```
 
-`${VAR}` in a header value is replaced at send time with the secret Hermes holds for the active
-profile (Hermes' per-profile secret scope, else the environment), so the token lives in
-`~/.hermes/.env` and never in `config.yaml`. A placeholder that cannot be read because no secret
-scope is bound for the profile fails the send; it never falls back to another profile's value. An
-unset variable is replaced with nothing.
+Keep a collector token in the profile's `.env` (`<HERMES_HOME>/.env`: `~/.hermes/.env` for the
+default profile, `~/.hermes/profiles/<name>/.env` for a named one) and write it as `${VAR}` where
+the entry needs it. Hermes' config loader replaces every `${VAR}` (or `${env:VAR}`) in the settings,
+in `headers`, `url` and `host` alike, with the active profile's secret when the plugin reads its
+settings, on the thread of the call that emits the event. The Desktop's settings form has a masked
+field for this, `audit_sink_secret`, which stores the token as `LIBRENMS_AUDIT_SINK_SECRET`:
+
+```yaml
+            headers:
+              Authorization: "Splunk ${LIBRENMS_AUDIT_SINK_SECRET}"
+```
+
+Once `audit_sinks` holds a placeholder, edit it in `config.yaml`, not in the Desktop's settings
+form. Hermes fills that form from the settings as loaded, with every `${VAR}` already replaced by
+its value, so the `audit_sinks` editor shows the token in clear, and saving that field writes the
+token into `config.yaml` as a literal (which status then warns about). This is Hermes' behaviour,
+not the plugin's; the masked `audit_sink_secret` field itself never shows or writes the token.
+
+A placeholder still there after Hermes' expansion is a variable this profile does not set. That
+entry is ignored (the other sinks still work), and Hermes' log names the variable and the profile's
+`.env`, never a value: `librenms audit_sinks[1] (http) ignored: header Authorization holds
+${SPLUNK_HEC_TOKEN}, which is not set for this Hermes profile; set it in ~/.hermes/profiles/netops/.env`.
+The plugin never reads a placeholder itself: on the background thread that sends events no Hermes
+profile is bound, and the process environment there holds another profile's values. Once Hermes
+has the variable for the profile, the next event builds the sink.
+
+A credential written straight into `config.yaml` (an `Authorization` header, or any header whose
+name holds `token`, `key`, `secret`, `auth` or `pass`, with no `${VAR}` in its value) still works,
+but `/librenms status` warns about it, and so does Hermes' log when the plugin loads, naming the
+entry and the header only and saying to write the placeholder in `config.yaml` itself. The check
+reads `config.yaml` as written, through Hermes, since the settings the plugin gets hold the
+expanded values.
 
 `/librenms status` shows how many sinks are configured and their types, never their hosts, URLs or
 headers; the `config_digest` on every event covers the same.
@@ -74,7 +101,8 @@ a port that is not a whole number from 1 to 65535, a timeout that is not a numbe
 0.1 to 600 (`true` and `false` are not numbers here), a `verify_ssl` that is not a flag or the path
 of an existing CA bundle, a `verify_ssl` path and a `ca_file` both given, a URL that is not
 `http://` or `https://` with a host, headers that are not a mapping of header names to single-line
-text, and the clear-text and unverified cases above without `allow_insecure_transport`. When the
+text, a `${VAR}` placeholder Hermes left unexpanded (above), and the clear-text and unverified cases
+above without `allow_insecure_transport`. When the
 sinks are built (at the first event of a process, and again after their settings change), Hermes'
 log gets one line per ignored entry, naming it by its place in `audit_sinks` as written in
 config.yaml (counting from 0, the same number `Settings.errors` uses for an entry that is not a
@@ -93,7 +121,7 @@ type; a non-mapping entry is named there by its index.
 | `format` | Syslog: `json` (the audit record as the message body) or `cef` (below). HTTP: `json` or `hec` |
 | `facility` | Syslog facility name (`local0` by default, `user`, `daemon`, `auth`, `local7`, …) or number 0 to 23 |
 | `app_name` | Syslog APP-NAME, default `hermes-librenms` |
-| `url`, `headers` | HTTP collector and request headers; `${VAR}` placeholders in header values |
+| `url`, `headers` | HTTP collector and request headers; `${VAR}` placeholders, expanded by Hermes |
 | `timeout` | Connect and send timeout in seconds, default 5, from 0.1 to 600 |
 | `verify_ssl` | For `tls` syslog and `https://` collectors. `true` (default), `false` (needs `allow_insecure_transport`), or a CA bundle path. Read like a flag setting: `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`; any other value that is not an existing path, an empty one included, makes the entry unusable rather than unverified |
 | `ca_file` | The other spelling of a CA bundle path |
@@ -110,11 +138,14 @@ type; a non-mapping entry is named there by its index.
   not once per event, naming the sink by its index and kind and the reason by an HTTP status or an
   error class.
 - The sinks are built from the settings when the first event of a process is sent, and built again
-  when an event finds `audit_sinks` (any entry, or its place in the list) or
-  `allow_insecure_transport` changed, so an edit to `config.yaml` applies from the next event without
-  a restart, like every other setting. Events already queued when the change is seen are still
-  delivered by the old sinks while they drain, for up to two seconds.
-- On shutdown the plugin waits up to two seconds for the queue to drain.
+  when an event finds `audit_sinks` (any entry, its place in the list, or a value Hermes expanded
+  into it) or `allow_insecure_transport` changed, so an edit to `config.yaml` applies from the next
+  event without a restart, like every other setting. Events already queued
+  when the change is seen are still delivered by the old sinks while they drain, for up to two
+  seconds.
+- A gateway that serves several Hermes profiles keeps one set of sinks, with its own queue and
+  thread, per profile, each built from that profile's settings and secrets.
+- On shutdown the plugin waits up to two seconds in all for the queues to drain.
 
 Sinks are for convenience and near-real-time alerting. If you need guaranteed delivery, ship the
 file with Filebeat, Fluent Bit, Vector or a forwarder, which buffer to disk. UDP confirms nothing:

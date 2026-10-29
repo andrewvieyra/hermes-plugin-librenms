@@ -15,8 +15,8 @@ results before it is written or forwarded.
 
 | Output | Location | Setting |
 |---|---|---|
-| Plan files | `<HERMES_HOME>/plugin-data/librenms/plans/<plan_id>.json` | `plan_retention_days` (default 90; `0` keeps them forever) |
-| Event stream | `<HERMES_HOME>/plugin-data/librenms/audit.jsonl` | `audit_log` (on/off), `audit_log_path` (absolute path override), `audit_include_request` |
+| Plan files | `<HERMES_HOME>/plugin-data/librenms/plans/<plan_id>.json` | `plan_retention_days` (default 90; `0` keeps them forever), applied at most hourly per profile when the plugin is used; `hermes librenms prune` from cron for a strict policy |
+| Event stream | `<HERMES_HOME>/plugin-data/librenms/audit.jsonl` | `audit_log` (on/off), `audit_log_path` (absolute path override; a relative one is a settings error and the default is used), `audit_include_request` |
 
 `<HERMES_HOME>` is the active Hermes profile's home, resolved for every event, so a gateway that
 serves several profiles writes each profile's events to its own file.
@@ -26,9 +26,19 @@ Set `audit_log_path` to a location your collector already watches, for example
 for every event and writes each line with a single `write`, so `logrotate` with `copytruncate` is
 safe, and several Hermes processes (the gateway and `hermes librenms`) can append to the same file
 without coordination. A file the plugin creates is `0600`, and directories it creates are `0700`;
-an existing directory keeps its mode. Lines are UTF-8 JSON; a lone surrogate (which UTF-8 cannot
-encode) is replaced with U+FFFD rather than losing the event. A failed write is logged to Hermes'
-log and never fails the operation it describes.
+an existing directory keeps its mode, except `plugin-data/librenms` itself, which Hermes creates
+under the process umask and the plugin narrows to `0700` (a log shipper should read a file at
+`audit_log_path` instead). The file is never opened through a symlink, and an event is written to
+it only when it is a regular file owned by the account Hermes runs as whose only name is the log's:
+in a directory another account can write to, a symbolic or hard link or a file planted at the
+log's name would otherwise receive the users' messages, and any account may hard-link a file it can
+reach, a shell's rc file among them. The name is looked up again after the open, so a link removed
+in between is caught too, and a rotation that renames the file at that moment has the event written
+to the new one. An event the file refuses still reaches the sinks, and Hermes' log says why the
+file was skipped.
+Lines are UTF-8 JSON; a lone surrogate (which UTF-8 cannot encode) is replaced with U+FFFD rather
+than losing the event. A failed write is logged to Hermes' log and never fails the operation it
+describes.
 
 `audit_log: false` stops the file and the [sinks](sinks.md) alike: events are forwarded from the
 same call that writes them. Plan files are always written; they are how apply and rollback work.

@@ -1,5 +1,5 @@
 name: librenms
-version: 0.1.0
+version: 0.1.1
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"
@@ -78,7 +78,7 @@ config_schema:
   plan_retention_days:
     type: int
     default: 90
-    description: "Delete plan files older than this many days (plans being applied or rolled back are kept). 0 keeps plans forever."
+    description: "Delete plan files older than this many days (plans being applied or rolled back are kept). 0 keeps plans forever. Checked at most hourly per profile, when a plan is made or listed, on status and on every /librenms or hermes librenms command; for a strict policy run `hermes librenms prune` from cron."
   audit_log:
     type: bool
     default: true
@@ -86,7 +86,7 @@ config_schema:
   audit_log_path:
     type: str
     default: ""
-    description: "Audit log file. Empty means <HERMES_HOME>/plugin-data/librenms/audit.jsonl."
+    description: "Audit log file, as an absolute path (~ is expanded; a relative one is refused and the default used). It must be a regular file owned by the account Hermes runs as and have no other hard link, and is never written through a symlink. Empty means <HERMES_HOME>/plugin-data/librenms/audit.jsonl."
   audit_include_request:
     type: bool
     default: true
@@ -98,4 +98,8 @@ config_schema:
   audit_sinks:
     type: list
     default: []
-    description: "Forward audit events to syslog (udp/tcp/tls, json or CEF) and/or an HTTP collector (json or Splunk HEC). See docs/sinks.md."
+    description: "Forward audit events to syslog (udp/tcp/tls, json or CEF) and/or an HTTP collector (json or Splunk HEC). Put a collector token in .env and write it as ${NAME} in a header, never as a literal. Once the list holds a ${NAME}, edit it in config.yaml: the Desktop's form shows it with each ${NAME} replaced by its value and saves it that way. See docs/sinks.md."
+  audit_sink_secret:
+    type: secret
+    env: LIBRENMS_AUDIT_SINK_SECRET
+    description: "A collector token for an HTTP audit sink, kept in the profile's .env (never config.yaml). Write ${LIBRENMS_AUDIT_SINK_SECRET} where audit_sinks needs it, e.g. headers: {Authorization: \"Splunk ${LIBRENMS_AUDIT_SINK_SECRET}\"}, and make later changes to audit_sinks in config.yaml: the Desktop's form shows and saves it with the token in the placeholder's place."

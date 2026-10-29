@@ -28,9 +28,9 @@ v0 route to what the plugin does with it.
 | `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
 | `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
 | `executor` | Preflight, claims and run locks, per-step precondition, execute, journal, automatic and manual rollback, crash recovery, eventlog linking | `resources`, `store`, `audit` |
-| `store` | Atomic `0600` JSON persistence of plans, the cross-process claim lock, per-plan run locks, retention | Hermes `plugin_storage` (optional) |
+| `store` | Atomic `0600` JSON persistence of plans in `0700` directories, the cross-process claim lock, per-plan run locks, retention, the active profile's key | Hermes `plugin_storage`, `hermes_constants` (optional) |
 | `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl` | Hermes `gateway.session_context` (optional) |
-| `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread | none |
+| `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread per Hermes profile; the warning about a credential written into `config.yaml` | `settings`, `store`, Hermes `hermes_cli.config` (optional) |
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only | Hermes `hermes_time` (optional) |
 | `settings` | Operator settings with fail-closed coercion | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |

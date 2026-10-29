@@ -392,6 +392,22 @@ class Prune(CommandCase):
         self.configure(plan_retention_days=7)
         self.assertIn("Removed 1 plan(s) older than 7 days", self.commands.slash_handler("prune"))
 
+    def test_every_other_command_sweeps_old_plans_too(self):
+        # an install whose plans are only ever handled by an operator still keeps to plan_retention_days
+        self.configure(plan_retention_days=7)
+        for argv in (["status"], ["plans"], ["show", "nothing-like-it"]):
+            self.handlers.reset_state()
+            pid = self.planned()
+            self.age(pid, 10)
+            self.commands.run(argv, via=self.audit.VIA_CLI)
+            self.assertIsNone(self.store.load(pid), argv)
+            self.assertEqual(self.events("plans_pruned")[-1]["actor"]["via"], "cli")
+        self.handlers.reset_state()
+        pid = self.planned()
+        self.age(pid, 10)
+        self.commands.run(["help"], via=self.audit.VIA_CLI)  # usage only: nothing runs
+        self.assertIsNotNone(self.store.load(pid))
+
 
 if __name__ == "__main__":
     unittest.main()

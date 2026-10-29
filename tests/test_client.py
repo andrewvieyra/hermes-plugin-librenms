@@ -10,6 +10,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 from .helpers import submodule
 
@@ -78,6 +79,23 @@ def env(**extra):
     return {"LIBRENMS_URL": BASE, "LIBRENMS_TOKEN": TOKEN, **extra}
 
 
+@contextlib.contextmanager
+def env_proxies(**proxies):
+    """The process environment with only *proxies* as its proxy variables (restored afterwards)."""
+    with mock.patch.dict(os.environ):
+        for name in [name for name in os.environ if name.lower().endswith("_proxy")]:
+            del os.environ[name]
+        os.environ.update(proxies)
+        yield
+
+
+def restore_module(name, module):
+    if module is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = module
+
+
 class Config(unittest.TestCase):
     def test_settings_from_env_normalises_the_url(self):
         s = client_mod.settings_from_env(env(LIBRENMS_URL=" https://nms.example.com/librenms/api/v0/ "))
@@ -110,6 +128,53 @@ class Config(unittest.TestCase):
                 client_mod.settings_from_env(bad)
             self.assertEqual((caught.exception.kind, caught.exception.status), ("config", 0))
             self.assertNotIn(TOKEN, str(caught.exception))
+
+    def test_an_unusable_url_is_never_quoted(self):
+        # the message reaches the model: a value in the wrong variable may be the token, or carry one
+        hex_token = "9f86d081884c7d659a2feaa0c55ad015"
+        sanctum = "12|" + "Ab3" * 16
+        cases = (
+            (
+                hex_token,
+                "LIBRENMS_URL looks like an API token, not a URL; are LIBRENMS_URL and LIBRENMS_TOKEN swapped?",
+            ),
+            (sanctum, "LIBRENMS_URL looks like an API token, not a URL; are LIBRENMS_URL and LIBRENMS_TOKEN swapped?"),
+            (
+                f"librenms.example.com/api/v0?api_token={hex_token}",
+                "LIBRENMS_URL must start with http:// or https://, e.g. https://librenms.example.com",
+            ),
+            (
+                f"ftp://{hex_token}",
+                "LIBRENMS_URL must start with http:// or https://, e.g. https://librenms.example.com",
+            ),
+            ("https://", "LIBRENMS_URL must name a host after http:// or https://, e.g. https://librenms.example.com"),
+            ("https://[::1", "LIBRENMS_URL cannot be read as a URL, e.g. https://librenms.example.com"),
+        )
+        for url, message in cases:
+            with self.assertRaises(client_mod.ConfigError) as caught:
+                client_mod.settings_from_env({"LIBRENMS_URL": url, "LIBRENMS_TOKEN": hex_token})
+            self.assertEqual(str(caught.exception), message, url)
+            self.assertNotIn(hex_token, str(caught.exception))
+            self.assertNotIn("librenms.example.com/", str(caught.exception))
+
+    def test_missing_settings_name_the_profiles_env_file(self):
+        self.addCleanup(restore_module, "hermes_constants", sys.modules.get("hermes_constants"))
+        for shown, expected in (
+            ("~/.hermes/profiles/netops", "~/.hermes/profiles/netops/.env"),
+            ("~/.hermes", "~/.hermes/.env"),
+            ("/srv/alice/hermes", "the .env file in this profile's HERMES_HOME"),  # a path naming the OS account
+        ):
+            module = types.ModuleType("hermes_constants")
+            module.display_hermes_home = lambda shown=shown: shown
+            sys.modules["hermes_constants"] = module
+            self.assertEqual(client_mod.env_file(), expected)
+            with self.assertRaises(client_mod.ConfigError) as caught:
+                client_mod.settings_from_env({"LIBRENMS_URL": BASE})
+            self.assertEqual(
+                str(caught.exception), f"LIBRENMS_URL and LIBRENMS_TOKEN must both be set (put them in {expected})"
+            )
+        sys.modules["hermes_constants"] = None  # outside Hermes
+        self.assertEqual(client_mod.env_file(), "<HERMES_HOME>/.env (~/.hermes/.env for the default profile)")
 
     def test_a_user_or_password_in_the_url_is_refused_without_quoting_it(self):
         for url in (
@@ -175,11 +240,104 @@ class Config(unittest.TestCase):
     def test_proxy_is_none_a_url_or_refused_without_quoting_it(self):
         self.assertIsNone(client_mod.proxy_from_env(None))
         self.assertEqual(client_mod.proxy_from_env(" NONE "), "none")
-        self.assertEqual(client_mod.proxy_from_env("http://u:pw@proxy:3128"), "http://u:pw@proxy:3128")
-        for junk in ("socks5://u:topsecret@proxy:1080", "topsecret:3128", "http://"):
+        for good in (
+            "http://u:pw@proxy:3128",
+            "https://proxy.example.com",
+            "http://svc-proxy:Pr0xy%23Pa%2Fss%3F!$&'()*+,;=:x@127.0.0.1:3128/",
+            "http://[::1]:3128",
+            "http://token-as-user@proxy:8080",
+        ):
+            self.assertEqual(client_mod.proxy_from_env(good), good)
+        form = "LIBRENMS_PROXY must be none or an http:// or https:// proxy URL: scheme, host and port only"
+        for junk in (
+            "socks5://u:topsecret@proxy:1080",
+            "topsecret:3128",
+            "http://",
+            "http://proxy:topsecret",  # a port that is no number: requests would quote the URL into the log
+            "http://proxy:99999",
+            "http://proxy:3128/topsecret",
+            "http://proxy:3128?topsecret",
+            "http://proxy:3128#topsecret",
+            "http://pro xy:3128",
+        ):
             with self.assertRaises(client_mod.ConfigError) as caught:
                 client_mod.settings_from_env(env(LIBRENMS_PROXY=junk))
+            self.assertEqual(str(caught.exception), form, junk)
+        for junk in (
+            "http://svc-proxy:Pr0xy#topsecret@127.0.0.1:3128",  # what urlsplit read as host "svc-proxy"
+            "http://svc-proxy:Pr0xy/topsecret@127.0.0.1:3128",
+            "http://svc-proxy:Pr0xy?topsecret@127.0.0.1:3128",
+            "http://svc-proxy:top@secret@127.0.0.1:3128",
+            "http://svc-proxy:top secret@127.0.0.1:3128",
+            "http://svc-proxy:topsecret%zz@127.0.0.1:3128",
+        ):
+            with self.assertRaises(client_mod.ConfigError) as caught:
+                client_mod.settings_from_env(env(LIBRENMS_PROXY=junk))
+            self.assertTrue(str(caught.exception).startswith("LIBRENMS_PROXY's user name or password holds"), junk)
             self.assertNotIn("topsecret", str(caught.exception))
+            self.assertNotIn("Pr0xy", str(caught.exception))
+
+    def test_proxy_credentials_never_reach_a_log_line_or_an_error(self):
+        proxy = "http://svc-proxy:Pr0xy%23Pass@127.0.0.1:3128"
+        self.assertEqual(
+            sorted(client_mod.proxy_secrets(proxy)), ["Pr0xy#Pass", "Pr0xy%23Pass", "svc-proxy:Pr0xy%23Pass"]
+        )
+        self.assertEqual(client_mod.proxy_secrets("http://tok3n-as-user@proxy:3128"), ["tok3n-as-user"])
+        for nothing in (None, "none", "http://proxy:3128"):
+            self.assertEqual(client_mod.proxy_secrets(nothing), [])
+        failure = OSError(f"Failed to parse: {proxy} (Pr0xy#Pass)")
+        client, _, _ = make(failure, proxy=proxy)
+        with (
+            self.assertRaises(client_mod.TransportError) as caught,
+            self.assertLogs(client_mod.logger, "WARNING") as logs,
+        ):
+            client.get("devices")
+        self.assertNotIn("Pr0xy", logs.output[0] + str(caught.exception))
+        self.assertIn("http://<redacted>@127.0.0.1:3128 (<redacted>)", logs.output[0])
+        client, _, _ = make(Resp(400, {"status": "error", "message": "proxy said Pr0xy#Pass"}), proxy=proxy)
+        with self.assertRaises(client_mod.LibreNMSError) as caught:
+            client.get("devices")
+        self.assertNotIn("Pr0xy", json.dumps(caught.exception.to_dict()))
+
+    def test_the_environments_proxy_credentials_never_reach_a_log_line_either(self):
+        # with LIBRENMS_PROXY unset requests takes HTTPS_PROXY, which nothing validates (Hermes' model traffic reads
+        # it too): an unencoded "#" in its password fails every request with an error quoting the whole URL
+        proxy = "http://svc:Pr0xy#Pass@127.0.0.1:9"
+        with env_proxies(HTTPS_PROXY=proxy, http_proxy="http://web:W3bPass@127.0.0.1:9", NO_PROXY="localhost"):
+            self.assertEqual(sorted(client_mod.environment_proxy_secrets(BASE)), ["Pr0xy#Pass", "svc:Pr0xy#Pass"])
+            self.assertEqual(
+                sorted(client_mod.environment_proxy_secrets("http://nms.example.com")), ["W3bPass", "web:W3bPass"]
+            )
+            client, _, _ = make(OSError(f"Failed to parse: {proxy}"))
+            with (
+                self.assertRaises(client_mod.TransportError) as caught,
+                self.assertLogs(client_mod.logger, "WARNING") as logs,
+            ):
+                client.get("devices")
+            self.assertNotIn("Pr0xy", logs.output[0] + str(caught.exception))
+            self.assertIn("Failed to parse: http://<redacted>@127.0.0.1:9", logs.output[0])
+            # LIBRENMS_PROXY replaces the environment's proxy, and none ignores it: then requests never reads it
+            self.assertEqual(make(proxy="none")[0]._proxy_secrets, [])
+            self.assertEqual(make(proxy="http://proxy:3128")[0]._proxy_secrets, [])
+        with env_proxies(all_proxy="svc:Pr0xy%23Pass@127.0.0.1:9"):  # no scheme: requests assumes http://
+            self.assertEqual(
+                sorted(client_mod.environment_proxy_secrets(BASE)), ["Pr0xy#Pass", "Pr0xy%23Pass", "svc:Pr0xy%23Pass"]
+            )
+        with env_proxies(HTTPS_PROXY="http://proxy:3128"):
+            self.assertEqual(client_mod.environment_proxy_secrets(BASE), [])
+
+    @unittest.skipUnless(HAVE_REQUESTS, "requests is not installed")
+    def test_requests_failing_on_the_environments_proxy_logs_no_password(self):
+        with env_proxies(HTTPS_PROXY="http://svc:Pr0xy#Pass@127.0.0.1:9"):
+            client = client_mod.LibreNMSClient("https://librenms.invalid", TOKEN)
+            client.retry_sleep = lambda seconds: None
+            with (
+                self.assertRaises(client_mod.TransportError),
+                self.assertLogs(client_mod.logger, "WARNING") as logs,
+            ):
+                client.get("system")
+        self.assertIn("http://<redacted>@127.0.0.1:9", logs.output[0])  # requests did quote the proxy URL
+        self.assertNotIn("Pr0xy", logs.output[0])
 
     def test_is_configured_needs_url_and_token_only(self):
         self.assertFalse(client_mod.is_configured({}))

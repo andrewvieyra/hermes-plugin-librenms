@@ -3,6 +3,7 @@ status), plan / apply / rollback / plans end to end, argument coercion, plan id 
 invariants that the token and existing service parameters never reach a tool result or an audit line."""
 
 import json
+import os
 import unittest
 
 from .base import PluginTestCase
@@ -50,6 +51,23 @@ class Query(HandlerCase):
         warnings = self.call("librenms_query", action="status")["warnings"]
         self.assertTrue(any("require_approval is false" in w for w in warnings), warnings)
         self.assertTrue(any(w.startswith("allow_insecure_transport is on") for w in warnings), warnings)
+
+    def test_status_warns_about_a_sink_credential_written_into_config_yaml_without_quoting_it(self):
+        sink = {"type": "http", "url": "https://hec.example.com", "headers": {"Authorization": "Splunk 3f2a9c1e-77"}}
+        self.settings_mod.set_settings(self.settings_mod.Settings(audit_sinks=[sink]))
+        # what Hermes' raw read finds, where it is importable (JSON is YAML)
+        config = {"plugins": {"entries": {"librenms": {"settings": {"audit_sinks": [sink]}}}}}
+        (self.home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+        out = self.call("librenms_query", action="status")
+        (warning,) = out["warnings"]
+        self.assertTrue(warning.startswith("audit_sinks[0] header Authorization holds a credential written into "))
+        self.assertNotIn("3f2a9c1e", json.dumps(out))
+
+    def test_status_says_only_whether_a_custom_audit_log_path_is_set(self):
+        self.settings_mod.set_settings(self.settings_mod.Settings(audit_log_path="/home/alice/logs/audit.jsonl"))
+        out = self.call("librenms_query", action="status")
+        self.assertEqual(out["settings"]["audit_log_path"], "custom")
+        self.assertNotIn("alice", json.dumps(out))
 
     def test_list_with_params_fields_and_limit(self):
         out = self.call("librenms_query", path="devices", params={"type": "all"}, fields=["hostname"], limit=2)
@@ -402,6 +420,43 @@ class Prune(HandlerCase):
         self.age(stale, 4000)
         self.call("librenms_plan", description="x", operations=[self.update_purpose("edge", 2)])
         self.assertIsNotNone(self.store.load(stale))
+
+    def test_listing_plans_and_status_sweep_too_so_a_profile_that_stops_planning_is_still_pruned(self):
+        self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=1))
+        for name, args in (
+            ("librenms_plans", {}),
+            ("librenms_plans", {"plan_id": "x"}),
+            ("librenms_query", {"action": "status"}),
+        ):
+            self.handlers.reset_state()
+            stale = self.plan([self.update_purpose()])["id"]
+            self.age(stale, 2)
+            self.call(name, {"task_id": "t1"}, **args)
+            self.assertIsNone(self.store.load(stale), name)
+            pruned = self.events("plans_pruned")[-1]
+            self.assertEqual((pruned["plan_ids"], pruned["actor"]["kind"]), ([stale], "model"))
+
+    def test_the_hourly_throttle_is_kept_per_profile(self):
+        # a gateway serving two profiles: one profile's sweep must not hold off the other's for an hour
+        self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=1))
+        os.environ["HERMES_HOME"] = str(self.home / "profiles" / "a")
+        self.call("librenms_plans")  # profile a swept, nothing to remove yet
+        stale = self.plan([self.update_purpose()])["id"]
+        self.age(stale, 2)
+        self.call("librenms_plans")
+        self.assertIsNotNone(self.store.load(stale))  # profile a: within its hour
+        os.environ["HERMES_HOME"] = str(self.home / "profiles" / "b")
+        self.call("librenms_plans")
+        self.assertIsNone(self.store.load(stale))  # profile b: its own first sweep
+
+    def test_a_failing_sweep_never_fails_the_call(self):
+        self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=1))
+
+        def broken(*args, **kwargs):
+            raise OSError("disk gone")
+
+        self.store.prune = broken
+        self.assertTrue(self.call("librenms_plans")["success"])
 
 
 if __name__ == "__main__":

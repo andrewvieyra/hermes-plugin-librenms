@@ -38,6 +38,8 @@ def register(ctx) -> None:
     # status shows these too, but an operator who never runs it would not learn that a setting fell back
     for error in settings.get_settings().errors:
         logger.warning("librenms settings: %s", error)
+    for warning in sinks.literal_credential_warnings():  # reads config.yaml through Hermes; no network
+        logger.warning("librenms settings: %s", warning)
     audit.set_ctx(ctx)
     audit.set_audit_log(None)  # re-resolve path/enabled from the fresh settings
     sinks.set_worker(None)  # sinks are built lazily from the fresh settings on first event

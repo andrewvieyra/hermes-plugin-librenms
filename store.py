@@ -1,8 +1,9 @@
 """Plan persistence: one JSON file per plan under the plugin's data directory.
 
 The plan file is the source of truth during apply: the journal is flushed after every step so an interrupted
-apply leaves a file that ``librenms_rollback`` can act on. Files are ``0600`` in ``0700`` directories and every
-write is fsynced, because a plan holds what rollback needs (service parameters included).
+apply leaves a file that ``librenms_rollback`` can act on. Files are ``0600`` in ``0700`` directories (the data
+directory itself included, which Hermes' helper creates under the umask) and every write is fsynced, because a plan
+holds what rollback needs (service parameters included).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import itertools
 import json
 import os
 import secrets
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,23 +35,56 @@ class RunLockBusy(RuntimeError):
     running."""
 
 
-def data_dir() -> Path:
-    """``<HERMES_HOME>/plugin-data/librenms``, resolved on every call so it follows the active Hermes profile:
-    Hermes' own helper when importable, else its home resolver, else ``$HERMES_HOME`` or ``~/.hermes``."""
-    try:
-        from plugins.plugin_storage import plugin_data_dir  # type: ignore
-
-        return Path(plugin_data_dir(PLUGIN_NAME))
-    except Exception:
-        pass
+def _hermes_home() -> Path:
+    """The active profile's home: Hermes' resolver, else ``$HERMES_HOME`` or ``~/.hermes``."""
     try:
         from hermes_constants import get_hermes_home  # type: ignore
 
-        return Path(get_hermes_home()) / "plugin-data" / PLUGIN_NAME
+        return Path(get_hermes_home())
     except Exception:
         pass
-    home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
-    return Path(home) / "plugin-data" / PLUGIN_NAME
+    return Path(os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes"))
+
+
+def profile_key() -> str:
+    """Which Hermes profile is active, as a key: Hermes' ``hermes_home_key`` when importable, else the home's path.
+    Per-profile state in this process (the retention throttle, the audit sink workers) is kept under it."""
+    try:
+        from hermes_constants import hermes_home_key  # type: ignore
+
+        return str(hermes_home_key())
+    except Exception:
+        return str(_hermes_home())
+
+
+def data_dir() -> Path:
+    """``<HERMES_HOME>/plugin-data/librenms``, resolved on every call so it follows the active Hermes profile:
+    Hermes' own helper when importable (it creates the directory), else the home resolver. Kept ``0700``: Hermes
+    creates it under the process umask, usually ``0755``, which lets other accounts list the plans and watch the
+    audit log grow, so a directory this account owns is narrowed when found wider (it is the plugin's own; a log
+    shipper should read a copy at ``audit_log_path`` instead)."""
+    try:
+        from plugins.plugin_storage import plugin_data_dir  # type: ignore
+
+        path = Path(plugin_data_dir(PLUGIN_NAME))
+    except Exception:
+        path = _hermes_home() / "plugin-data" / PLUGIN_NAME
+    _narrow(path)
+    return path
+
+
+def _narrow(path: Path) -> None:
+    """``chmod 0700`` *path* when it is a directory (not a link to one) owned by this account and open to anyone
+    else; nothing when it does not exist yet (:func:`private_dir` will create it ``0700``), cannot be changed, or
+    the platform has no POSIX owners and modes (Windows)."""
+    if not hasattr(os, "geteuid"):
+        return
+    try:
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and info.st_mode & 0o077:
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
 
 
 def default_plans_dir() -> Path:

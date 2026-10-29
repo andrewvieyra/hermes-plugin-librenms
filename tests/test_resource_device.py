@@ -12,7 +12,7 @@ from .helpers import submodule
 
 PLAN_ID = "lnp-20261028T120000Z-ab12"
 CLIENT_LOG = "hermes_plugins.librenms.client"  # transport failures are detailed there, under their error id
-ENV = "LIBRENMS_SNMP_COMMUNITY"
+ENV = "LIBRENMS_SNMP_COMMUNITY_SECRET"
 COMMUNITY = "Env-Comm-9x!"  # the value behind ENV: it may reach LibreNMS and nothing else
 OVERRIDE = (
     "LibreNMS re-assigns the location from SNMP sysLocation on every poll unless override_sysLocation is true; "
@@ -23,8 +23,9 @@ RETARGET = (
     "plugins.entries.librenms.settings.allow_device_add: true"
 )
 LITERAL = (
-    "SNMP credentials are never written into a plan; set an environment variable such as LIBRENMS_SNMP_COMMUNITY "
-    'and pass {"env": "LIBRENMS_SNMP_COMMUNITY"}, or omit the field to use LibreNMS\'s default credentials'
+    "SNMP credentials are never written into a plan; set an environment variable such as "
+    'LIBRENMS_SNMP_COMMUNITY_SECRET and pass {"env": "LIBRENMS_SNMP_COMMUNITY_SECRET"}, or omit the field to use '
+    "LibreNMS's default credentials"
 )
 DELETE_NOTE = (
     "deleting a device removes its RRD history, ports, alerts and group membership; LibreNMS cannot restore it and "
@@ -173,6 +174,32 @@ class Validation(DeviceCase):
         os.environ[ENV] = COMMUNITY
         self.assertEqual(self.validate("create", data), [])
         self.assertEqual(self.validate("create", {"hostname": "new.example.net", "community": None}), [])
+
+    def test_a_secret_lives_in_a_variable_whose_name_hermes_masks(self):
+        # Hermes masks an environment dump's value by the variable's name: always for *_SECRET, *_PASS and
+        # *_PASSWORD, never for LIBRENMS_SNMP_COMMUNITY or LIBRENMS_SNMP_V3_PRIV (0.1.0's suggestions)
+        unmasked = (
+            "the environment variable must be named LIBRENMS_SNMP_<NAME> ending in _SECRET, _PASS or _PASSWORD (A-Z, "
+            "0-9 and _), such as LIBRENMS_SNMP_COMMUNITY_SECRET or LIBRENMS_SNMP_V3_AUTH_PASS: Hermes masks only "
+            "such names when the agent's terminal prints the environment"
+        )
+        names = ("LIBRENMS_SNMP_COMMUNITY", "LIBRENMS_SNMP_V3_PRIV", "LIBRENMS_SNMP_CORE_KEY", "LIBRENMS_SNMP_XSECRET")
+        for name in names:
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = COMMUNITY
+            for field in ("community", "authpass", "cryptopass"):
+                errors = self.validate("create", {"hostname": "new.example.net", field: {"env": name}})
+                self.assertIn(f"{field}: {unmasked}", errors, (field, name))
+        names = ("LIBRENMS_SNMP_SECRET", "LIBRENMS_SNMP_V3_AUTH_PASS", "LIBRENMS_SNMP_EDGE_2_PASSWORD")
+        for name in names:
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = COMMUNITY
+            self.assertEqual(self.validate("create", {"hostname": "new.example.net", "community": {"env": name}}), [])
+        # the SNMPv3 user name is no password: any LIBRENMS_SNMP_ name will do
+        os.environ["LIBRENMS_SNMP_COMMUNITY"] = "snmp-user"
+        data = {"hostname": "new.example.net", "snmpver": "v3", "authlevel": "noAuthNoPriv",
+                "authname": {"env": "LIBRENMS_SNMP_COMMUNITY"}}  # fmt: skip
+        self.assertEqual(self.validate("create", data), [])
 
     def test_snmpv3_fields_must_agree(self):
         os.environ[ENV] = COMMUNITY
@@ -418,8 +445,8 @@ class Planning(DeviceCase):
         self.assertEqual(
             self.res.describe(step),
             [
-                'hostname="new-sw9.example.net", community=$LIBRENMS_SNMP_COMMUNITY, override_sysLocation=true, '
-                'snmpver="v2c", port=1161, force_add=false, location_id=3',
+                'hostname="new-sw9.example.net", community=$LIBRENMS_SNMP_COMMUNITY_SECRET, '
+                'override_sysLocation=true, snmpver="v2c", port=1161, force_add=false, location_id=3',
                 'precondition: no device matches {"hostname": "new-sw9.example.net"}',
             ],
         )
@@ -760,7 +787,7 @@ class Execute(DeviceCase):
             self.apply(step)
         self.assertEqual(
             str(ctx.exception),
-            "community: LIBRENMS_SNMP_COMMUNITY is not set in this Hermes profile's environment; set it and apply",
+            f"community: {ENV} is not set in this Hermes profile's environment; set it and apply",
         )
         self.assertEqual(self.writes(), [])
 
@@ -774,6 +801,19 @@ class Execute(DeviceCase):
         self.assertEqual((ctx.exception.kind, ctx.exception.status), ("api", 400))
         self.assertIn('community "<redacted>"', str(ctx.exception))
         self.assertNotIn(COMMUNITY, json.dumps(ctx.exception.to_dict()))
+
+    def test_a_community_shorter_than_four_characters_is_scrubbed_too(self):
+        os.environ[ENV] = "pub"
+        step = self.plan("create", {"hostname": "new-sw9.example.net", "community": {"env": ENV}})
+        echoed = {"status": "error", "message": "SNMP v2c: No reply using pub (public, published)"}
+        self.fake.fail_on("POST", r"devices", 400, echoed)
+        with self.assertRaises(self.LibreNMSError) as ctx:
+            self.apply(step)
+        # where it stands alone; inside a longer word it would mask half the message
+        self.assertEqual(
+            str(ctx.exception),
+            "POST /api/v0/devices -> HTTP 400: SNMP v2c: No reply using <redacted> (public, published)",
+        )
 
     def test_create_whose_answer_was_lost_is_found_and_rolled_back(self):
         self.fake.fail_on("POST", r"devices", exc=TimeoutError("read timed out"), commit=True)

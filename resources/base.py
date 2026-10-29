@@ -865,7 +865,7 @@ class Resource:
         """*exc*, or a StepError with scrubbed text when its message or body carries a sensitive value."""
         values = [value for record in records for value in self._secrets(record)]
         body = str(getattr(exc, "body", "") or "")
-        if any(value in str(exc) or value in body for value in values):
+        if redact.holds_any(str(exc), values) or redact.holds_any(body, values):
             return StepError(self.scrub(str(exc), *records))
         return exc
 

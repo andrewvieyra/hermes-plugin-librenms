@@ -3,8 +3,8 @@
   "operations": [
     {"op": "create", "resource": "device",
      "data": {"hostname": "branch-rtr7.example.net", "snmpver": "v3", "authlevel": "authPriv",
-              "authname": {"env": "LIBRENMS_SNMP_V3_USER"}, "authpass": {"env": "LIBRENMS_SNMP_V3_AUTH"},
-              "authalgo": "SHA-256", "cryptopass": {"env": "LIBRENMS_SNMP_V3_PRIV"}, "cryptoalgo": "AES-256",
+              "authname": {"env": "LIBRENMS_SNMP_V3_USER"}, "authpass": {"env": "LIBRENMS_SNMP_V3_AUTH_PASS"},
+              "authalgo": "SHA-256", "cryptopass": {"env": "LIBRENMS_SNMP_V3_PRIV_PASS"}, "cryptoalgo": "AES-256",
               "location": "NYC-2", "override_sysLocation": true, "poller_group": 1}}
   ]
 }

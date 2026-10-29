@@ -12,6 +12,7 @@ import unittest
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from .base import PluginTestCase
 from .fake_librenms import TOKEN
@@ -505,6 +506,124 @@ class EventStream(AuditCase):
         with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"):
             record = audit.emit("apply_started", plan_id="lnp-1")
         self.assertEqual(record["event"], "apply_started")
+
+    def test_the_log_is_never_written_through_a_symlink(self):
+        # in a directory another account can write to, a link planted at the log's name would take every event
+        victim = self.tmp / "victim.txt"
+        victim.write_text("untouched\n")
+        os.symlink(victim, self.audit_path)
+        recorder = Recorder()
+        sinks.set_worker(sinks.SinkWorker([recorder]))
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            record = audit.emit("plan_created", plan_id="lnp-1", description="Move core-sw1")
+        self.assertEqual(record["event"], "plan_created")  # the operation goes on, and the sinks still get it
+        self.assertEqual(victim.read_text(), "untouched\n")
+        self.assertIn("librenms audit log write failed", logs.output[0])
+        self.assertTrue(sinks.get_worker().flush(2))
+        self.assertEqual([r["event"] for r in recorder.records], ["plan_created"])
+
+    def test_the_log_is_never_written_through_a_hard_link(self):
+        # any account may hard-link a file it can reach (macOS has no protected_hardlinks), so a link planted at the
+        # log's name passes for a regular file this account owns: the victim's .zshrc would get the users' messages
+        victim = self.tmp / "victim.txt"
+        victim.write_text("untouched\n")
+        os.link(victim, self.audit_path)
+        recorder = Recorder()
+        sinks.set_worker(sinks.SinkWorker([recorder]))
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            record = audit.emit("plan_created", plan_id="lnp-1", actor={"request": "$(touch /tmp/pwned)"})
+        self.assertEqual(record["event"], "plan_created")
+        self.assertEqual(victim.read_text(), "untouched\n")
+        self.assertIn("has other hard links", logs.output[0])
+        self.assertTrue(sinks.get_worker().flush(2))
+        self.assertEqual([r["event"] for r in recorder.records], ["plan_created"])
+
+    def open_then(self, after_open):
+        """``os.open`` that runs *after_open(attempt)* once the log itself is opened: what another process does to
+        the name between the open and the check."""
+        real_open, attempts = os.open, []
+
+        def opener(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if Path(path) == self.audit_path:
+                attempts.append(path)
+                after_open(len(attempts))
+            return fd
+
+        return mock.patch.object(audit.os, "open", opener), attempts
+
+    def test_a_hard_link_removed_between_the_open_and_the_check_is_caught(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("untouched\n")
+        os.link(victim, self.audit_path)
+        patched, attempts = self.open_then(lambda attempt: self.audit_path.unlink() if attempt == 1 else None)
+        with patched, self.assertNoLogs("hermes_plugins.librenms.audit", level="WARNING"):
+            audit.emit("plan_created", plan_id="lnp-1")
+        self.assertEqual(victim.read_text(), "untouched\n")  # the victim's file was open, but never written
+        self.assertEqual(len(attempts), 2)  # opened again: the log's name now holds a new file of this account's
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-1"])
+
+        def relink(attempt):  # removed and planted again: the name leads to the victim, which has two names
+            self.audit_path.unlink()
+            os.link(victim, self.audit_path)
+
+        self.audit_path.unlink()
+        os.link(victim, self.audit_path)
+        patched, attempts = self.open_then(relink)
+        with patched, self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            audit.emit("plan_created", plan_id="lnp-2")
+        self.assertEqual(victim.read_text(), "untouched\n")
+        self.assertIn("has other hard links", logs.output[0])
+
+        def swap(attempt):  # the name moved off the file just opened, and a file planted there, every time
+            self.audit_path.rename(self.tmp / f"moved-{attempt}")
+            self.audit_path.write_text("planted\n")
+
+        self.audit_path.unlink()
+        patched, attempts = self.open_then(swap)
+        with patched, self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            audit.emit("plan_created", plan_id="lnp-3")
+        self.assertEqual(len(attempts), 2)  # no third open
+        written = [path.read_text() for path in (self.tmp / "moved-1", self.tmp / "moved-2", self.audit_path)]
+        self.assertEqual(written, ["", "planted\n", "planted\n"])  # none of them got the event
+        self.assertIn("replaced as it was opened", logs.output[0])
+
+    def test_a_rotation_between_the_open_and_the_check_loses_no_event(self):
+        audit.emit("plan_created", plan_id="lnp-1")
+        rotated = self.tmp / "audit.jsonl.1"
+        patched, attempts = self.open_then(lambda attempt: self.audit_path.rename(rotated) if attempt == 1 else None)
+        with patched, self.assertNoLogs("hermes_plugins.librenms.audit", level="WARNING"):
+            audit.emit("plan_created", plan_id="lnp-2")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual([json.loads(line)["plan_id"] for line in rotated.read_text().splitlines()], ["lnp-1"])
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-2"])
+        # removed rather than renamed: the file just opened has no name left, and the event goes to a new one
+        patched, attempts = self.open_then(lambda attempt: self.audit_path.unlink() if attempt == 1 else None)
+        with patched, self.assertNoLogs("hermes_plugins.librenms.audit", level="WARNING"):
+            audit.emit("plan_created", plan_id="lnp-3")
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-3"])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_a_fifo_at_the_logs_name_is_refused_without_waiting_for_a_reader(self):
+        os.mkfifo(self.audit_path)
+        started = time.monotonic()
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"):
+            self.assertIsNotNone(audit.emit("plan_created", plan_id="lnp-1"))
+        self.assertLess(time.monotonic() - started, 2)
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), "no file owners on this platform")
+    def test_a_file_another_account_owns_is_refused(self):
+        self.audit_path.write_text("")
+        real = os.geteuid()
+        with (
+            mock.patch.object(audit.os, "geteuid", return_value=real + 1),  # the file is now someone else's
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            audit.emit("plan_created", plan_id="lnp-1")
+        self.assertIn("owned by another account", logs.output[0])
+        self.assertEqual(self.audit_path.read_text(), "")
+        audit.emit("plan_created", plan_id="lnp-2")
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-2"])
 
     def test_default_path_follows_the_profile_and_settings_override(self):
         audit.set_audit_log(None)

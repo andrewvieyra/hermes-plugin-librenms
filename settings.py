@@ -13,6 +13,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List
@@ -59,7 +60,7 @@ class Settings:
     max_maintenance_hours: int = 72
     plan_retention_days: int = 90  # 0 keeps plans forever
     audit_log: bool = True
-    audit_log_path: str = ""  # empty = <HERMES_HOME>/plugin-data/librenms/audit.jsonl
+    audit_log_path: str = ""  # absolute; empty = <HERMES_HOME>/plugin-data/librenms/audit.jsonl
     audit_include_request: bool = True
     link_eventlog: bool = True  # cross-reference LibreNMS' eventlog after apply/rollback
     audit_sinks: List[Dict[str, Any]] = field(default_factory=list)  # see sinks.py
@@ -109,7 +110,14 @@ class Settings:
 
     def public(self) -> Dict[str, Any]:
         """What status may show the model: sink entries become a count and their types, because a sink's url or
-        headers can carry a collector's credentials."""
+        headers can carry a collector's credentials, and ``audit_log_path`` only whether it is set (``custom``),
+        because a path names the OS account."""
+        values = self._summary()
+        values["audit_log_path"] = "custom" if self.audit_log_path else ""
+        return values
+
+    def _summary(self) -> Dict[str, Any]:
+        """Every setting, with sink entries reduced to their count and types (what :meth:`digest` covers)."""
         values = self.to_dict()
         values["audit_sinks"] = {
             "count": len(self.audit_sinks),
@@ -118,9 +126,11 @@ class Settings:
         return values
 
     def digest(self) -> str:
-        """Short SHA-256 of :meth:`public` as canonical JSON: the same settings give the same digest in every
-        process, so audit events can show which configuration a run used without carrying it."""
-        text = json.dumps(self.public(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+        """Short SHA-256 of the settings as canonical JSON, sink entries reduced to their count and types: the same
+        settings give the same digest in every process, so audit events can show which configuration a run used
+        without carrying it. A different ``audit_log_path`` gives a different digest, though status shows neither
+        path."""
+        text = json.dumps(self._summary(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
         return hashlib.sha256(text.encode("ascii")).hexdigest()[:12]
 
 
@@ -140,9 +150,14 @@ def coerce(name: str, raw: Any, default: Any, errors: List[str]) -> Any:
         if text in WRITE_MODES:
             return text
         return _reject(name, f"one of {', '.join(WRITE_MODES)}", _shown(raw), _FAIL_CLOSED[name], errors)
-    if isinstance(raw, str):
-        return raw.strip()  # paths keep their case
-    return _reject(name, "text", _shown(raw), default, errors)
+    if not isinstance(raw, str):
+        return _reject(name, "text", _shown(raw), default, errors)
+    text = raw.strip()  # paths keep their case
+    if name == "audit_log_path" and text and not os.path.isabs(os.path.expanduser(text)):
+        # a relative path would land in whatever directory each process (gateway, cron, CLI) was started from; the
+        # path itself is not quoted, since it names the OS account and status shows errors to the model
+        return _reject(name, "an absolute path (~ is expanded)", "a relative path", default, errors)
+    return text
 
 
 def flag(raw: Any) -> bool | None:

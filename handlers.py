@@ -22,17 +22,18 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Tuple
 
-from . import audit
+from . import audit, sinks
 from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
 from .executor import ExecutionRefused, apply_plan, pending_entries, render_journal, rollback_plan
 from .planner import PlanError, build_plan, render_plan
 from .redact import for_model, mask, one_line, printable
 from .routes import QueryError, prepare
 from .settings import Settings, get_settings
-from .store import PlanStore, get_store
+from .store import PlanStore, get_store, profile_key
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,9 @@ _RULE_KEY_RE = re.compile(
 )
 _MIN_FRAGMENT = 4  # hex digits in a plan id's random suffix
 _PRUNE_INTERVAL = 3600.0
-_last_prune_at: float | None = None  # None = never pruned in this process (0.0 is a valid monotonic value)
+# store.profile_key() -> when this process last swept that profile's plans (absent: never)
+_last_prune_at: Dict[str, float] = {}
+_prune_lock = threading.Lock()
 _client_factory: Callable[[], LibreNMSClient] | None = None
 
 
@@ -103,9 +106,9 @@ def make_client(settings: Settings | None = None) -> LibreNMSClient:
 
 
 def reset_state() -> None:
-    """Test seam: forget the last retention sweep, so the next plan runs one."""
-    global _last_prune_at
-    _last_prune_at = None
+    """Test seam: forget the last retention sweeps, so the next call that sweeps runs one."""
+    with _prune_lock:
+        _last_prune_at.clear()
 
 
 def check_requirements() -> bool:
@@ -223,16 +226,21 @@ def prune_plans(
     return {"max_age_days": max_age, "dry_run": dry_run, "removed": removed}
 
 
-def _maybe_prune(actor: Dict[str, Any]) -> None:
-    """Opportunistic retention sweep, at most once per process per hour; never raises."""
-    global _last_prune_at
-    if get_settings().plan_retention_days <= 0:
-        return
-    if _last_prune_at is not None and time.monotonic() - _last_prune_at < _PRUNE_INTERVAL:
-        return
-    _last_prune_at = time.monotonic()
-    with contextlib.suppress(Exception):  # retention is housekeeping; a failure must not affect planning
-        prune_plans(actor=actor)
+def maybe_prune(actor: Dict[str, Any] | Callable[[], Dict[str, Any]]) -> None:
+    """Opportunistic retention sweep of the active profile's plans, at most once an hour per profile in this
+    process: planning, listing plans, status and every ``/librenms`` or ``hermes librenms`` command call it, so a
+    profile that stops planning is still swept. *actor* (or a function making it, called only when a sweep runs)
+    is recorded on ``plans_pruned``. Never raises: retention is housekeeping and must not affect the call."""
+    with contextlib.suppress(Exception):
+        if get_settings().plan_retention_days <= 0:
+            return
+        key, now = profile_key(), time.monotonic()
+        with _prune_lock:
+            last = _last_prune_at.get(key)
+            if last is not None and now - last < _PRUNE_INTERVAL:
+                return
+            _last_prune_at[key] = now
+        prune_plans(actor=actor() if callable(actor) else actor)
 
 
 def status_report(settings: Settings | None = None) -> Dict[str, Any]:
@@ -254,6 +262,7 @@ def status_report(settings: Settings | None = None) -> Dict[str, Any]:
             "write_mode is full and require_approval is false: the model can apply and roll back plans without "
             "anyone approving them"
         )
+    warnings += sinks.literal_credential_warnings()
     return {
         "librenms_url": client.base_url,
         "librenms": for_model(system),
@@ -384,6 +393,7 @@ def librenms_query(args: Dict[str, Any], **kwargs: Any) -> str:
     settings = get_settings()
     action = str(args.get("action") or "get").strip().lower()
     if action == "status":
+        maybe_prune(lambda: _actor_from(kwargs))
         return _ok(**status_report(settings))
     if action != "get":
         return _fail(f"action must be get or status (got {action[:40]!r})")
@@ -445,7 +455,7 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
         )
         raise
     get_store().create(plan)  # may give the plan a new id on a collision: read plan["id"] only after this
-    _maybe_prune(actor)
+    maybe_prune(actor)
     audit.emit(
         "plan_created",
         plan_id=plan["id"],
@@ -582,7 +592,8 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 @guarded
-def librenms_plans(args: Dict[str, Any], **_: Any) -> str:
+def librenms_plans(args: Dict[str, Any], **kwargs: Any) -> str:
+    maybe_prune(lambda: _actor_from(kwargs))
     store = get_store()
     if str(args.get("plan_id") or "").strip():
         _plan_id, plan, candidates = find_plan(store, args.get("plan_id"))

@@ -101,7 +101,8 @@ LIBRENMS_PLAN = _schema(
     "icon, hostname to rename), create (hostname, snmpver, port, transport, poller_group, location, "
     "override_sysLocation, display_template, overwrite_ip, port_association_mode, force_add, ping_fallback, "
     "snmp_disable, sysName, hardware, os, authlevel, authalgo, "
-    'cryptoalgo; community, authname, authpass, cryptopass only as {"env": "LIBRENMS_SNMP_<NAME>"} or omitted), '
+    'cryptoalgo; community, authname, authpass, cryptopass only as {"env": "LIBRENMS_SNMP_<NAME>"} or omitted, '
+    "the name ending _SECRET, _PASS or _PASSWORD except for authname), "
     "delete, maintenance, discover. location: create (location, lat, lng), update (location, lat, lng), delete, "
     "maintenance. device_group: create (name, type static|dynamic, desc, devices or rules), update (name, desc, "
     "devices or devices_add/devices_remove, rules), delete, maintenance. service: create (device, type, ip, desc, "

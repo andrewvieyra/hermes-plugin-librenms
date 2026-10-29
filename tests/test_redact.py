@@ -73,6 +73,19 @@ class ScrubText(unittest.TestCase):
         )
         self.assertEqual(text, f"check -H x -p {redact.MASK} then {redact.MASK}")
 
+    def test_a_short_secret_is_replaced_where_it_stands_alone(self):
+        # a three-character community is still a credential; inside "public" or "pub1" it is not that community
+        text = "community pub failed (pub), public pub1 _pub-pub"
+        self.assertEqual(
+            redact.scrub_values(text, ["pub", ""]),
+            "community <redacted> failed (<redacted>), public pub1 _<redacted>-<redacted>",
+        )
+        self.assertTrue(redact.holds_any(text, ["pub"]))
+        self.assertFalse(redact.holds_any("public pub1", ["pub"]))
+        self.assertTrue(redact.holds_any("in publicity", ["publ"]))  # four characters and more: anywhere
+        self.assertFalse(redact.holds_any("anything", ["", None]))
+        self.assertEqual(redact.scrub_text('{"x": "ab"}', None, extra=["ab"]), f'{{"x": "{redact.MASK}"}}')
+
     def test_credential_pairs_are_masked_in_free_text(self):
         text = redact.scrub_text(
             "SQL: insert (\"community\":\"pub lic\", 'authpass': 'x y', password=hunter2; X-Auth-Token: tok123)"

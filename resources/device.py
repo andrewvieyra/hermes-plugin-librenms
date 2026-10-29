@@ -48,6 +48,11 @@ V3_KEYS = ("authlevel", "authname", "authpass", "authalgo", "cryptopass", "crypt
 # add_device reads these with !empty(): the string "false" would switch them on, so they are sent only when true.
 SEND_WHEN_TRUE = ("force_add", "ping_fallback", "snmp_disable")
 ENV_NAME = re.compile(r"LIBRENMS_SNMP_[A-Z0-9_]{1,64}")
+# A community or an SNMPv3 password must live in a variable whose name ends in a word Hermes always masks when an
+# environment dump reaches the model through its terminal tool (TOKEN and KEY are masked only for long values):
+# Hermes hands the profile's .env to that tool's shells. The SNMPv3 user name (authname) may be named freely.
+SECRET_ENV_NAME = re.compile(r"LIBRENMS_SNMP_(?:[A-Z0-9_]{0,55}_)?(?:SECRET|PASS|PASSWORD)")
+SECRET_ENV_SUFFIXES = "_SECRET, _PASS or _PASSWORD"
 # What add_device accepts as a host name or an IP address; a "/" or a space could not be put in a rename path.
 HOSTNAME = re.compile(r"(?=.*[A-Za-z0-9])[A-Za-z0-9_.:-]{1,253}")
 # add_device probes the host (ping, then SNMP with each default credential) before it answers, and del_device
@@ -79,8 +84,14 @@ _START = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 _START_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 _LITERAL_CREDENTIAL = (
-    "SNMP credentials are never written into a plan; set an environment variable such as LIBRENMS_SNMP_COMMUNITY "
-    'and pass {"env": "LIBRENMS_SNMP_COMMUNITY"}, or omit the field to use LibreNMS\'s default credentials'
+    "SNMP credentials are never written into a plan; set an environment variable such as "
+    'LIBRENMS_SNMP_COMMUNITY_SECRET and pass {"env": "LIBRENMS_SNMP_COMMUNITY_SECRET"}, or omit the field to use '
+    "LibreNMS's default credentials"
+)
+_UNMASKED_NAME = (
+    f"the environment variable must be named LIBRENMS_SNMP_<NAME> ending in {SECRET_ENV_SUFFIXES} (A-Z, 0-9 and "
+    "_), such as LIBRENMS_SNMP_COMMUNITY_SECRET or LIBRENMS_SNMP_V3_AUTH_PASS: Hermes masks only such names when "
+    "the agent's terminal prints the environment"
 )
 _SNMP_UPDATE = "LibreNMS API v0 cannot change SNMP settings or credentials of an existing device"
 _RETARGET = (
@@ -219,8 +230,9 @@ def _number(field: Field, value: Any) -> int | None:
 
 
 def _credential_problem(name: str, value: Any) -> str | None:
-    """Why an SNMP credential cannot be planned: only a reference to a set LIBRENMS_SNMP_* variable can. A
-    literal is never quoted back (it is the secret)."""
+    """Why an SNMP credential cannot be planned: only a reference to a set LIBRENMS_SNMP_* variable can, and for
+    a community or password one whose name Hermes masks (:data:`SECRET_ENV_NAME`). A literal is never quoted back
+    (it is the secret)."""
     if value is None:
         return None
     env = diff.env_name(value)
@@ -228,6 +240,8 @@ def _credential_problem(name: str, value: Any) -> str | None:
         return f"{name}: {_LITERAL_CREDENTIAL}"
     if not ENV_NAME.fullmatch(env):
         return f"{name}: the environment variable must be named LIBRENMS_SNMP_<NAME> (A-Z, 0-9 and _)"
+    if name != "authname" and not SECRET_ENV_NAME.fullmatch(env):
+        return f"{name}: {_UNMASKED_NAME}"
     try:
         present = bool(secret(env))
     except LibreNMSError as exc:
@@ -239,7 +253,7 @@ def _without_secrets(exc: LibreNMSError, secrets: List[str]) -> LibreNMSError:
     """*exc*, or a copy of the same kind and status whose text no longer carries a resolved SNMP credential (the
     kind and status decide whether the write may have happened)."""
     body = "" if exc.body is None else str(exc.body)
-    if not any(value in str(exc) or value in body for value in secrets):
+    if not (redact.holds_any(str(exc), secrets) or redact.holds_any(body, secrets)):
         return exc
     message = redact.scrub_text(str(exc), None, extra=secrets)
     return LibreNMSError(message, status=exc.status, method=exc.method, path=exc.path, kind=exc.kind)

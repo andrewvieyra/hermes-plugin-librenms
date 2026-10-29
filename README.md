@@ -56,7 +56,8 @@ reverse order on failure. That logic lives in Python here and runs the same way 
                                   status: applied | failed
 ```
 
-A plan is a JSON file under `~/.hermes/plugin-data/librenms/plans/`. Each step is journaled before
+A plan is a JSON file under `<HERMES_HOME>/plugin-data/librenms/plans/` (`~/.hermes` is the default
+profile's home). Each step is journaled before
 its write is sent and again after it, so an interrupted run leaves a journal that
 `librenms_rollback` (or the CLI) can finish. See [docs/architecture.md](docs/architecture.md) for
 the full model and guarantees.
@@ -71,7 +72,9 @@ and an API token for a user with the permissions you intend to grant the agent.
 hermes plugins install andrewvieyra/hermes-plugin-librenms
 ```
 
-Hermes prompts for `LIBRENMS_URL` and `LIBRENMS_TOKEN` and stores them in `~/.hermes/.env`. Then:
+Hermes prompts for `LIBRENMS_URL` and `LIBRENMS_TOKEN` and stores them in the active profile's
+`.env`: `~/.hermes/.env` for the default profile, `~/.hermes/profiles/<name>/.env` for a named one.
+Then:
 
 ```bash
 hermes plugins enable librenms
@@ -81,7 +84,7 @@ Start a new session. The tools show up in the `librenms` toolset and `/librenms 
 connectivity, the LibreNMS version, the write mode, and any setting it could not read.
 
 Manual install works too: clone this repository to `~/.hermes/plugins/librenms`, add the two
-variables to `~/.hermes/.env`, and enable the plugin.
+variables to `<HERMES_HOME>/.env` (`~/.hermes/.env` for the default profile), and enable the plugin.
 
 ### The token
 
@@ -99,7 +102,10 @@ to unmask device credentials receives SNMP communities and passwords in device p
 refuses the rediscovery route in `librenms_query` (and any path that would reach it through an
 encoded `/`), never writes the eventlog, and masks credential fields in every result, but a token without those rights is the safeguard LibreNMS enforces itself.
 Hermes does not hide a standalone plugin's environment from the agent's terminal tool, so a model
-with that tool can read `LIBRENMS_TOKEN`: scope it accordingly. See [SECURITY.md](SECURITY.md).
+with that tool can read `LIBRENMS_TOKEN`, `LIBRENMS_PROXY` and the `LIBRENMS_SNMP_*` credentials:
+scope the token accordingly. Hermes masks a value in a printed environment by the variable's name,
+which covers `LIBRENMS_TOKEN` and the SNMP credential names the plugin accepts, but not a password
+inside `LIBRENMS_PROXY`. See [SECURITY.md](SECURITY.md).
 
 ### Configuration
 
@@ -123,7 +129,7 @@ plugins:
         max_maintenance_hours: 72    # longest maintenance window a plan may schedule
         plan_retention_days: 90      # prune plan files older than this; 0 keeps them forever
         audit_log: true              # append events to audit.jsonl
-        audit_log_path: ""           # empty = <HERMES_HOME>/plugin-data/librenms/audit.jsonl
+        audit_log_path: ""           # absolute; empty = <HERMES_HOME>/plugin-data/librenms/audit.jsonl
         audit_include_request: true  # record the triggering message (masked, truncated) in the actor
         link_eventlog: true          # attach LibreNMS eventlog ids to the journal after apply/rollback
         audit_sinks: []              # optional syslog / HTTP forwarding, see docs/sinks.md
@@ -131,8 +137,11 @@ plugins:
 
 A value that cannot be read as its setting's type fails closed: a flag takes the value that lets the
 model do least, a number its default (or its upper limit when it is too large), and an unknown
-`write_mode` becomes `read_only`. `/librenms status` lists every such fallback. Settings are re-read
-on each call, so a change in `config.yaml` or the Desktop settings form applies without a restart.
+`write_mode` becomes `read_only`, and a relative `audit_log_path` is the default path.
+`/librenms status` lists every such fallback. Settings are re-read on each call, so a change in
+`config.yaml` or the Desktop settings form applies without a restart. Retention is applied at most
+hourly per profile, when a plan is made or listed, on status and on every `/librenms` or `hermes
+librenms` command; for a strict policy, run `hermes librenms prune` from cron.
 
 Environment variables (connection only; nothing that relaxes a safeguard is read from the
 environment):
@@ -143,8 +152,9 @@ environment):
 | `LIBRENMS_TOKEN` | yes | API token, sent only in the `X-Auth-Token` header |
 | `LIBRENMS_VERIFY_SSL` | no | `true` (default), `false` (needs `allow_insecure_transport`), or the path of a CA bundle file or directory |
 | `LIBRENMS_TIMEOUT` | no | Seconds to connect and to wait for each read (`30`), or both apart (`5,60`) |
-| `LIBRENMS_PROXY` | no | Unset: the usual proxy variables apply. `none`: ignore them. Or an `http(s)://` proxy for LibreNMS alone |
-| `LIBRENMS_SNMP_*` | no | SNMP credentials a device-create plan names as `{"env": "LIBRENMS_SNMP_<NAME>"}`, read only at apply time |
+| `LIBRENMS_PROXY` | no | Unset: the usual proxy variables apply. `none`: ignore them. Or an `http(s)://` proxy for LibreNMS alone: scheme, host and port, with any user name and password percent-encoded (`%40` for `@`, `%23` for `#`, `%2F` for `/`, `%3F` for `?`, `%25` for `%`); anything else is refused. An `http://` proxy receives that password in clear (Basic authentication), whatever `allow_insecure_transport` says |
+| `LIBRENMS_SNMP_*` | no | SNMP credentials a device-create plan names as `{"env": "LIBRENMS_SNMP_<NAME>"}`, read only at apply time. A community's or password's variable ends in `_SECRET`, `_PASS` or `_PASSWORD` (`LIBRENMS_SNMP_COMMUNITY_SECRET`), which Hermes masks in a printed environment |
+| `LIBRENMS_AUDIT_SINK_SECRET` | no | A collector token for an `http` audit sink, written as `${LIBRENMS_AUDIT_SINK_SECRET}` in its headers; the Desktop's `audit_sink_secret` field stores it. Once `audit_sinks` holds the placeholder, edit it in `config.yaml`: the Desktop's form shows and saves it with the token in its place. Any variable works the same way (see [docs/sinks.md](docs/sinks.md)) |
 
 ## Tools
 
@@ -268,7 +278,7 @@ came from LibreNMS is printed with control and bidirectional characters escaped,
 - **No secrets in plans.** The token appears only in the request header. SNMP credentials are
   environment references in the plan and are resolved only while the step runs. Credential fields
   (communities, SNMP passwords, service parameters) are masked in every tool result and audit event;
-  plan files are `0600` in a `0700` directory.
+  plan files are `0600` in `0700` directories, and the plugin's data directory is kept `0700`.
 - **Hardened transport.** `https://` with certificate checks unless `allow_insecure_transport` is
   set; redirects are refused rather than followed with the token; `.netrc` and cookies are ignored;
   responses are size-capped; only GETs are retried.
@@ -331,8 +341,10 @@ Every plan, apply and rollback is recorded for review and for SIEM ingestion:
 The actor record distinguishes a model tool call from a human using `/librenms` or `hermes
 librenms`, and carries the Hermes surface, profile, gateway platform, chat, user, session, cron job,
 and the message that triggered the call (`audit_include_request`). All timestamps are UTC. Point
-your collector at the file, or set `audit_log_path` to a path it already watches. Schema and
-examples: [docs/audit.md](docs/audit.md).
+your collector at the file, or set `audit_log_path` to an absolute path it already watches (a
+regular file owned by the account Hermes runs as, with no other hard link; the plugin never writes
+through a symlink).
+Schema and examples: [docs/audit.md](docs/audit.md).
 
 Installs without a log shipper can forward events directly: `audit_sinks` sends each event to a
 syslog server (UDP, TCP or TLS, JSON or CEF) and/or an HTTP collector such as Splunk HEC, from a

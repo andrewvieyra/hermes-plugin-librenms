@@ -227,6 +227,41 @@ class DataDir(unittest.TestCase):
         with modules(NO_HERMES), environ(HERMES_HOME=None, HOME=str(self.home)):
             self.assertEqual(store_mod.data_dir(), self.home / ".hermes" / "plugin-data" / "librenms")
 
+    def test_the_data_directory_hermes_creates_under_the_umask_is_narrowed_to_0700(self):
+        # Hermes' helper mkdirs it under the umask (0755 with 022), so other accounts could list plans and audit.jsonl
+        def plugin_data_dir(name):
+            root = self.home / "plugin-data" / name
+            root.mkdir(parents=True, exist_ok=True)
+            return root
+
+        plugins, storage = types.ModuleType("plugins"), types.ModuleType("plugins.plugin_storage")
+        storage.plugin_data_dir = plugin_data_dir
+        plugins.plugin_storage = storage
+        with modules({"plugins": plugins, "plugins.plugin_storage": storage}), umask(0o022):
+            path = store_mod.data_dir()
+            self.assertEqual(_mode(path), 0o700)
+            self.assertEqual(_mode(path.parent), 0o755)  # Hermes' own directory, shared by every plugin, stays
+            os.chmod(path, 0o750)  # an earlier release's directory, or one widened by hand
+            self.assertEqual(_mode(store_mod.data_dir()), 0o700)
+
+    def test_a_linked_data_directory_is_left_as_it_is(self):
+        target = self.home / "relocated"
+        target.mkdir(mode=0o755)
+        os.chmod(target, 0o755)
+        (self.home / "plugin-data").mkdir()
+        os.symlink(target, self.home / "plugin-data" / "librenms")
+        with modules(NO_HERMES), environ(HERMES_HOME=str(self.home)):
+            self.assertEqual(store_mod.data_dir(), self.home / "plugin-data" / "librenms")
+        self.assertEqual(_mode(target), 0o755)
+
+    def test_profile_key_is_hermes_own_else_the_home(self):
+        constants = types.ModuleType("hermes_constants")
+        constants.hermes_home_key = lambda: "/resolved/profiles/netops"
+        with modules({"hermes_constants": constants}):
+            self.assertEqual(store_mod.profile_key(), "/resolved/profiles/netops")
+        with modules(NO_HERMES), environ(HERMES_HOME=str(self.home / "b")):
+            self.assertEqual(store_mod.profile_key(), str(self.home / "b"))
+
     def test_a_store_without_a_directory_follows_the_active_profile(self):
         with modules(NO_HERMES), environ(HERMES_HOME=str(self.home / "a")), umask(0o022):
             store = PlanStore()

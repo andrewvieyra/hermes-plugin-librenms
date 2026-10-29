@@ -24,6 +24,7 @@ import os
 import platform
 import re
 import socket
+import stat
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -344,6 +345,62 @@ def describe_actor(actor: Dict[str, Any] | None) -> str:
 _SURROGATE = re.compile("[\ud800-\udfff]")
 # One lock for every AuditLog in the process: lines stay whole and in the order the sinks get them.
 _write_lock = threading.Lock()
+# Never through a symlink: in a directory another account can write to (a log shipper's), one planted at the log's
+# name would have users' messages appended to whatever file it points at (no open flag sees a hard link; that is
+# _check_owned's to refuse). Non-blocking, so a FIFO planted there fails the open instead of holding every audited
+# operation until something reads it.
+_OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+_OPEN_FLAGS |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+
+class _Moved(OSError):
+    """The log's name no longer leads to the file just opened: rotated or removed, or swapped by another account."""
+
+
+def _check_owned(fd: int, path: Path) -> None:
+    """Refuse to write to anything but a regular file this account owns whose only name is the log's: a FIFO or a
+    device would take the events elsewhere, a file another account created in a shared directory is a file that
+    account reads, and a hard link planted there (any account may link a file it can reach) is another of this
+    account's files, a shell's rc file say, under a second name. The name is looked up again after the open, so a
+    link planted for the open and removed before this check is caught as well."""
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("not a regular file; events are not written to it")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise OSError("owned by another account; events are not written to it")
+    if info.st_nlink > 1:
+        raise OSError("has other hard links; events are not written to it")
+    if info.st_nlink == 0:
+        raise _Moved("removed as it was opened; events are not written to it")
+    if os.name != "posix":  # like the owner check; Windows' stat and fstat need not fill st_dev and st_ino alike
+        return
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        raise _Moved("moved away as it was opened; events are not written to it") from None
+    if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+        raise _Moved("replaced as it was opened; events are not written to it")
+    if named.st_nlink != 1:
+        raise OSError("has other hard links; events are not written to it")
+
+
+def _append(path: Path, data: bytes) -> None:
+    """Write *data* to the log with one ``write``, if :func:`_check_owned` passes. A name that moved between the
+    open and the check (a rotation that renames the file) is opened once more, so the event lands in the new one."""
+    for attempt in (1, 2):
+        fd = os.open(path, _OPEN_FLAGS, 0o600)
+        try:
+            try:
+                _check_owned(fd, path)
+            except _Moved:
+                if attempt == 2:
+                    raise
+                continue
+            if os.write(fd, data) != len(data):
+                raise OSError("short write (disk full?)")
+            return
+        finally:
+            os.close(fd)
 
 
 def _encodable(value: Any) -> Any:
@@ -376,7 +433,9 @@ def _forward(record: Dict[str, Any]) -> None:
 class AuditLog:
     """Append-only JSON Lines writer. Each event is one ``open`` with ``O_APPEND`` and one ``write`` of the whole
     line, so the file is safe to rotate with ``copytruncate`` and several processes (gateway, ``hermes librenms``)
-    can append without coordination: POSIX places each write whole at the end of the file."""
+    can append without coordination: POSIX places each write whole at the end of the file. The file is never
+    opened through a symlink and must be a regular file this account owns, with no other hard link; otherwise the
+    event is not written there (the sinks still get it) and Hermes' log says why."""
 
     def __init__(self, path: Path | None = None, enabled: bool = True):
         self._path = Path(path) if path else None
@@ -423,12 +482,7 @@ class AuditLog:
                     data = line.encode("utf-8", "replace")
                     path = self.path
                     private_dir(path.parent)  # 0700 when it creates it; an existing one is the operator's
-                    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
-                    try:
-                        if os.write(fd, data) != len(data):
-                            raise OSError("short write (disk full?)")
-                    finally:
-                        os.close(fd)
+                    _append(path, data)
                 except Exception as exc:  # never let auditing break the operation it describes
                     logger.warning("librenms audit log write failed (%s): %s", path, exc)
                 _forward(record)  # under the lock, so the sinks see the file's order

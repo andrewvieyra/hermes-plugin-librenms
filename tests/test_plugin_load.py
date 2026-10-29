@@ -165,6 +165,18 @@ class RegisterWithAFakeContext(PluginTestCase):
         with self.assertNoLogs(self.plugin.logger, "WARNING"):
             self.register(FakeContext({"write_mode": "operator_only"}))
 
+    def test_a_sink_credential_written_into_config_yaml_is_logged_without_its_value(self):
+        self.settings_mod.set_settings(None)
+        for name in ("hermes_cli", "hermes_cli.config"):  # outside Hermes the settings are what config.yaml holds
+            self.addCleanup(_restore_module, name, sys.modules.get(name))
+            sys.modules[name] = None
+        sink = {"type": "http", "url": "https://hec.example.com", "headers": {"Authorization": "Splunk 3f2a9c1e"}}
+        with self.assertLogs(self.plugin.logger, "WARNING") as logs:
+            self.register(FakeContext({"audit_sinks": [sink]}))
+        [message] = [record.getMessage() for record in logs.records]
+        self.assertTrue(message.startswith("librenms settings: audit_sinks[0] header Authorization holds a credential"))
+        self.assertNotIn("3f2a9c1e", message)
+
     def test_an_older_hermes_without_cli_or_skill_registration_still_loads(self):
         self.plugin_dir(REPO_ROOT)
         ctx = self.register(FakeContext(old=True))
@@ -212,14 +224,16 @@ class LoadThroughPluginManager(unittest.TestCase):
         )
         (self.home / "config.yaml").write_text(
             "plugins:\n  enabled: [librenms]\n  entries:\n    librenms:\n      settings:\n        allow_delete: true\n"
-            "        max_operations: 7\n        max_query_results: lots\n"
+            "        max_operations: 7\n        max_query_results: lots\n        audit_log: false\n"
+            "        audit_sinks:\n          - type: http\n            url: https://hec.example.com/services/collector\n"
+            '            headers: {Authorization: "Splunk ${HEC_TEST_SECRET}", X-Splunk-Token: literal-in-config}\n'
         )
         self._env = dict(os.environ)
         # Hermes loads the copy as hermes_plugins.librenms, replacing the modules every other test module bound
         # when it was imported; put them back, or those tests set settings on modules the handlers never read
         self._modules = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "hermes_plugins"}
         os.environ["HERMES_HOME"] = str(self.home)
-        os.environ.update(ENV)
+        os.environ.update(ENV, HEC_TEST_SECRET="hec-from-env")  # Hermes expands it in the settings
         for name in ("HERMES_SESSION_ID", "HERMES_SESSION_KEY"):
             os.environ.pop(name, None)
         self.mgr = None
@@ -242,7 +256,11 @@ class LoadThroughPluginManager(unittest.TestCase):
         with self.assertLogs("hermes_plugins.librenms", "WARNING") as logs:
             mgr.discover_and_load()
         fell_back = "max_query_results: expected a whole number of 1 or more, got 'lots'; using 500"
-        self.assertEqual(logs.output, [f"WARNING:hermes_plugins.librenms:librenms settings: {fell_back}"])
+        self.assertEqual(logs.output[0], f"WARNING:hermes_plugins.librenms:librenms settings: {fell_back}")
+        # config.yaml as written decides: the expanded placeholder is no literal, the X-Splunk-Token header is
+        [literal] = logs.output[1:]
+        self.assertIn("librenms settings: audit_sinks[0] header X-Splunk-Token holds a credential written", literal)
+        self.assertNotIn("literal-in-config", literal)
         loaded = {p["name"]: p for p in mgr.list_plugins()}
         self.assertIn("librenms", loaded, loaded)
         self.assertIsNone(loaded["librenms"]["error"])
@@ -259,6 +277,7 @@ class LoadThroughPluginManager(unittest.TestCase):
         mod = sys.modules["hermes_plugins.librenms"]
         settings = mod.settings.get_settings()
         self.assertEqual((settings.max_operations, settings.allow_delete), (7, True))
+        self.assertEqual(settings.audit_sinks[0]["headers"]["Authorization"], "Splunk hec-from-env")
         self.assertEqual(settings.max_query_results, 500)
         self.assertEqual(len(settings.errors), 1)
 
@@ -274,6 +293,13 @@ class LoadThroughPluginManager(unittest.TestCase):
         self.assertEqual(directive["action"], "approve")
         self.assertTrue(directive["rule_key"].startswith("librenms:librenms_apply:unresolved:"))
         self.assertEqual(mgr.invoke_hook("pre_tool_call", tool_name="web_search", args={"query": "x"}), [])
+
+
+def _restore_module(name, module):
+    if module is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = module
 
 
 if __name__ == "__main__":

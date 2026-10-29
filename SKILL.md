@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Look things up in LibreNMS and plan, review, apply and roll back changes with the librenms_* tools. Load when the user asks about or wants to change devices, ports, alerts, alert rules, locations, device groups, services, maintenance windows, the eventlog or syslog in LibreNMS.
-version: 0.1.0
+version: 0.1.1
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -162,8 +162,10 @@ window early, so keep it as short as the work.
 - A `match` must hit exactly one object. Hostnames match exactly; query `devices` with
   `{"type": "hostname", "query": "core"}` to find the stored spelling.
 - SNMP credentials are never written into a plan. Pass `{"env": "LIBRENMS_SNMP_<NAME>"}`, naming a variable
-  the operator has set, or omit them so LibreNMS tries its configured defaults. Never ask the user to paste
-  a community string or password into the chat.
+  the operator has set, or omit them so LibreNMS tries its configured defaults. For `community`, `authpass`
+  and `cryptopass` the name ends in `_SECRET`, `_PASS` or `_PASSWORD` (`LIBRENMS_SNMP_COMMUNITY_SECRET`,
+  `LIBRENMS_SNMP_V3_AUTH_PASS`), which Hermes masks if an environment dump reaches you. Never ask the user to
+  paste a community string or password into the chat, and never print the environment to find one.
 - The API cannot change an existing device's SNMP settings or credentials, and fields the poller owns
   (`sysName`, `sysDescr`, `os`, `hardware`, `version`, `serial`, `ip`) are refused because the next poll
   would overwrite them.

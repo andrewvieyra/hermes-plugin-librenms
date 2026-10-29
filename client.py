@@ -26,7 +26,7 @@ from http.cookiejar import DefaultCookiePolicy
 from typing import Any, Callable, Dict, List, Tuple
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
-from .redact import clip, scrub_token
+from .redact import clip, scrub_token, scrub_values
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,20 @@ _SURROGATE_RE = re.compile("[\ud800-\udfff]")
 _KIND_LABELS = {"timeout": "timeout", "tls": "TLS", "dns": "DNS", "refused": "refused", "connection": "connection"}
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
+# What a LibreNMS API token looks like (a Sanctum <id>|<secret>, or the older 32 hex digits): such a LIBRENMS_URL is
+# a token in the wrong variable, and is never quoted back.
+_TOKEN_SHAPE = re.compile(r"[0-9A-Fa-f]{32}|\d{1,20}\|[A-Za-z0-9_]{40,}")
+# RFC 3986 userinfo: unreserved, percent-encoded and sub-delims characters, and ":" between user and password.
+# Anything else in a proxy's user name or password ("@", "/", "?", "#", a space) must be percent-encoded, or the URL
+# parser ends the user info, or the whole authority, early and reads part of the password as the host or port.
+_USERINFO = re.compile(r"(?:[A-Za-z0-9._~!$&'()*+,;=:-]|%[0-9A-Fa-f]{2})*")
+# A proxy's host (a name, an IPv4 address or a bracketed IPv6 one) and port, and at most a closing "/"
+_HOSTPORT = re.compile(r"[A-Za-z0-9._\[\]:-]+/?")
+_PROXY_FORM = "LIBRENMS_PROXY must be none or an http:// or https:// proxy URL: scheme, host and port only"
+_PROXY_USERINFO = (
+    "LIBRENMS_PROXY's user name or password holds a character that must be percent-encoded (such as @ / ? # % or "
+    "a space: %40 for @, %2F for /, %3F for ?, %23 for #, %25 for %, %20 for a space)"
+)
 
 Timeout = Tuple[float, float]
 
@@ -142,6 +156,19 @@ def secret(name: str) -> str | None:
         raise ConfigError(f"no secret scope is bound for this Hermes profile; cannot read {name}") from exc
 
 
+def env_file() -> str:
+    """Where the active profile's secrets go, as a message may name it: Hermes' own spelling of the profile's home
+    (``~/.hermes/.env``, ``~/.hermes/profiles/netops/.env``). A home outside the user's home directory is not
+    spelled out, since its path names the OS account and messages reach the model."""
+    try:
+        from hermes_constants import display_hermes_home  # type: ignore
+
+        shown = str(display_hermes_home())
+    except Exception:
+        return "<HERMES_HOME>/.env (~/.hermes/.env for the default profile)"
+    return f"{shown}/.env" if shown.startswith("~/") else "the .env file in this profile's HERMES_HOME"
+
+
 def normalise_url(url: str) -> str:
     """``url`` without surrounding blanks, trailing ``/`` or a trailing ``/api/v0``."""
     url = (url or "").strip().rstrip("/")
@@ -187,21 +214,59 @@ def timeout_from_env(value: str | None) -> Timeout:
 
 def proxy_from_env(value: str | None) -> str | None:
     """``LIBRENMS_PROXY``: unset is ``None`` (the environment's proxy variables apply), ``none`` ignores them, and
-    an ``http://`` or ``https://`` URL is the proxy for LibreNMS alone (Hermes' model traffic reads the same
-    ``HTTPS_PROXY``; this is how the two part ways). Anything else is refused without quoting it: it may hold a
-    proxy password."""
+    an ``http://`` or ``https://`` URL of a host and port, with a percent-encoded user name and password if any, is
+    the proxy for LibreNMS alone (Hermes' model traffic reads the same ``HTTPS_PROXY``; this is how the two part
+    ways). Anything else is refused without quoting it: it may hold a proxy password. An unencoded ``#``, ``/`` or
+    ``?`` in the password would otherwise pass for the end of the host, and ``requests`` would fail on every call
+    with an error that quotes the whole URL, password included, into the log."""
     text = (value or "").strip()
     if not text:
         return None
     if text.lower() == "none":
         return "none"
+    scheme, sep, rest = text.partition("://")
+    if not sep or scheme.lower() not in ("http", "https"):
+        raise ConfigError(_PROXY_FORM)
+    userinfo, at, hostport = rest.rpartition("@")
+    if at and not _USERINFO.fullmatch(userinfo):
+        raise ConfigError(_PROXY_USERINFO)
+    if not _HOSTPORT.fullmatch(hostport):
+        raise ConfigError(_PROXY_FORM)
     try:
-        host = urlsplit(text).hostname
+        parts = urlsplit(f"{scheme}://{hostport}")
+        host, _port = parts.hostname, parts.port  # .port raises for a port that is not a number up to 65535
     except ValueError:
         host = None
-    if not text.lower().startswith(("http://", "https://")) or not host:
-        raise ConfigError("LIBRENMS_PROXY must be none or an http:// or https:// proxy URL")
+    if not host:
+        raise ConfigError(_PROXY_FORM)
     return text
+
+
+def proxy_secrets(proxy: str | None) -> List[str]:
+    """What of a proxy URL (``LIBRENMS_PROXY``, or one from the environment, which may have no scheme) must never
+    reach a log line or an error: its user info, and the password (or a user name standing alone, which may be a
+    token) as written and percent-decoded."""
+    if not proxy or proxy == "none":
+        return []
+    _scheme, sep, rest = proxy.partition("://")
+    userinfo, at, _hostport = (rest if sep else proxy).rpartition("@")
+    if not at or not userinfo:
+        return []
+    user, colon, password = userinfo.partition(":")
+    credential = password if colon else user
+    return [value for value in {userinfo, credential, unquote(credential)} if value]
+
+
+def environment_proxy_secrets(url: str) -> List[str]:
+    """:func:`proxy_secrets` of the proxies ``requests`` may take from the environment for *url* when
+    ``LIBRENMS_PROXY`` is unset: the one for its scheme (``HTTPS_PROXY`` or ``HTTP_PROXY``) and ``ALL_PROXY``.
+    Nothing validates those (Hermes' model traffic reads them too), and a malformed one fails every request with
+    an error that quotes it whole, password included."""
+    try:
+        found = urllib.request.getproxies()
+    except Exception:  # pragma: no cover - the system's proxy settings could not be read
+        return []
+    return [secret for key in (urlsplit(url).scheme, "all") for secret in proxy_secrets(found.get(key))]
 
 
 def insecure_transport(url: str, verify: Any) -> List[str]:
@@ -226,9 +291,15 @@ def settings_from_env(env: Dict[str, str] | None = None, *, allow_insecure: bool
     url = normalise_url(read("LIBRENMS_URL") or "")
     token = (read("LIBRENMS_TOKEN") or "").strip()
     if not url or not token:
-        raise ConfigError("LIBRENMS_URL and LIBRENMS_TOKEN must both be set (put them in ~/.hermes/.env)")
+        raise ConfigError(f"LIBRENMS_URL and LIBRENMS_TOKEN must both be set (put them in {env_file()})")
+    # No message below quotes the value: it reaches the model, and a URL in the wrong shape may be the token itself
+    # (the two variables swapped) or carry one in a query string.
+    if _TOKEN_SHAPE.fullmatch(url):
+        raise ConfigError(
+            "LIBRENMS_URL looks like an API token, not a URL; are LIBRENMS_URL and LIBRENMS_TOKEN swapped?"
+        )
     if "@" in url:
-        # not quoted: what precedes the @ is a user name and password, and the message reaches the model
+        # what precedes the @ is a user name and password
         raise ConfigError(
             "LIBRENMS_URL holds an @, as a user name and password before the host do; they are never needed "
             "(the token authenticates), so take them out of LIBRENMS_URL"
@@ -237,9 +308,11 @@ def settings_from_env(env: Dict[str, str] | None = None, *, allow_insecure: bool
         parts = urlsplit(url)
         host = parts.hostname
     except ValueError:
-        parts, host = None, None
-    if parts is None or parts.scheme not in ("http", "https") or not host:
-        raise ConfigError(f"LIBRENMS_URL must start with http:// or https:// and name a host (got {url[:200]!r})")
+        raise ConfigError("LIBRENMS_URL cannot be read as a URL, e.g. https://librenms.example.com") from None
+    if parts.scheme not in ("http", "https"):
+        raise ConfigError("LIBRENMS_URL must start with http:// or https://, e.g. https://librenms.example.com")
+    if not host:
+        raise ConfigError("LIBRENMS_URL must name a host after http:// or https://, e.g. https://librenms.example.com")
     if "?" in url or "#" in url:
         raise ConfigError("LIBRENMS_URL must not hold a query string or a fragment")
     verify = verify_from_env(read("LIBRENMS_VERIFY_SSL"))
@@ -554,6 +627,8 @@ class LibreNMSClient:
         self.timeout = _pair(timeout)
         self.proxy = proxy
         self._token = (token or "").strip()
+        # made per call, so the environment's proxy is read as requests will read it for this client's requests
+        self._proxy_secrets = proxy_secrets(proxy) if proxy is not None else environment_proxy_secrets(self.base_url)
         self._session = session
         self.retry_sleep: Callable[[float], None] = time.sleep
         self.last_call: Dict[str, Any] = {}
@@ -590,8 +665,10 @@ class LibreNMSClient:
         return {"scheme": target.scheme, "verify": verify, "proxy": via}
 
     def scrub(self, text: Any) -> str:
-        """*text* without the token: defence in depth for error messages, bodies and log lines."""
-        return scrub_token(text, self._token)
+        """*text* without the token or the proxy's credentials (``LIBRENMS_PROXY``'s, or with it unset the
+        environment's proxy for LibreNMS): defence in depth for error messages, bodies and log lines (Hermes' log
+        redaction does not recognise either)."""
+        return scrub_values(scrub_token(text, self._token), self._proxy_secrets)
 
     def _scrub_obj(self, value: Any) -> Any:
         if isinstance(value, str):

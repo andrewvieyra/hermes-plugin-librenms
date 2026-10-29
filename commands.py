@@ -211,6 +211,8 @@ def _run(argv: List[str], via: str, actor: Dict[str, Any]) -> str:
     if parsed is None or (cmd in _PLAN_COMMANDS and len(parsed[0]) != 1):
         return f"Usage: {prog} {_SYNTAX[cmd][0]}"
     positional, options = parsed
+    if cmd != "prune":  # retention also for a profile whose plans are only ever handled from here
+        handlers.maybe_prune(actor)
     if cmd == "status":
         return json.dumps(mask(handlers.status_report()), indent=2, ensure_ascii=False, default=str)
     if cmd == "plans":

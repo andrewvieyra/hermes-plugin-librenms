@@ -226,6 +226,14 @@ class Texts(unittest.TestCase):
         self.assertEqual(built("audit_log_path", 42), ("", ["audit_log_path: expected text, got 42; using ''"]))
         self.assertEqual(built("audit_log_path", ["/x"]), ("", ["audit_log_path: expected text, got list; using ''"]))
 
+    def test_audit_log_path_must_be_absolute(self):
+        # a relative path lands in each process's working directory (a repository the gateway started in)
+        relative = ["audit_log_path: expected an absolute path (~ is expanded), got a relative path; using ''"]
+        for path in ("logs/librenms-audit.jsonl", "./audit.jsonl", "audit.jsonl", "~alice-x-nobody/a.jsonl"):
+            self.assertEqual(built("audit_log_path", path), ("", relative), path)
+        self.assertEqual(built("audit_log_path", "~/logs/audit.jsonl"), ("~/logs/audit.jsonl", []))
+        self.assertEqual(built("audit_log_path", "  "), ("", []))  # empty: the default file
+
 
 class Sinks(unittest.TestCase):
     def test_mappings_are_kept_as_deep_copies(self):
@@ -313,12 +321,23 @@ class PublicAndDigest(unittest.TestCase):
             self.assertNotIn(secret, text)
         self.assertNotIn("errors", public)
 
+    def test_public_says_only_whether_audit_log_path_is_set(self):
+        # status reaches the model, and a path names the OS account
+        self.assertEqual(Settings().public()["audit_log_path"], "")
+        public = Settings(audit_log_path="/home/alice/hermes/librenms-audit.jsonl").public()
+        self.assertEqual(public["audit_log_path"], "custom")
+        self.assertNotIn("alice", json.dumps(public))
+
     def test_digest_is_short_canonical_and_stable(self):
         settings = Settings(audit_sinks=self.SINKS)
         digest = settings.digest()
         self.assertRegex(digest, r"^[0-9a-f]{12}$")
-        canonical = json.dumps(settings.public(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        summary = dict(settings.to_dict(), audit_sinks={"count": 4, "types": ["http", "syslog", "unknown"]})
+        canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         self.assertEqual(digest, hashlib.sha256(canonical.encode("ascii")).hexdigest()[:12])
+        # what 0.1.0 gave, so an upgrade raises no alert on an unapproved configuration
+        self.assertEqual(Settings().digest(), "82752853a9ac")
+        self.assertEqual(Settings(audit_log_path="/var/log/hermes/librenms-audit.jsonl").digest(), "0a6839d34d47")
         self.assertEqual(Settings(audit_sinks=list(reversed(self.SINKS))).digest(), digest)  # types are a set
         self.assertEqual(Settings(audit_sinks=self.SINKS, errors=["x"]).digest(), digest)
         rotated = [dict(spec) for spec in self.SINKS]

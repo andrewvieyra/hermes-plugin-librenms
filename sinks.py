@@ -24,13 +24,17 @@ Standard library only. Configuration lives in ``plugins.entries.librenms.setting
         headers: {Authorization: "Splunk ${SPLUNK_HEC_TOKEN}"}   # ${VAR} is read from Hermes' secrets
         format: hec            # json | hec
 
-Secrets belong in the environment (``~/.hermes/.env``); ``${VAR}`` placeholders in header values are resolved
-at send time, through Hermes' per-profile secret scope, so the token never sits in ``config.yaml``. No redirect is
-followed. Events hold users' messages, so clear text (``udp``/``tcp`` syslog, an ``http://`` url) is accepted only
-to a loopback host, which is dialed directly, never through a proxy, and an unverified TLS collector
+Secrets belong in the profile's ``.env`` (``<HERMES_HOME>/.env``), so the token never sits in ``config.yaml``.
+Hermes' config loader replaces each ``${VAR}`` in the settings (headers and url alike) with the active profile's
+secret when the settings are read, on the thread of the call that emits the event. A placeholder still there
+afterwards is a variable this profile does not set: that sink is not built (and the log says which variable), and
+nothing here ever reads one later, on the sink thread, where no profile is bound and the environment holds another
+profile's values. Status warns about a credential header written into ``config.yaml`` as a literal value. No
+redirect is followed. Events hold users' messages, so clear text (``udp``/``tcp`` syslog, an ``http://`` url) is
+accepted only to a loopback host, which is dialed directly, never through a proxy, and an unverified TLS collector
 (``verify_ssl: false``) not at all, unless ``allow_insecure_transport`` is on. A change to that setting or to
-``audit_sinks`` applies from the next event, without a restart. Log lines name a sink by its place in
-``audit_sinks`` and its kind, never by its host, url, headers or file paths.
+``audit_sinks`` applies from the next event, without a restart. Each Hermes profile gets its own worker. Log lines
+name a sink by its place in ``audit_sinks`` and its kind, never by its host, url, headers or file paths.
 """
 
 from __future__ import annotations
@@ -54,7 +58,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlsplit
 
+from .client import env_file
 from .settings import Settings, flag, get_settings
+from .store import PLUGIN_NAME, profile_key
 from .version import __version__
 
 logger = logging.getLogger(__name__)
@@ -131,20 +137,25 @@ class SinkError(Exception):
     url, headers and paths may carry a credential or name the OS account), so it is safe to log."""
 
 
-_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# A ``${VAR}`` or ``${env:VAR}`` placeholder, as Hermes' config loader writes them and leaves them when unset
+_PLACEHOLDER = re.compile(r"\$\{([^}]*)\}")
+_VARIABLE = re.compile(r"(?:env:)?\s*([A-Za-z_][A-Za-z0-9_]{0,99})\s*")
 
 
-def expand_env(value: str) -> str:
-    """Replace each ``${VAR}`` with the secret Hermes holds for the active profile (empty when unset)."""
-    from .client import secret
-
-    def lookup(match: re.Match) -> str:
-        try:
-            return secret(match.group(1)) or ""
-        except Exception:  # a profile with no secret scope bound: never fall back to another profile's value
-            raise SinkError(f"the header placeholder ${{{match.group(1)}}} could not be read") from None
-
-    return _ENV_RE.sub(lookup, value)
+def _unresolved(where: str, value: str) -> None:
+    """Refuse *value* when Hermes left a placeholder in it: the variable is not set for this profile, and reading it
+    any later (on the sink thread) would get the environment's, which is another profile's. The reason names the
+    variable, never the value."""
+    found = _PLACEHOLDER.search(value)
+    if found is None:
+        return
+    name = _VARIABLE.fullmatch(found.group(1))
+    shown = f"${{{name.group(1)}}}" if name else "a ${...} placeholder"
+    raise SinkError(
+        f"{where} holds {shown}, which is not set for this Hermes profile; set it in {env_file()}"
+        if name
+        else f"{where} holds {shown} that Hermes could not read; reference an environment variable as ${{NAME}}"
+    )
 
 
 def _reason(exc: BaseException) -> str:
@@ -400,6 +411,7 @@ class HttpSink(Sink):
         sourcetype: str = SOURCETYPE,
         allow_insecure: bool = False,
     ):
+        _unresolved("url", url)
         if not url.startswith(("http://", "https://")):
             raise SinkError("http sink url must start with http:// or https://")
         try:
@@ -435,8 +447,7 @@ class HttpSink(Sink):
         return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
 
     def send(self, record: Dict[str, Any]) -> None:
-        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-        headers.update({k: expand_env(v) for k, v in self.headers.items()})
+        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT, **self.headers}
         req = urllib.request.Request(self.url, data=self.body(record), headers=headers, method="POST")
         context = _tls_context(self.verify_ssl) if self.name == "https" else None
         # a loopback collector is dialed directly: through a proxy from the environment, its clear text (events and
@@ -464,6 +475,7 @@ def _headers(raw: Any) -> Dict[str, str]:
         text = str(value) if isinstance(value, (str, int, float)) and not isinstance(value, bool) else None
         if not (isinstance(name, str) and _HEADER_NAME.fullmatch(name)) or text is None or re.search(r"[\r\n]", text):
             raise SinkError("http sink headers must map header names to single-line text values")
+        _unresolved(f"header {name}", text)
         headers[name] = text
     return headers
 
@@ -529,6 +541,7 @@ def _build(spec: Any, allow_insecure: bool) -> Sink:
         host = spec.get("host")
         if not isinstance(host, str) or not host.strip():
             raise SinkError("syslog sink needs a host")
+        _unresolved("host", host)
         framing = spec.get("framing")
         return SyslogSink(
             host,
@@ -571,6 +584,67 @@ def build_sink(spec: Any, allow_insecure: bool = False, index: int | None = None
     kind = kind.lower() if isinstance(kind, str) and kind.lower() in {"syslog", "http"} else "unknown type"
     logger.warning("librenms audit_sinks[%s] (%s) ignored: %s", "?" if index is None else index, kind, reason)
     return None
+
+
+# -- credentials written into config.yaml ---------------------------------------------------------
+
+# A header that carries a credential: Authorization, Proxy-Authorization, X-Splunk-Token, X-API-Key, ...
+_CREDENTIAL_HEADER = re.compile(r"auth|token|key|secret|pass", re.IGNORECASE)
+SECRET_FIELD, SECRET_ENV = "audit_sink_secret", "LIBRENMS_AUDIT_SINK_SECRET"
+
+
+def written_specs() -> Any:
+    """``audit_sinks`` as config.yaml writes them, before Hermes' loader replaces the ``${VAR}`` placeholders (the
+    settings hold the values, so a literal token cannot be told from a resolved one there): Hermes' raw read of the
+    active profile's config.yaml, else (outside Hermes) the settings' own entries."""
+    try:
+        from hermes_cli.config import read_raw_config_readonly  # type: ignore
+    except Exception:
+        return get_settings().audit_sinks
+    try:
+        raw = read_raw_config_readonly()
+        entry = ((raw.get("plugins") or {}).get("entries") or {}).get(PLUGIN_NAME) or {}
+        for subtree in ("settings", "config"):  # where ctx.get_config looks, in its order
+            values = entry.get(subtree)
+            if isinstance(values, dict) and "audit_sinks" in values:
+                return values["audit_sinks"]
+    except Exception:  # an unreadable config.yaml: Hermes reports that itself
+        pass
+    return []
+
+
+def literal_credentials(specs: Any) -> List[str]:
+    """Where an http sink's credential header holds a value written into config.yaml rather than a ``${VAR}``
+    placeholder, as ``audit_sinks[N] header NAME`` (N its place in config.yaml). Names no value."""
+    found: List[str] = []
+    for index, spec in enumerate(specs if isinstance(specs, list) else []):
+        if not isinstance(spec, dict) or str(spec.get("type") or "").strip().lower() != "http":
+            continue
+        headers = spec.get("headers")
+        for name, value in headers.items() if isinstance(headers, dict) else ():
+            if not (isinstance(name, str) and _HEADER_NAME.fullmatch(name) and _CREDENTIAL_HEADER.search(name)):
+                continue
+            if isinstance(value, (str, int, float)) and str(value).strip() and not _PLACEHOLDER.search(str(value)):
+                found.append(f"audit_sinks[{index}] header {name[:64]}")
+    return found
+
+
+def literal_credential_warnings() -> List[str]:
+    """One warning per credential header written into config.yaml (see :func:`literal_credentials`), saying where
+    the credential belongs instead, and that the placeholder is written in config.yaml: Hermes fills the Desktop's
+    settings form from the expanded settings, so that form would save the credential back. For status and the log
+    at registration. Never raises."""
+    try:
+        places = literal_credentials(written_specs())
+    except Exception:
+        return []
+    return [
+        f"{place} holds a credential written into config.yaml; put it in {env_file()} (the Desktop's "
+        f"{SECRET_FIELD} setting stores one there as {SECRET_ENV}) and write ${{{SECRET_ENV}}} in its place, in "
+        "config.yaml itself: the Desktop's form shows audit_sinks with each ${...} replaced by its value, and "
+        "saving it there writes the credential back"
+        for place in places
+    ]
 
 
 # -- worker ---------------------------------------------------------------------------------------
@@ -657,8 +731,10 @@ class SinkWorker:
                 sink.close()
 
 
-_worker: SinkWorker | None = None
+_pinned: SinkWorker | None = None  # set_worker's, which wins over the settings
+_workers: Dict[str, SinkWorker] = {}  # built from the settings, one per Hermes profile (store.profile_key)
 _worker_lock = threading.Lock()
+_exit_hooked = False
 
 
 def configure(specs: Any, allow_insecure: bool = False, numbers: List[int] | None = None) -> SinkWorker:
@@ -684,35 +760,56 @@ def _settings_key(settings: Settings) -> str:
 
 
 def get_worker() -> SinkWorker:
-    """The worker installed with :func:`set_worker`, else one built from the current settings and rebuilt when
-    ``audit_sinks`` or ``allow_insecure_transport`` changes, so turning the opt-in off stops a clear-text sink
-    without a restart."""
-    global _worker
-    settings = get_settings()
-    key = _settings_key(settings)
+    """The worker installed with :func:`set_worker`, else the active profile's, built from its settings (on the
+    emitting thread, under that profile's secrets) and rebuilt when its ``audit_sinks`` or
+    ``allow_insecure_transport`` changes, so turning the opt-in off stops a clear-text sink without a restart. A
+    gateway serving several profiles keeps one worker each, rather than one rebuilt at every switch."""
+    global _exit_hooked
     with _worker_lock:
-        old = _worker
-        if old is not None and old.settings_key in (None, key):
+        if _pinned is not None:
+            return _pinned
+    settings = get_settings()
+    key, profile = _settings_key(settings), profile_key()
+    with _worker_lock:
+        if _pinned is not None:
+            return _pinned
+        old = _workers.get(profile)
+        if old is not None and old.settings_key == key:
             return old
-        _worker = worker = configure(
+        _workers[profile] = worker = configure(
             settings.audit_sinks, settings.allow_insecure_transport, settings.audit_sink_numbers
         )
         worker.settings_key = key
-        atexit.register(worker.close, 2.0)
+        if not _exit_hooked:  # once per process, however many workers it builds
+            atexit.register(_close_all, 2.0)
+            _exit_hooked = True
     if old is not None:
         # closing waits for the old queue to drain, and emitting never blocks, so it closes on a thread of its own
         threading.Thread(target=old.close, name="librenms-audit-sinks-close", daemon=True).start()
     return worker
 
 
-def set_worker(worker: SinkWorker | None) -> None:
-    """Replace (and close) the process-wide worker. One given here (the test seam) is kept whatever the settings
-    say; ``None`` (``register``) has the next event build one from them."""
-    global _worker
+def _close_all(timeout: float) -> None:
+    """At exit: let the workers' queues drain for up to *timeout* seconds in all, then stop them."""
+    deadline = time.monotonic() + timeout
     with _worker_lock:
-        old, _worker = _worker, worker
-    if old is not None and old is not worker:
-        old.close(1.0)
+        workers = [*_workers.values(), *([_pinned] if _pinned is not None else [])]
+    for worker in workers:
+        with contextlib.suppress(Exception):
+            worker.close(max(0.0, deadline - time.monotonic()))
+
+
+def set_worker(worker: SinkWorker | None) -> None:
+    """Replace (and close) the workers. One given here (the test seam) is kept whatever the settings and the
+    profile say; ``None`` (``register``) has the next event build one from them."""
+    global _pinned
+    with _worker_lock:
+        old = [*_workers.values(), *([_pinned] if _pinned is not None else [])]
+        _workers.clear()
+        _pinned = worker
+    for each in old:
+        if each is not worker:
+            each.close(1.0)
 
 
 def dispatch(record: Dict[str, Any]) -> None:
