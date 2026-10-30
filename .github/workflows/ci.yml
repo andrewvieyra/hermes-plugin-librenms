@@ -55,7 +55,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          # hermes-agent's pyproject declares its dependencies for Python 3.14 only (its own installs use uv.lock),
+          # so `pip install -e` on an older Python leaves out ruamel.yaml and the loader cannot import.
+          python-version: "3.14"
       - name: Fetch hermes-agent
         run: git clone --depth 1 https://github.com/NousResearch/hermes-agent /tmp/hermes-agent
       - name: Install hermes-agent requirements

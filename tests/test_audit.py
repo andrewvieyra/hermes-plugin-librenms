@@ -20,7 +20,7 @@ from unittest import mock
 
 from .base import PluginTestCase
 from .fake_librenms import TOKEN
-from .helpers import REPO_ROOT, submodule
+from .helpers import REPO_ROOT, budget, submodule
 
 audit = submodule("audit")
 sinks = submodule("sinks")
@@ -432,7 +432,7 @@ class RequestCache(AuditCase):
         for text in ("a-" * 200_000, "a." * 200_000 + "://", "token-" * 60_000):
             started = time.monotonic()
             audit.remember_request("s", "t", text, None)
-            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertLess(time.monotonic() - started, budget(2.0))
             self.assertEqual(len(audit.recall_request("s", "t")[0]), 500)
 
     def test_include_request_off_keeps_only_the_sender(self):
@@ -703,7 +703,7 @@ class EventStream(AuditCase):
         started = time.monotonic()
         with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"):
             self.assertIsNotNone(audit.emit("plan_created", plan_id="lnp-1"))
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, budget(2))
 
     @unittest.skipUnless(hasattr(os, "geteuid"), "no file owners on this platform")
     def test_a_file_another_account_owns_is_refused(self):

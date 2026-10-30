@@ -1,5 +1,5 @@
 name: librenms
-version: 0.14.4
+version: 0.14.5
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"

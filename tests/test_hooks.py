@@ -18,6 +18,7 @@ import unittest
 
 from .base import PluginTestCase, _restore_env
 from .fake_librenms import TOKEN
+from .helpers import budget
 
 HOOK_KWARGS = {"task_id": "t1", "session_id": "s1", "tool_call_id": "call-1", "turn_id": "turn-1"}
 CALL_KWARGS = {"task_id": "t1", "session_id": "s1"}  # what Hermes then passes the handler of the same call
@@ -846,7 +847,7 @@ class Terminal(HookCase):
         ):
             started = time.monotonic()
             self.assertIsNone(self.hook("execute_code", {"code": text}))
-            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertLess(time.monotonic() - started, budget(1.0))
         self.configure(write_mode="operator_only")
         for command in (
             "hermes" + " " * 5000 + "librenms apply x",
@@ -1411,7 +1412,7 @@ class SecretGuard(HookCase):
         ):
             started = time.monotonic()
             self.hook("execute_code", {"code": text})
-            self.assertLess(time.monotonic() - started, 1.0, text[:40])
+            self.assertLess(time.monotonic() - started, budget(1.0), text[:40])
 
     def test_a_failing_check_blocks(self):
         def broken(_text):

@@ -11,6 +11,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "hermes_plugins.librenms"
 
+# The linear-time tests' budgets are for an untraced run. Under coverage the Python around each scan runs several
+# times slower (a GitHub runner took 1.08 s against a 1 s budget), while a quadratic scan at the tests' sizes still
+# takes minutes, so the budgets stretch tenfold when coverage is measuring.
+TIME_SCALE = 10 if "coverage" in sys.modules else 1
+
+
+def budget(seconds: float) -> float:
+    """*seconds* scaled for the run: the time a linear scan may take here."""
+    return seconds * TIME_SCALE
+
 
 def load_plugin():
     if PACKAGE in sys.modules:

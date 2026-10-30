@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-10-30
+
+The first CI run on GitHub failed two jobs; neither failure was in the plugin's code.
+
+### Fixed
+- The linear-time tests' budgets now stretch tenfold while coverage is measuring (`tests/helpers.budget`). Under
+  coverage's tracer the Python around each scan ran slower than the 1 s budget on a GitHub runner (1.08 s for 70,000
+  lines), though the cost stays linear; a quadratic scan at these sizes still overruns the stretched budget by
+  minutes.
+- CI's `hermes-loader` job installs hermes-agent on Python 3.14. Its pyproject declares dependencies for 3.14 only
+  (its own installs use `uv.lock`), so `pip install -e` on 3.11 left out `ruamel.yaml` and the loader could not
+  import, which also left Hermes without its configured time zone in the zone test.
+
 ## [0.14.4] - 2026-10-30
 
 What the final review of 0.14.2 and 0.14.3 found in the secret guard and in what the docs claim, each confirmed

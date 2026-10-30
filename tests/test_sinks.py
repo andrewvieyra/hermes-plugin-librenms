@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from .helpers import submodule
+from .helpers import budget, submodule
 
 sinks = submodule("sinks")
 audit = submodule("audit")
@@ -698,7 +698,7 @@ class Delivery(EnvCase):
         with self.assertLogs("hermes_plugins.librenms.sinks", level="WARNING"):
             worker.enqueue(_record())
             self.assertTrue(worker.flush(10))
-        self.assertLess(time.monotonic() - started, 8)
+        self.assertLess(time.monotonic() - started, budget(8))
         self.assertEqual((worker.stats["sent"], worker.stats["failed"]), (0, 1))
         worker.close(1)
 
