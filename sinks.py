@@ -118,6 +118,7 @@ _WARNING_EVENTS = {
     "revert_conflict",
     "revert_irreversible",
     "run_recovered",
+    "secret_access_refused",
 }
 _NOTICE_EVENTS = {
     "apply_started",
@@ -126,6 +127,7 @@ _NOTICE_EVENTS = {
     "audit_pruned",
     "approval_requested",
     "approval_decided",
+    "secret_access_requested",
 }
 
 
@@ -207,8 +209,9 @@ def _cef_ext(value: Any) -> str:
 
 
 def to_cef(record: Dict[str, Any]) -> str:
-    """ArcSight Common Event Format line. Standard keys where they fit, labelled ``csN``/``cnN`` pairs for the rest;
-    a label is written only with its value, so no field is left dangling."""
+    """ArcSight Common Event Format line. Standard keys where they fit, labelled ``csN``/``cnN``/``flexStringN`` pairs
+    for the rest (the tool and the secret guard's rule in the flex strings); a label is written only with its value,
+    so no field is left dangling."""
     actor = record.get("actor") or {}
     sev = {SEV_WARNING: 7, SEV_NOTICE: 4, SEV_INFO: 2}[severity_of(record)]
     stamp = record.get("ts")
@@ -233,6 +236,8 @@ def to_cef(record: Dict[str, Any]) -> str:
         ("cn1", "http_status", record.get("http_status")),
         ("cs7", "request_text", actor.get("request")),
         ("cs8", "config_digest", record.get("config_digest")),
+        ("flexString1", "tool", record.get("tool")),
+        ("flexString2", "rule", record.get("rule")),
     ]
     for key, label, value in labelled:
         if value not in (None, ""):

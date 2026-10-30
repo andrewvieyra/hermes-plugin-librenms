@@ -178,8 +178,8 @@ Severity mapping:
 
 | Severity | Events |
 |---|---|
-| warning (4) | `plan_rejected`, `apply_refused`, `rollback_refused`, `query_refused`, `step_failed`, `step_conflict`, `revert_failed`, `revert_conflict`, `revert_irreversible`, `run_recovered`, `apply_finished` with a failed outcome, `rollback_finished` that is not fully rolled back, `eventlog_linked` that could not link |
-| notice (5) | `apply_started`, `rollback_started`, `plans_pruned`, `audit_pruned`, `approval_requested`, `approval_decided` |
+| warning (4) | `plan_rejected`, `apply_refused`, `rollback_refused`, `query_refused`, `secret_access_refused`, `step_failed`, `step_conflict`, `revert_failed`, `revert_conflict`, `revert_irreversible`, `run_recovered`, `apply_finished` with a failed outcome, `rollback_finished` that is not fully rolled back, `eventlog_linked` that could not link |
+| notice (5) | `apply_started`, `rollback_started`, `plans_pruned`, `audit_pruned`, `approval_requested`, `approval_decided`, `secret_access_requested` |
 | informational (6) | everything else |
 
 ## CEF
@@ -202,10 +202,13 @@ CEF:0|andrewvieyra|hermes-plugin-librenms|0.1.0|apply_refused|apply refused|7|rt
 | `outcome` | apply outcome, or the status of a step, a revert or a rollback |
 | `msg` | error, reason or description |
 | `cs1` … `cs8`, `cn1` | plan id, actor kind, via, platform (or surface, or source), chat, resource, request text, config digest; `cn1` the HTTP status |
+| `flexString1`, `flexString2` | `tool` (the Hermes tool an approval, a refusal or the secret guard concerns) and `rule` (the secret guard's rule: `librenms_api`, `secret_variable`, `env_file`, `environment`) |
 
 A label is written only with its value. CEF defines six custom string fields; `cs7` and `cs8` go
-beyond them, and a strict parser may keep them as plain extension keys. CEF severity is 7 for
-warnings, 4 for notices, 2 for informational.
+beyond them, and a strict parser may keep them as plain extension keys. `flexString1` and
+`flexString2` are CEF's own, with their labels. Other fields of an event (a secret guard event's
+`variables` and `rule_key`) are in the file and the syslog and HTTP bodies, not the CEF line. CEF
+severity is 7 for warnings, 4 for notices, 2 for informational.
 
 ## HTTP details
 

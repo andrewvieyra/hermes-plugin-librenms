@@ -601,12 +601,13 @@ script can tell an apply that went through from one that did not.
   file whose `id` is not its name. See [Write modes](#write-modes).
 - **The shell does not read the secrets.** A `terminal`, `execute_code` or `process_manage` call
   that reads `LIBRENMS_TOKEN`, `LIBRENMS_PROXY`, an SNMP credential (`LIBRENMS_SNMP_*`) or a sink's
-  collector token by name (`$LIBRENMS_TOKEN`, `printenv`, `os.environ[...]`; a presence test such as
-  `[ -n "$LIBRENMS_TOKEN" ]` reads nothing), or that calls the LibreNMS API with a token, is refused
-  and audited as `secret_access_refused`. One that reads a Hermes `.env` file, or prints an
-  environment that holds them, goes to Hermes' approval prompt with the command, audited as
-  `secret_access_requested`. A text heuristic, like the CLI block below; the token's role is the
-  limit that holds.
+  collector token by name (`$LIBRENMS_TOKEN`, `printenv` however it is run, `os.environ[...]`; a
+  presence test such as `[ -n "$LIBRENMS_TOKEN" ] && ...` reads nothing), or that calls the
+  LibreNMS API with a token (`Authorization: Bearer` or `X-Auth-Token`, API v0 or v1), is refused
+  and audited as `secret_access_refused`. One that reads a Hermes `.env` file (by name, a dotfile
+  glob or a recursive search of the home), or prints an environment that holds them, goes to
+  Hermes' approval prompt with the command, audited as `secret_access_requested`. A text heuristic,
+  like the CLI block below; the token's role is the limit that holds.
 - **No secrets in plans.** The token appears only in the request header. SNMP credentials are
   environment references in the plan and are resolved only while the step runs. Credential fields
   (communities, SNMP passwords, service parameters) are masked in every tool result and audit event;
@@ -717,9 +718,9 @@ Every plan, apply and rollback is recorded for review and for SIEM ingestion:
   object per line: `plan_created`, `apply_started`, `step_done`, `apply_finished`, `rollback_*`,
   `approval_requested`, `approval_decided`, the refusals and rejections that never reached
   LibreNMS, and the shell calls the secret guard refused or asked about (`secret_access_refused`,
-  `secret_access_requested`). It is rotated at 10 MiB and daily, and rotated files are deleted after 90 days or past
-  the newest 100 (`audit_max_mb`, `audit_retention_days`, `audit_keep_files`), each deletion recorded
-  as `audit_pruned`.
+  `secret_access_requested`). It is rotated at 10 MiB and daily, and rotated files are deleted
+  after 90 days or past the newest 100 (`audit_max_mb`, `audit_retention_days`,
+  `audit_keep_files`), each deletion recorded as `audit_pruned`.
 
 The actor record distinguishes a model tool call from a human using `/librenms` or `hermes
 librenms`, and carries the Hermes surface, profile, gateway platform, chat, user, session, cron job,
@@ -769,7 +770,7 @@ Layout:
 plugin.yaml   manifest (tools, hooks, env, settings schema)
 __init__.py   register(ctx)
 schemas.py    tool schemas the model sees
-handlers.py   tool handlers, the write_mode gate, the approval, approval-binding and request hooks, the shell guards
+handlers.py   tool handlers, the write_mode gate, the approval and request hooks, the shell guards
 commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query

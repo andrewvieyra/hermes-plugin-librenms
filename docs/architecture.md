@@ -573,16 +573,26 @@ human to ask blocks the call.
   blocks a read of one of the plugin's secrets by name (`secret_variable`: `LIBRENMS_TOKEN`,
   `LIBRENMS_PROXY`, `LIBRENMS_SNMP_*`, `LIBRENMS_AUDIT_SINK_SECRET` and any `LIBRENMS_` name holding
   `TOKEN`, `SECRET`, `PASS` or `KEY`, through a shell, PowerShell, cmd, Perl or PHP expansion,
-  `printenv`/`declare -p`, or an environment lookup in code; presence tests excepted) and a call to the
-  API with a token (`librenms_api`: `X-Auth-Token` or `api_token` with `/api/v0` or `LIBRENMS_URL`),
-  in every `write_mode`, and tells the model the tools carry the token. It returns `approve` for a
-  Hermes `.env` file (`env_file`) and, while this process's environment holds one of the secrets,
-  for a whole-environment print (`environment`), with a prompt that names what Hermes' masking leaves
-  readable and the command, cut to one line, under the rule key
-  `librenms:secret:<tool>:<rule>:<digest of the text>`. Audited as `secret_access_refused` and
-  `secret_access_requested` with the tool, the rule and the variable names, never the text. It reads
-  no settings, every pattern is anchored on a literal and runs in linear time, and a failure inside
-  it blocks the call with an error id.
+  `printenv`/`declare -p` wherever it stands in the command (by path, `\printenv`, after `sudo`,
+  `env`, `timeout`, `busybox`, or from `xargs`, which hands it the names in its input), or an
+  environment lookup in code; a presence test excepted where a command starts, outside a quoted
+  string, as the whole test, and a braced `${N:+x}`) and a call to the API with a token
+  (`librenms_api`: `Authorization: Bearer`, `X-Auth-Token` or `api_token` with `/api/v0`,
+  `LIBRENMS_URL`, the configured `LIBRENMS_URL`'s host, or `/api/v1` beside the word librenms, since
+  Kubernetes, Prometheus and others serve an `/api/v1` too), in every `write_mode`, and tells the
+  model the tools carry the token. It returns `approve` for a Hermes `.env` file (`env_file`: named,
+  or reached by a dotfile glob under a home or a recursive `grep -r`, `rg`, `find -exec` of a home,
+  its `profiles` or a profile) and, while this process's environment holds one of the secrets, for
+  a whole-environment print (`environment`; wrappers with their options are skipped to find the
+  command, so `sudo -E env` and `/usr/bin/env` count and `env FOO=1 make` does not), under the rule
+  key `librenms:secret:<tool>:<rule>:<digest of the text>`. Its prompt opens with a line saying what
+  the call reads and a line with the command, together within the 300 characters Discord shows; a
+  longer command is cut there and says first how many of its characters are not shown. Then what
+  Hermes' masking leaves readable. Audited as `secret_access_refused` and `secret_access_requested` with the tool,
+  the rule and the variable names, never the text. It reads no settings (only the configured
+  `LIBRENMS_URL`, as the client does, when a call carries a token), every pattern is anchored on a
+  literal and runs in linear time (secret names are checked by a string test, not a pattern), and a
+  failure inside it blocks the call with an error id.
 - **Other tools**: both callbacks return immediately, without I/O, for every other tool.
 - Every `approve` the hook returns is audited as `approval_requested` (tool, plan id, rule key,
   digest), or for a shell call as `secret_access_requested`, and `post_approval_response` records the

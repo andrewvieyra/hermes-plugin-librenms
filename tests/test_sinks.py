@@ -147,6 +147,9 @@ class Formats(unittest.TestCase):
         self.assertEqual(sinks.severity_of(_record("apply_started")), sinks.SEV_NOTICE)
         self.assertEqual(sinks.severity_of(_record("approval_decided", choice="deny")), sinks.SEV_NOTICE)
         self.assertEqual(sinks.severity_of(_record("approval_requested")), sinks.SEV_NOTICE)  # one never decided
+        # the shell guard: a refusal is an alarm like apply_refused, a request one more approval to watch for
+        self.assertEqual(sinks.severity_of(_record("secret_access_requested")), sinks.SEV_NOTICE)
+        self.assertEqual(sinks.severity_of(_record("secret_access_refused")), sinks.SEV_WARNING)
         for event in ("plans_pruned", "audit_pruned"):  # retention removed records: worth a look, not an alarm
             self.assertEqual(sinks.severity_of(_record(event)), sinks.SEV_NOTICE, event)
         for event in ("apply_refused", "query_refused", "revert_irreversible", "run_recovered", "step_conflict"):
@@ -202,13 +205,21 @@ class Formats(unittest.TestCase):
             "cs8Label=config_digest cs8=0123456789ab",
         ):
             self.assertIn(needle, ext, needle)
+        refused = sinks.to_cef(_record("secret_access_refused", tool="terminal", rule="librenms_api", variables=[]))
+        self.assertIn("|secret_access_refused|secret access refused|7|", refused)
+        self.assertIn(
+            "flexString1Label=tool flexString1=terminal flexString2Label=rule flexString2=librenms_api", refused
+        )
+        self.assertIn(
+            "|secret_access_requested|secret access requested|4|", sinks.to_cef(_record("secret_access_requested"))
+        )
         pipe = sinks.to_cef(_record("x|y"))
         self.assertIn("|x\\|y|", pipe)
         self.assertEqual(sinks._cef_ext("a=b\\c\nd"), "a\\=b\\\\c\\nd")
 
     def test_cef_writes_no_label_without_its_value(self):
         line = sinks.to_cef({"event": "plans_pruned", "ts": "bad", "actor": None, "count": 2})
-        for label in ("cs1Label", "cs2Label", "cs6Label", "cn1Label", "cs7Label", "cs8Label"):
+        for label in ("cs1Label", "cs2Label", "cs6Label", "cn1Label", "cs7Label", "cs8Label", "flexString1Label"):
             self.assertNotIn(label, line)
         self.assertIn("rt=", line)
 

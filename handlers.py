@@ -19,6 +19,7 @@ repository root is on ``sys.path`` (tests, editable checkouts).
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import functools
 import hashlib
@@ -28,10 +29,20 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, NamedTuple, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Tuple
+from urllib.parse import urlsplit
 
 from . import audit, listing, reports, sinks
-from .client import LibreNMSClient, LibreNMSError, insecure_transport, is_configured, is_digits, new_error_id
+from .client import (
+    LibreNMSClient,
+    LibreNMSError,
+    insecure_transport,
+    is_configured,
+    is_digits,
+    new_error_id,
+    normalise_url,
+)
+from .client import secret as read_secret
 from .executor import (
     EVENTLOG_MESSAGE_CHARS,
     ExecutionRefused,
@@ -103,27 +114,47 @@ API_BLOCK = "refused: the agent's terminal and code do not call the LibreNMS API
 # The rules _secret_access applies: these two block; env_file and environment go to Hermes' approval prompt, since
 # a person may want them and Hermes' masking hides some of what they print.
 _BLOCKED_RULES = frozenset({"librenms_api", "secret_variable"})
-# The plugin's secrets, by the variable that holds them: the token, a proxy URL that may carry a password, the SNMP
-# credentials a device create reads, and an audit sink's collector token (the Desktop's LIBRENMS_AUDIT_SINK_SECRET,
-# or any LIBRENMS_ name that says it holds one). LIBRENMS_URL, LIBRENMS_VERIFY_SSL and LIBRENMS_TIMEOUT are not.
-# Matched whole (fullmatch) against a name the patterns below found, so no pattern backtracks into a long name.
-_SECRET_NAME_RE = re.compile(r"LIBRENMS_(?:PROXY|SNMP_\w+|\w*?(?:TOKEN|SECRET|PASS|KEY)\w*)", re.IGNORECASE | re.ASCII)
-# A variable read by name: a shell, PowerShell, cmd, Perl or PHP expansion ($N, ${N:-x}, $env:N, %N%, $ENV{N},
-# $_ENV['N']), and a call or subscript of Python, Ruby, Node, Go, Java, C# or Rust (os.environ["N"], os.getenv("N"),
-# ENV.fetch("N"), process.env.N, System.getenv("N"), env::var("N")). ${N:+x} and ${N+x} expand to x, not the value.
+# The plugin's secrets, by the variable that holds them (_is_secret_name): the token, a proxy URL that may carry a
+# password, the SNMP credentials a device create reads, and an audit sink's collector token (the Desktop's
+# LIBRENMS_AUDIT_SINK_SECRET, or any LIBRENMS_ name that says it holds one). LIBRENMS_URL, LIBRENMS_VERIFY_SSL and
+# LIBRENMS_TIMEOUT are not.
+_SECRET_WORDS = ("TOKEN", "SECRET", "PASS", "KEY")
+_NAME_RE = re.compile(r"\w+", re.ASCII)
+# A variable read by name: a shell, PowerShell, cmd, Perl or PHP expansion ($N, ${N:-x}, $env:N, env:N, %N%,
+# $ENV{N}, $_ENV['N']), and a call or subscript of Python, Ruby, Node, Go, Java, C# or Rust (os.environ["N"],
+# os.environ.copy()["N"], os.getenv("N"), ENV.fetch("N"), process.env.N, System.getenv("N"),
+# System.getenv().get("N"), env::var("N")). Only a braced ${N:+x} or ${N+x} expands to x, not the value: $N+ and
+# process.env.N+"" read it.
 _VARIABLE_READ_RE = re.compile(
-    r"""(?:\$\{?(?:env:)?|%|\$ENV\{\s*['"]?|\$_(?:ENV|SERVER)\[\s*['"]"""
-    r"""|\b(?:getenv|environb?|env|GetEnvironmentVariable|LookupEnv|var)\s*"""
-    r"""(?:(?:\.\s*(?:get|fetch|pop|setdefault)\s*)?[\[(]\s*b?['"]|\.\s*))"""
-    r"""(?P<name>LIBRENMS_\w+)(?!\w)(?!:?\+)""",
+    r"""(?:\$(?P<brace>\{)?(?:env:)?|%|\benv:|\$ENV\{\s*['"]?|\$_(?:ENV|SERVER)\[\s*['"]"""
+    r"""|\b(?:getenv|environb?|env|GetEnvironmentVariable|LookupEnv|var)\s*(?:\(\s*\)\s*)?"""
+    r"""(?:\.\s*(?:copy|to_h|to_hash)\s*(?:\(\s*\)\s*)?)?(?:\)\s*)?"""
+    r"""(?:(?:\.\s*(?:get|fetch|pop|setdefault|getOrDefault)\s*)?[\[(]\s*b?['"]|\.\s*))"""
+    r"""(?P<name>LIBRENMS_\w+)(?!\w)(?(brace)(?!:?\+))""",
     re.IGNORECASE | re.ASCII,
 )
-# A test that a variable is set or empty, which reveals nothing of its value: [ -n "$N" ], test -z "${N:-}"
+# Node's destructuring of the environment, which reads every name between the braces:
+# const {LIBRENMS_TOKEN, LIBRENMS_PROXY: proxy} = process.env
+_DESTRUCTURE_RE = re.compile(r"\{(?P<names>[^{}]*)\}\s*=\s*process\s*\.\s*env\b", re.IGNORECASE | re.ASCII)
+_NAMES_RE = re.compile(r"(?<!\w)LIBRENMS_\w+", re.IGNORECASE | re.ASCII)
+# A test that a variable is set or empty, which reveals nothing of its value ([ -n "$N" ], test -z "${N:-}",
+# if [[ ! -n $N ]]), only where a command starts (at the start, after a separator, a pipe or a command
+# substitution, and after if, then, elif, else, while, until, do or !) and as the whole test (`]`, `]]`, a
+# separator or the end after it), and only where that start is outside a quoted string (_without_presence_tests).
+# The same words inside an argument, a URL or a string still read the value: echo [ -z "$N" ], "?q=test -n $N".
 _PRESENCE_TEST_RE = re.compile(
-    r"""(?:\btest|\[\[?)\s+(?:!\s+)?-[nz]\s+["']?\$\{?LIBRENMS_\w+(?!\w)(?::?-?\})?["']?""", re.IGNORECASE | re.ASCII
+    r"""(?P<lead>^|[\n;&|(`])\s*(?:(?:if|then|elif|else|while|until|do|!)\s+)*"""
+    r"""(?:test|\[\[?)\s+(?:!\s+)?-[nz]\s+(?P<quote>["']?)\$\{?LIBRENMS_\w+(?!\w)(?::?-?\})?(?P=quote)"""
+    r"""(?=\s*(?:\]|[\n;&|)`]|$))""",
+    re.IGNORECASE | re.ASCII,
 )
-# A header or parameter that authenticates to LibreNMS, and what says the request goes to its API
-_AUTH_MARKERS = ("x-auth-token", "api_token")
+# A string as a shell quotes it ('...', "..." with backslash escapes), or one escaped character outside them
+_QUOTED_RE = re.compile(r"""'[^']*'|"[^"\\]*(?:\\.[^"\\]*)*"|\\.""", re.DOTALL)
+# A header or parameter that authenticates to LibreNMS (X-Auth-Token on API v0, Authorization: Bearer on every
+# version, as curl's --oauth2-bearer and httpie's -A bearer send it, api_token), and what says the request goes to
+# its API: /api/v0, LIBRENMS_URL, /api/v1 with the word librenms (other products serve an /api/v1 too: Kubernetes,
+# Prometheus, Gitea), or the host of the configured LIBRENMS_URL (_names_librenms_host).
+_AUTH_MARKERS = ("x-auth-token", "api_token", "bearer")
 _API_MARKERS = ("/api/v0", "librenms_url")
 # A Hermes .env file: the name .env (with a suffix such as .bak, not .example) next to a Hermes home (~/.hermes,
 # $HERMES_HOME, %LOCALAPPDATA%\hermes on Windows, or the active home's path)
@@ -144,8 +175,38 @@ _ENVIRON_RE = re.compile(
 _COMMAND_SPLIT_RE = re.compile(r"""[\n;&|`\])]|\$\(|\((?=\s*["'\[])""")
 _WORD_SPLIT_RE = re.compile(r"[\s,]+")
 _REDIRECT_RE = re.compile(r"\d*[<>]+")  # > file, 2>, >>file, <<EOF: not an argument of the command
-_WRAPPERS = frozenset({"sudo", "command", "builtin", "exec", "nohup", "time", "nice"})
+# Words that run the command after them, by name (_command_name: /usr/bin/env and \env are env), each with the
+# letters of its short options that take a value (sudo -u root, nice -n 5, env -u NAME, xargs -I {}); timeout also
+# takes a duration. _command_start skips them, with their options and NAME=value assignments.
+_WRAPPERS = {
+    "sudo": "CDghpRrTtUu",
+    "doas": "Cu",
+    "command": "",
+    "builtin": "",
+    "exec": "a",
+    "nohup": "",
+    "time": "fo",
+    "nice": "n",
+    "ionice": "cnp",
+    "timeout": "ks",
+    "stdbuf": "eio",
+    "setsid": "",
+    "env": "CPSu",
+    "xargs": "adEILnPs",
+    "busybox": "",
+    "toybox": "",
+}
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*=")
+_PATH_SPLIT_RE = re.compile(r"[\\/]")
+# Commands that read a directory's files recursively: grep with -r (and its kin), the searchers that recurse by
+# default, and find running a command on what it finds
+_GREPS = frozenset({"grep", "egrep", "fgrep", "zgrep"})
+_SEARCHERS = frozenset({"rg", "ag", "ack", "ugrep"})
+_FIND_RUNS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_GLOB_CHARS = frozenset("*?[")
+# The part of a secret prompt every surface shows: Hermes cuts the reason at 300 characters on Discord, the least of
+# its surfaces, so the head line and the command line fit in that much (_secret_prompt).
+_SECRET_PROMPT_SHOWN = 300
 # The rule_key pre_tool_call returns, as Hermes reports it back (prefixed "plugin_rule:"):
 # "librenms:<tool>:<plan_id>:<variant>:<content digest>". 0.10.x and earlier left the digest out, and 0.1.1 and
 # earlier also returned "librenms:<tool>:unresolved:<digest>", which a remembered answer can still carry.
@@ -1740,26 +1801,30 @@ def _secret_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str
 def _secret_access(text: str) -> Tuple[str, List[str]] | None:
     """The rule a shell tool's *text* breaks, and the secrets it names, or None. In order:
 
-    - ``librenms_api``: an ``X-Auth-Token`` header or ``api_token`` parameter with ``/api/v0`` or ``LIBRENMS_URL``,
-      a call to LibreNMS's API past every control of the plugin, whatever the token's source;
-    - ``secret_variable``: a read of one of the plugin's secrets by name (:data:`_SECRET_NAME_RE`): an expansion
-      or an environment lookup in code (:data:`_VARIABLE_READ_RE`), ``printenv N`` or ``declare -p N``. A presence
-      test (``[ -n "$LIBRENMS_TOKEN" ]``) and ``${#N}`` or ``${N:+x}`` read nothing;
-    - ``env_file``: a Hermes ``.env`` file named, which holds them all;
+    - ``librenms_api``: a token header or parameter (``X-Auth-Token``, ``Authorization: Bearer``, ``api_token``)
+      with ``/api/v0``, ``LIBRENMS_URL``, ``/api/v1`` beside the word librenms, or the configured LibreNMS host
+      (:func:`_names_api`): a call to LibreNMS's API past every control of the plugin, whatever the token's source;
+    - ``secret_variable``: a read of one of the plugin's secrets by name (:func:`_is_secret_name`): an expansion
+      or an environment lookup in code (:data:`_VARIABLE_READ_RE`, :data:`_DESTRUCTURE_RE`), or ``printenv N`` or
+      ``declare -p N`` however it is run (``/usr/bin/printenv``, ``sudo -E printenv``, ``echo N | xargs
+      printenv``). A presence test where a command starts (``[ -n "$LIBRENMS_TOKEN" ]``), ``${#N}`` and
+      ``${N:+x}`` read nothing;
+    - ``env_file``: a Hermes ``.env`` file, which holds them all, named next to a Hermes home, or reached without
+      its name by a dotfile glob or a recursive search of the home (:func:`_searches_home`);
     - ``environment``: an environment printed whole (``env``, ``printenv``, ``export -p``, ``declare -p``, ``set``,
-      ``Get-ChildItem env:``, a ``/proc`` environ file, ``print(os.environ)``) while this process's environment
-      holds one of them, which the agent's local terminal inherits.
+      ``Get-ChildItem env:``, a ``/proc`` environ file, ``print(os.environ)``), however it is run, while this
+      process's environment holds one of them, which the agent's local terminal inherits.
 
     Hermes masks a printed ``NAME=value`` by the name and the value's shape, not always whole (part of a token can
     show) and not a password inside ``LIBRENMS_PROXY``. The first two rules block, the last two ask.
     Every pattern is anchored on a literal and runs in linear time, since this runs before every shell call."""
     folded = text.casefold()
     names = _secrets_read(text, folded) if "librenms_" in folded else []
-    if any(marker in folded for marker in _AUTH_MARKERS) and any(marker in folded for marker in _API_MARKERS):
+    if any(marker in folded for marker in _AUTH_MARKERS) and _names_api(folded):
         return "librenms_api", names
     if names:
         return "secret_variable", names
-    if ".env" in folded and _ENV_FILE_RE.search(text) and _names_home(text):
+    if _reads_env_file(text, folded):
         return "env_file", []
     held = _held_secrets()
     if held and (_ENVIRON_RE.search(text) or any(map(_prints_environment, _commands(text)))):
@@ -1767,22 +1832,76 @@ def _secret_access(text: str) -> Tuple[str, List[str]] | None:
     return None
 
 
+def _names_api(folded: str) -> bool:
+    """The case-folded call *folded* goes to LibreNMS's API (see :data:`_AUTH_MARKERS`)."""
+    if any(marker in folded for marker in _API_MARKERS):
+        return True
+    return "/api/v1" in folded and "librenms" in folded or _names_librenms_host(folded)
+
+
+def _names_librenms_host(folded: str) -> bool:
+    """*folded* names the host of the configured ``LIBRENMS_URL``, read as the client reads it, as a whole name."""
+    host = ""
+    with contextlib.suppress(Exception):
+        host = urlsplit(normalise_url(read_secret("LIBRENMS_URL") or "")).hostname or ""
+    return bool(host) and re.search(rf"(?<![\w.-]){re.escape(host)}(?![\w-])", folded) is not None
+
+
 def _secrets_read(text: str, folded: str) -> List[str]:
     """The plugin's secrets *text* reads by name, upper-cased and sorted (see :func:`_secret_access`)."""
-    found = (match.group("name") for match in _VARIABLE_READ_RE.finditer(_PRESENCE_TEST_RE.sub(" ", text)))
-    names = {name.upper() for name in found if _SECRET_NAME_RE.fullmatch(name)}
+    found = [match.group("name") for match in _VARIABLE_READ_RE.finditer(_without_presence_tests(text))]
+    if "process" in folded:
+        for match in _DESTRUCTURE_RE.finditer(text):
+            found += _NAMES_RE.findall(match.group("names"))
     if "printenv" in folded or "declare" in folded or "typeset" in folded:
-        for words in _commands(text):
-            command = words[0].lower()
-            if command == "printenv" or (command in ("declare", "typeset") and any(_flag(word, "p") for word in words)):
-                names.update(word.upper() for word in words[1:] if _SECRET_NAME_RE.fullmatch(word))
-    return sorted(names)
+        piped = False
+        for words in _simple_commands(text):
+            listed, through_xargs = _listed_names(words)
+            found += listed
+            piped = piped or through_xargs
+        if piped:  # echo LIBRENMS_TOKEN | xargs printenv: printenv takes the names from its input
+            found += _NAMES_RE.findall(text)
+    return sorted({name.upper() for name in found if _is_secret_name(name)})
 
 
-def _commands(text: str):
-    """The simple commands in *text*, each as its words: split at shell separators, pipes and command substitutions,
-    and in code at a call's string or list argument; quotes and brackets stripped, redirections and their targets
-    left out, and leading wrappers (``sudo``, ``nohup``, ...) and ``NAME=value`` assignments skipped."""
+def _without_presence_tests(text: str) -> str:
+    """*text* with each presence test (:data:`_PRESENCE_TEST_RE`) that starts outside a quoted string blanked out.
+    The quoted strings are found once, and only when there is a test to check."""
+    starts: List[int] = []
+    ends: List[int] = []
+
+    def blank(match: re.Match[str]) -> str:
+        if not starts:
+            for quoted in _QUOTED_RE.finditer(text):
+                starts.append(quoted.start())
+                ends.append(quoted.end())
+            starts.append(len(text) + 1)  # found: never searched again
+            ends.append(len(text) + 1)
+        at = bisect.bisect_right(starts, match.start("lead")) - 1
+        inside = at >= 0 and match.start("lead") < ends[at]
+        return match.group(0) if inside else match.group("lead") + " "
+
+    return _PRESENCE_TEST_RE.sub(blank, text)
+
+
+def _listed_names(words: List[str]) -> Tuple[List[str], bool]:
+    """The words the simple command *words* hands ``printenv``, or ``declare -p``/``typeset -p``, as names, wherever
+    that word is in it (``sudo -E printenv``, ``timeout 5 printenv``, ``busybox printenv``), and whether ``xargs``
+    runs it, which hands it the names from its input instead."""
+    for at, word in enumerate(words):
+        command = _command_name(word)
+        if command == "printenv":
+            return words[at + 1 :], any(_command_name(before) == "xargs" for before in words[:at])
+        if command in ("declare", "typeset"):
+            rest = words[at + 1 :]
+            return (rest if any(_flag(arg, "p") for arg in rest) else []), False
+    return [], False
+
+
+def _simple_commands(text: str) -> Iterator[List[str]]:
+    """The simple commands in *text*, each as all its words: split at shell separators, pipes and command
+    substitutions, and in code at a call's string or list argument; quotes and brackets stripped, redirections and
+    their targets left out."""
     for piece in _COMMAND_SPLIT_RE.split(text):
         words: List[str] = []
         target = False  # the word after a bare redirection operator is its file
@@ -1793,11 +1912,55 @@ def _commands(text: str):
                 target = not target and redirect is not None and redirect.end() == len(word)
             elif word:
                 words.append(word)
-        start = 0
-        while start < len(words) and (words[start] in _WRAPPERS or _ASSIGNMENT_RE.match(words[start])):
-            start += 1
+        if words:
+            yield words
+
+
+def _commands(text: str) -> Iterator[List[str]]:
+    """The simple commands in *text* (:func:`_simple_commands`), each from the command it runs
+    (:func:`_command_start`)."""
+    for words in _simple_commands(text):
+        start = _command_start(words)
         if start < len(words):
             yield words[start:]
+
+
+def _command_name(word: str) -> str:
+    """The command *word* runs, by name: its last path part, lower-cased, without the backslash that skips an alias
+    or a ``.exe`` (``/usr/bin/printenv`` and ``\\printenv`` are ``printenv``)."""
+    name = _PATH_SPLIT_RE.split(word)[-1].lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _command_start(words: List[str]) -> int:
+    """Where the command the simple command *words* runs starts: past ``NAME=value`` assignments and the wrappers of
+    :data:`_WRAPPERS` with their options (``sudo -E``, ``nice -n 5``, ``timeout -s KILL 5``, ``env -u NAME``). A
+    wrapper that runs nothing is the command itself (``env`` and ``env -0`` print the environment), and so is
+    ``command -v``, which names a command without running it."""
+    at, wrapper = 0, None
+    while at < len(words):
+        if _ASSIGNMENT_RE.match(words[at]):
+            at += 1
+            continue
+        name = _command_name(words[at])
+        takes = _WRAPPERS.get(name)
+        if takes is None:
+            return at
+        wrapper, at = at, at + 1
+        while at < len(words) and words[at].startswith("-") and words[at] != "-":
+            option = words[at]
+            at += 1
+            if option == "--":
+                break
+            if name == "command" and ("v" in option or "V" in option):
+                return wrapper
+            letters = "" if option.startswith("--") else option[1:]
+            first = next((index for index, letter in enumerate(letters) if letter in takes), None)
+            if first is not None and first == len(letters) - 1:
+                at += 1  # the option's value is the next word: sudo -u root
+        if name == "timeout":
+            at += 1  # the duration
+    return len(words) if wrapper is None else wrapper
 
 
 def _flag(word: str, letter: str) -> bool:
@@ -1806,11 +1969,13 @@ def _flag(word: str, letter: str) -> bool:
 
 
 def _prints_environment(words: List[str]) -> bool:
-    """The simple command *words* prints the whole environment: ``env`` or ``printenv`` with only options,
-    ``export`` or ``export -p``, ``declare``/``typeset`` alone or with ``-p``/``-x``, ``set`` alone, or PowerShell's
-    ``env:`` drive listed."""
-    command, rest = words[0].lower(), words[1:]
-    if command in ("env", "printenv"):
+    """The simple command *words*, from the command it runs (:func:`_commands`), prints the whole environment:
+    ``env`` running nothing, ``printenv`` with only options, ``export`` or ``export -p``, ``declare``/``typeset``
+    alone or with ``-p``/``-x``, ``set`` alone, or PowerShell's ``env:`` drive listed."""
+    command, rest = _command_name(words[0]), words[1:]
+    if command == "env":
+        return True  # _command_start stops at env only when it runs nothing
+    if command == "printenv":
         return all(word.startswith("-") for word in rest)
     if command == "export":
         return all(word == "-p" for word in rest)
@@ -1824,45 +1989,119 @@ def _prints_environment(words: List[str]) -> bool:
     return False
 
 
-def _names_home(text: str) -> bool:
-    """*text* names a Hermes home: a ``.hermes`` directory, ``HERMES_HOME``, or the active home's path."""
-    if _HOME_RE.search(text):
+def _reads_env_file(text: str, folded: str) -> bool:
+    """*text* reads a Hermes ``.env`` file: it names a Hermes home (a ``.hermes`` directory, ``HERMES_HOME``,
+    ``%LOCALAPPDATA%\\hermes`` or the active home's path) and either a ``.env`` file or a way to read the home's
+    without naming it (:func:`_searches_home`)."""
+    home = _active_home()
+    if not (_HOME_RE.search(text) or home and home in text):
+        return False
+    if ".env" in folded and _ENV_FILE_RE.search(text):
         return True
+    xargs = "xargs" in folded
+    return any(_searches_home(words, home, xargs) for words in _commands(text))
+
+
+def _searches_home(words: List[str], home: str, xargs: bool) -> bool:
+    """The simple command *words* reads a Hermes home's ``.env`` without naming it: by a glob for dotfiles under the
+    home (``~/.hermes/.e*``, ``~/.hermes/profiles/*/.*``; a plain ``*`` skips dotfiles), or by a recursive read
+    (``grep -r``, ``rg``, ``find -exec``, ``find`` piped to ``xargs`` when *xargs*) of the home, its ``profiles``
+    directory or a profile's, where a ``.env`` is."""
+    paths = [word for word in words[1:] if _HOME_RE.search(word) or home and home in word]
+    if not paths:
+        return False
+    if any(_dotfile_glob(path) for path in paths):
+        return True
+    command, rest = _command_name(words[0]), words[1:]
+    if command in _GREPS:
+        recursive = any(
+            _flag(word, "r") or _flag(word, "R") or word in ("--recursive", "--dereference-recursive") for word in rest
+        )
+    elif command == "find":
+        recursive = xargs or any(word in _FIND_RUNS for word in rest)
+    else:
+        recursive = command in _SEARCHERS
+    return recursive and any(_reaches_env(path, home) for path in paths)
+
+
+def _dotfile_glob(path: str) -> bool:
+    """The last part of *path* is a glob for dotfiles (``.e*``, ``.*``, ``.??v``), which a ``.env`` matches."""
+    last = _PATH_SPLIT_RE.split(path)[-1]
+    return last.startswith(".") and not _GLOB_CHARS.isdisjoint(last)
+
+
+def _reaches_env(path: str, home: str) -> bool:
+    """A recursive read of *path*, which names a Hermes home, reaches a ``.env``: *path* is the home, its
+    ``profiles`` directory or a profile's directory, not one beside them (``~/.hermes/skills``)."""
+    found = _HOME_RE.search(path)
+    end = found.end() if found else path.find(home) + len(home)
+    parts = [part for part in _PATH_SPLIT_RE.split(path[end:].lstrip("}")) if part not in ("", ".")]
+    return not parts or (parts[0].lower() == "profiles" and len(parts) <= 2)
+
+
+def _active_home() -> str:
+    """The active Hermes home's path without a trailing separator, or "" when it is too short to look for."""
     home = ""
     with contextlib.suppress(Exception):
         from hermes_constants import get_hermes_home  # type: ignore
 
         home = str(get_hermes_home())
     home = home or os.environ.get("HERMES_HOME", "")
-    return len(home) > 3 and home.rstrip("/\\") in text
+    return home.rstrip("/\\") if len(home) > 3 else ""
+
+
+def _is_secret_name(name: str) -> bool:
+    """*name* is the variable of one of the plugin's secrets: ``LIBRENMS_`` and then ``PROXY``, ``SNMP_`` and more,
+    or anything holding one of :data:`_SECRET_WORDS`, in any letter case and of word characters only. A string test,
+    not a pattern, so a long name costs linear time."""
+    if len(name) <= 9 or name[:9].upper() != "LIBRENMS_" or not _NAME_RE.fullmatch(name):
+        return False
+    rest = name[9:].upper()
+    return (
+        rest == "PROXY" or (rest.startswith("SNMP_") and len(rest) > 5) or any(word in rest for word in _SECRET_WORDS)
+    )
 
 
 def _held_secrets() -> List[str]:
     """The plugin's secrets this process's environment holds, by name: what the agent's terminal inherits on Hermes'
     local backend (a single-profile process loads its profile's .env into the environment; a multiplexed gateway
     keeps each profile's in its secret scope instead)."""
-    return sorted(
-        name.upper()
-        for name, value in os.environ.items()
-        if value and name[:9].upper() == "LIBRENMS_" and _SECRET_NAME_RE.fullmatch(name)
-    )
+    return sorted(name.upper() for name, value in os.environ.items() if value and _is_secret_name(name))
 
 
 def _secret_prompt(tool: str, rule: str, names: List[str], text: str) -> str:
-    """What Hermes' approval prompt says about a call :func:`_secret_access` asks about: what it reads, what of it
-    Hermes' masking leaves readable, and the command, on one line and cut."""
-    if rule == "env_file":
+    """What Hermes' approval prompt says about a call :func:`_secret_access` asks about: what it reads and the
+    command, both within the part every surface shows (:data:`_SECRET_PROMPT_SHOWN`), then what of it Hermes'
+    masking leaves readable."""
+    if rule != "env_file":
+        head = f"LibreNMS secrets: this {tool} call prints the environment, which holds {_cut(', '.join(names), 80)}"
+    elif ".env" in text.casefold() and _ENV_FILE_RE.search(text):
         head = f"LibreNMS secrets: this {tool} call reads a Hermes .env file, which holds LIBRENMS_TOKEN"
     else:
-        head = f"LibreNMS secrets: this {tool} call prints the environment, which holds {', '.join(names)}"
+        head = (
+            f"LibreNMS secrets: this {tool} call reaches a Hermes .env file, which holds LIBRENMS_TOKEN, by search "
+            "or glob"
+        )
     return "\n".join(
         (
             head,
+            _command_line(one_line(text), _SECRET_PROMPT_SHOWN - len(head) - 1),
             "Hermes' masking can leave part of a token, and a password inside LIBRENMS_PROXY, readable.",
-            f"Command: {_cut(one_line(text), 2 * APPROVAL_LINE_CHARS)}",
             "Allow it only if you asked for it: the librenms tools never need it.",
         )
     )
+
+
+def _command_line(command: str, room: int) -> str:
+    """``Command: <command>`` in *room* characters, or when it does not fit, how much of it is not shown and then
+    its start, so every surface shows that the command was cut before what of it fits."""
+    line = f"Command: {command}"
+    if len(line) <= room:
+        return line
+    total = len(command)
+    note = "Command ({} of its {} characters not shown here; deny unless you can read it all): "
+    shown = max(room - len(note.format(total, total)) - 1, 0)
+    return note.format(total - shown, total) + command[:shown] + "…"
 
 
 def pre_llm_call(**kwargs: Any) -> None:

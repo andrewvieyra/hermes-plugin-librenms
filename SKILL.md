@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Plan, review, apply and roll back LibreNMS changes with the librenms_* tools: devices, locations, device groups, services, alert rules, port descriptions, alert acknowledgements and maintenance windows, each written only through a plan the user has seen and said yes to. Load when the user wants to change something in LibreNMS; for questions that change nothing, load librenms:ask.
-version: 0.13.0
+version: 0.13.1
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
