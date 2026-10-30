@@ -25,7 +25,7 @@ ENV = {"LIBRENMS_URL": "https://librenms.test", "LIBRENMS_TOKEN": "0123456789abc
 
 class FakeContext:
     """The ``PluginContext`` surface ``register`` uses, recording every call. ``old=True`` is a Hermes that predates
-    CLI and skill registration; ``hookless=True`` one that cannot take hooks."""
+    CLI, skill and blueprint registration; ``hookless=True`` one that cannot take hooks."""
 
     def __init__(self, config=None, *, old=False, hookless=False):
         self.config = dict(config or {})
@@ -36,6 +36,7 @@ class FakeContext:
         self.cli = []
         self.skills = []
         self.hooks = []
+        self.blueprints = []
 
     def get_config(self, key, default=None):
         return self.config.get(key, default)
@@ -60,6 +61,12 @@ class FakeContext:
         if self.old:
             raise AttributeError("'PluginContext' object has no attribute 'register_skill'")
         self.skills.append((name, Path(path), kwargs))
+
+    def register_automation_blueprint(self, key, **kwargs):
+        if self.old:
+            raise AttributeError("'PluginContext' object has no attribute 'register_automation_blueprint'")
+        self.blueprints.append((key, kwargs))
+        return "registration"
 
 
 class _Worker:
@@ -131,6 +138,7 @@ class RegisterWithAFakeContext(PluginTestCase):
         self.assertIn("changes", workflow)
         for subject in ("questions", "down", "ports", "utilisation", "link speeds", "MAC", "alerts", "follow-ups"):
             self.assertIn(subject, ask)
+        self.assertEqual(ctx.blueprints, [("network-digest", submodule("digest").BLUEPRINT)])
         self.assertEqual((self.clients, self.fake.calls), ([], []))  # registration makes no client, so no I/O
 
     def test_schemas_fit_the_budget(self):
@@ -197,7 +205,7 @@ class RegisterWithAFakeContext(PluginTestCase):
         ctx = self.register(FakeContext(old=True))
         self.assertEqual(len(ctx.tools), 6)
         self.assertIn("librenms", ctx.commands)
-        self.assertEqual((ctx.cli, ctx.skills, len(ctx.hooks)), ([], [], 4))
+        self.assertEqual((ctx.cli, ctx.skills, ctx.blueprints, len(ctx.hooks)), ([], [], [], 4))
 
     def test_a_hermes_that_cannot_take_the_hooks_fails_the_load(self):
         # without pre_tool_call nothing would ask before apply or rollback; better no plugin than that
@@ -304,6 +312,8 @@ class LoadThroughPluginManager(unittest.TestCase):
             self.assertIsNotNone(mgr.find_plugin_skill(f"librenms:{name}"), name)
             [skill] = [s for s in mgr.list_plugin_skill_metadata() if s["name"] == f"librenms:{name}"]
             self.assertEqual(skill["frontmatter"], {})
+        # Hermes validated the digest blueprint at load (it fills one whose blanks all have defaults) and kept it
+        self.assertEqual([bp.key for bp in mgr.list_automation_blueprints()], ["librenms:network-digest"])
 
         # settings flowed from config.yaml into the plugin, and the bad one fell back
         mod = sys.modules["hermes_plugins.librenms"]
@@ -545,6 +555,79 @@ class LoadThroughPluginManager(unittest.TestCase):
         self.assertTrue(views["ask"]["description"].startswith("Answer questions about the network"))
         command = get_plugin_skill_commands()["/librenms:ask"]
         self.assertEqual(Path(command["skill_md_path"]).parts[-3:], ("skills", "ask", "SKILL.md"))
+
+    def test_the_digest_is_in_the_catalog_fills_a_job_and_its_run_writes_nothing(self):
+        # Hermes' own catalog, filler, chat seed, cron prompt scan and cron run identity, with our hooks as Hermes
+        # invokes them. (Named to run after test_registration_through_real_loader, as _dispatching_plugin says.)
+        from cron.blueprint_catalog import (
+            BlueprintFillError,
+            blueprint_catalog_entry,
+            fill_blueprint,
+            get_blueprint,
+        )
+        from cron.execution_identity import enter_cron_execution, exit_cron_execution
+        from cron.jobs import parse_schedule
+        from hermes_cli.blueprint_cmd import build_blueprint_seed, match_blueprint
+        from tools.cronjob_prompt_scan import _scan_cron_prompt
+        from tools.registry import registry
+
+        plugin, fake, plan_id = self._dispatching_plugin()
+        digest = plugin.digest
+        blueprint = get_blueprint("librenms:network-digest")  # what /blueprint, the dashboard and the Desktop list
+        self.assertIsNotNone(blueprint)
+        self.assertEqual((blueprint.plugin, blueprint.title, blueprint.skills), ("librenms", digest.TITLE, ()))
+        self.assertIs(match_blueprint("network-digest")[0], blueprint)  # /blueprint network-digest finds it
+        entry = blueprint_catalog_entry(blueprint)
+        self.assertEqual((entry["source"], entry["scheduleHuman"]), ("plugin", "everyday at 08:00"))
+        self.assertEqual(
+            entry["command"],
+            '/blueprint librenms:network-digest time=08:00 recurrence=everyday group="all" rows=10 all_clear=send '
+            "deliver=origin",
+        )
+        spec = fill_blueprint(blueprint, {})
+        self.assertEqual(
+            {key: spec[key] for key in ("schedule", "name", "deliver")},
+            {"schedule": "0 8 * * *", "name": digest.TITLE, "deliver": "origin"},
+        )
+        self.assertNotIn("skills", spec)
+        self.assertEqual(spec["prompt"], digest.PROMPT.format(group="all", rows="10", all_clear="send"))
+        self.assertEqual(_scan_cron_prompt(spec["prompt"]), "")  # the strict scan a cron job's own prompt gets
+        parse_schedule(spec["schedule"])
+        chosen = {"time": "06:30", "recurrence": "weekdays", "group": "edge-routers", "rows": "5", "all_clear": "skip"}
+        filled = fill_blueprint(blueprint, {**chosen, "deliver": "telegram"})
+        self.assertEqual((filled["schedule"], filled["deliver"]), ("30 6 * * 1-5", "telegram"))
+        for text in ("Devices: edge-routers.", "limit 5 ", "All-clear days: skip."):
+            self.assertIn(text, filled["prompt"])
+        self.assertEqual(fill_blueprint(blueprint, {"recurrence": "weekends"})["schedule"], "0 8 * * 0,6")
+        for wrong in ({"rows": "7"}, {"time": "8am"}, {"recurrence": "mondays"}, {"tiem": "07:15"}):
+            with self.assertRaises(BlueprintFillError, msg=wrong):
+                fill_blueprint(blueprint, wrong)
+        # /blueprint network-digest with no values hands the agent the template to copy: nothing in it to unescape
+        seed = build_blueprint_seed(blueprint)
+        self.assertIn(digest.MARKER, seed)
+        self.assertNotIn("{{", seed)
+
+        # a run of the job: Hermes binds its identity, then starts the turn with the prompt (pre_llm_call)
+        token = enter_cron_execution({"id": "job-digest", "name": digest.TITLE}, "exec-1", {"source": "builtin"})
+        try:
+            self.mgr.invoke_hook("pre_llm_call", session_id="cron_s", task_id="cron_t", user_message=spec["prompt"])
+            directives = self.mgr.invoke_hook(
+                "pre_tool_call", tool_name="librenms_apply", args={"plan_id": plan_id}, task_id="cron_t",
+                session_id="cron_s",
+            )  # fmt: skip
+            self.assertIn({"action": "block", "message": digest.REFUSAL.format(action="apply")}, directives)
+            self.assertFalse([d for d in directives if d.get("action") == "approve"], directives)
+            out = json.loads(registry.dispatch("librenms_plan", {"description": "t", "operations": [{
+                "op": "update", "resource": "device", "id": 1, "data": {"purpose": "leaf"}}]}))  # fmt: skip
+            self.assertEqual(out["error"], digest.REFUSAL.format(action="plan"))
+            out = json.loads(registry.dispatch("librenms_report", {"view": "alerts", "limit": 5}))
+            self.assertTrue(out["success"], out)  # the reads the digest is for
+        finally:
+            exit_cron_execution(token)
+        self.assertEqual(fake.writes(), [])
+        # the run is over: the same session's next call is a chat's again
+        directive, _bound = self.mgr.invoke_hook("pre_tool_call", tool_name="librenms_apply", args={"plan_id": plan_id})
+        self.assertEqual(directive["action"], "approve")
 
     def test_report_times_use_the_zone_hermes_uses(self):
         # timefmt rebuilds hermes_time.get_timezone from public modules; both must name the same zone

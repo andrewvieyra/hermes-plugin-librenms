@@ -11,7 +11,8 @@ plan they would run (``pre_tool_call``, audited as ``approval_requested``; a pla
 blocked instead), keep the agent's own terminal, code and background shells from running ``hermes librenms apply``
 around that prompt (audited as a refusal) and from reading the plugin's secrets (blocked, or put to the approval
 prompt when the call reads a file or an environment that holds them), remember the user's message for the audit
-trail (``pre_llm_call``) and record the human's decision (``post_approval_response``). Hook callbacks never raise.
+trail and note a run of the scheduled digest (``pre_llm_call``), in which the write tools refuse (:mod:`digest`), and
+record the human's decision (``post_approval_response``). Hook callbacks never raise.
 
 Named ``handlers`` rather than ``tools`` so the module can never shadow Hermes' own ``tools`` package when the
 repository root is on ``sys.path`` (tests, editable checkouts).
@@ -32,7 +33,7 @@ import time
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Tuple
 from urllib.parse import urlsplit
 
-from . import audit, listing, reports, sinks
+from . import audit, digest, listing, reports, sinks
 from .client import (
     LibreNMSClient,
     LibreNMSError,
@@ -314,12 +315,13 @@ def make_client(settings: Settings | None = None) -> LibreNMSClient:
 
 
 def reset_state() -> None:
-    """Test seam: forget the last retention sweeps, so the next call that sweeps runs one, and what approval
-    prompts showed."""
+    """Test seam: forget the last retention sweeps, so the next call that sweeps runs one, what approval prompts
+    showed, and the digest runs seen."""
     with _prune_lock:
         _last_prune_at.clear()
     with _pending_lock:
         _pending.clear()
+    digest.reset()
 
 
 def check_requirements() -> bool:
@@ -1183,6 +1185,19 @@ def librenms_plan(args: Dict[str, Any], **kwargs: Any) -> str:
     actor = _actor_from(kwargs)
     description = str(args.get("description") or "")
     operations = args.get("operations")
+    refusal = digest.refusal("plan")
+    if refusal:
+        audit.emit(
+            "plan_rejected",
+            plan_id=None,
+            actor=actor,
+            librenms_url=client.base_url,
+            description=clip(description, DESCRIPTION_CHARS),
+            operations=len(operations) if isinstance(operations, list) else None,
+            errors=1,
+            first_error=refusal,
+        )
+        return _fail(refusal, refused=True)
     try:
         plan = build_plan(client, operations, description, settings, client.base_url, actor=actor)
     except PlanError as exc:
@@ -1251,11 +1266,22 @@ def librenms_apply(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
     plan_id, plan, reason = find_plan(store, args.get("plan_id"), exact=True)
+    dry_run = parse_bool(args.get("dry_run"), False)
+    refusal = digest.refusal("apply")
+    if refusal:
+        audit.emit(
+            "apply_refused",
+            plan_id=plan_id,
+            actor=actor,
+            librenms_url=(plan or {}).get("librenms_url"),
+            reason=refusal,
+            dry_run=dry_run,
+        )
+        return _fail(refusal, refused=True)
     if plan_id is None or plan is None:
         audit.emit("apply_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
         return _fail(reason)
     settings = get_settings()
-    dry_run = parse_bool(args.get("dry_run"), False)
     refusal = write_gate(actor, "apply", plan["id"], dry_run=dry_run, settings=settings)
     if refusal:
         audit.emit(
@@ -1340,11 +1366,22 @@ def librenms_rollback(args: Dict[str, Any], **kwargs: Any) -> str:
     store = get_store()
     actor = _actor_from(kwargs)
     plan_id, plan, reason = find_plan(store, args.get("plan_id"), exact=True)
+    force = parse_bool(args.get("force"), False)
+    refusal = digest.refusal("rollback")
+    if refusal:
+        audit.emit(
+            "rollback_refused",
+            plan_id=plan_id,
+            actor=actor,
+            librenms_url=(plan or {}).get("librenms_url"),
+            reason=refusal,
+            force=force,
+        )
+        return _fail(refusal, refused=True)
     if plan_id is None or plan is None:
         audit.emit("rollback_refused", plan_id=None, actor=actor, librenms_url=None, reason=reason)
         return _fail(reason)
     settings = get_settings()
-    force = parse_bool(args.get("force"), False)
     refusal = write_gate(actor, "rollback", plan["id"], settings=settings)
     if refusal:
         audit.emit(
@@ -1473,7 +1510,8 @@ HANDLERS = {
 def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dict[str, Any] | None:
     """Hermes ``pre_tool_call``: fires for every tool call, so anything but our two write tools and the agent's shell
     tools returns at once, without reading settings or plans. A callback that raises would block the call it was
-    asked about, so neither branch raises; when in doubt they block. An approval asked for is audited as
+    asked about, so neither branch raises; when in doubt they block. In a run of the scheduled digest an apply or a
+    rollback is blocked before anything is asked (:func:`_digest_block`). An approval asked for is audited as
     ``approval_requested``: Hermes may refuse it (cron, unattended platforms) without a ``post_approval_response``,
     and the attempt must still show in the trail. A block is audited as the refusal it is. For every apply and
     rollback it also keeps what the prompt shows, or that none is shown, for :func:`bind_approval` to hand the
@@ -1482,6 +1520,9 @@ def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dic
         return None
     if tool_name not in WRITE_TOOLS:
         return _terminal_guard(tool_name, args, kwargs)
+    blocked = _digest_block(tool_name, args, kwargs)
+    if blocked is not None:
+        return blocked
     directive, shown = _approval(tool_name, args)
     _note_shown(tool_name, args, kwargs, shown)
     if directive is None:
@@ -1500,6 +1541,26 @@ def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dic
         event = "apply_refused" if tool_name == "librenms_apply" else "rollback_refused"
         _audit_hook(event, kwargs, None, None, reason=directive["message"], tool=tool_name)
     return directive
+
+
+def _digest_block(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Block an apply or a rollback in a run of the scheduled digest, which is read-only (:func:`digest.refusal`),
+    audited as ``apply_refused`` / ``rollback_refused`` with the plan it named. ``None`` anywhere else, and when the
+    run cannot be told (then the approval prompt and the handler's own check stand)."""
+    action = "apply" if tool == "librenms_apply" else "rollback"
+    try:
+        refusal = digest.refusal(action)
+        if refusal is None:
+            return None
+        plan_id = None
+        with contextlib.suppress(Exception):  # the block and its audit never depend on the plan store
+            ref = args.get("plan_id") if isinstance(args, dict) else None
+            plan_id = find_plan(get_store(), ref, exact=True)[0]
+        _audit_hook(f"{action}_refused", hook_kwargs, plan_id, None, reason=refusal, tool=tool)
+        return {"action": "block", "message": refusal}
+    except Exception as exc:
+        logger.warning("librenms digest hook: not checked (%s)", type(exc).__name__)
+        return None
 
 
 def bind_approval(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dict[str, Any] | None:
@@ -1733,29 +1794,31 @@ def _terminal_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[s
 def _cli_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
     """Block ``hermes librenms apply|rollback`` in the agent's terminal, its code or a background shell's stdin unless
     the operator lets the model write without approval anyway: run there, it would skip the approval prompt and act
-    as an operator. The model is told what it may do instead under this write_mode, and the attempt is audited as
+    as an operator. In a run of the scheduled digest it is blocked whatever the settings, with the digest's refusal.
+    The model is told what it may do instead under this write_mode, and the attempt is audited as
     ``apply_refused`` / ``rollback_refused`` naming the tool and the plan, never the command text."""
     message = TERMINAL_BLOCK
     try:
         found = _cli_write(_shell_text(tool, args))
         if found is None:
             return None
-        settings = get_settings()
-        if settings.write_mode == "full" and not settings.require_approval:
-            return None
         action, ref = found.group("action").lower(), found.group("plan")
+        held = digest.refusal(action)
+        settings = get_settings()
+        if held is None and settings.write_mode == "full" and not settings.require_approval:
+            return None
         plan_id, plan = None, None
         with contextlib.suppress(Exception):  # the block and its audit never depend on the plan store
             plan_id, plan, _reason = find_plan(get_store(), ref) if ref else (None, None, "")
         named = plan_id or ref
-        message = write_gate({"kind": "model"}, action, named or "<plan_id>", settings=settings)
+        message = held or write_gate({"kind": "model"}, action, named or "<plan_id>", settings=settings)
         message = message or TERMINAL_BLOCK_FULL.format(action=action)
         _audit_hook(
             f"{action}_refused",
             hook_kwargs,
             named,
             (plan or {}).get("librenms_url"),
-            reason=TERMINAL_REASON,
+            reason=held or TERMINAL_REASON,
             tool=tool,
             write_mode=settings.write_mode,
         )
@@ -2106,11 +2169,13 @@ def _command_line(command: str, room: int) -> str:
 
 def pre_llm_call(**kwargs: Any) -> None:
     """Hermes ``pre_llm_call``: remember the user's message for this session so the audit trail can say what the
-    model was asked when it plans or applies. Injects nothing."""
+    model was asked when it plans or applies, and note a cron run of the scheduled digest by its prompt
+    (:func:`digest.note_request`), so the write tools refuse in it. Injects nothing."""
     with contextlib.suppress(Exception):
         audit.remember_request(
             kwargs.get("session_id"), kwargs.get("task_id"), kwargs.get("user_message"), kwargs.get("sender_id")
         )
+    digest.note_request(kwargs.get("user_message"))
     return None
 
 

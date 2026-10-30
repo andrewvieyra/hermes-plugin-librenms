@@ -1,9 +1,9 @@
 name: librenms
-version: 0.13.1
+version: 0.14.0
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"
-description: "LibreNMS change management for Hermes: query devices, ports, alerts and logs, answer questions about the network over a conversation, build a plan with a field-level diff, apply it with a journal, and roll back. Nothing is written without a reviewed plan."
+description: "LibreNMS change management for Hermes: query devices, ports, alerts and logs, answer questions about the network over a conversation, schedule a read-only digest of what needs attention, build a plan with a field-level diff, apply it with a journal, and roll back. Nothing is written without a reviewed plan."
 author: Andrew Vieyra
 license: MIT
 homepage: https://github.com/andrewvieyra/hermes-plugin-librenms

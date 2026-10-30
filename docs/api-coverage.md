@@ -76,6 +76,10 @@ comma was an HTTP 500) and must hold column names only.
 | `bills` | #108 once (`period=previous` for `filter.period` `previous`) |
 | `help` | none: answered by the plugin |
 
+The scheduled digest (`librenms:network-digest`, see the README) reads nothing of its own: each run makes six
+`librenms_report` calls (`devices`, `alerts`, `ports` twice, `health`, `routing`), so these routes and no others,
+at most 30 requests each.
+
 ## System
 
 | # | Route | Coverage |

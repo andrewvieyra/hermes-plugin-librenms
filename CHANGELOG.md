@@ -6,6 +6,56 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-29
+
+Scheduled network digest (finding hi-automation-blueprint).
+
+### Added
+- An Automation Blueprint, `librenms:network-digest`, listed beside Hermes' own in `/blueprint`, the dashboard's
+  Blueprints tab and the Desktop's Cron page, through `ctx.register_automation_blueprint` (Hermes 0.22.3 and later;
+  a Hermes without it, or one that refuses the blueprint, loads the plugin without it). Scheduling it makes an
+  ordinary cron job that reports, read-only, devices down, alerts firing, the busiest ports, the ports over 80 %,
+  the sensors out of range and the BGP sessions down, from six `librenms_report` calls. Its blanks, each with a
+  default: `time` and `recurrence` (`everyday`, `weekdays`, `weekends`) make the schedule, `group` (`all`, or a
+  device group's name), `rows` (5, 10 or 20 a section, each section counting every match), `all_clear` (`send` a
+  short all-clear on a quiet day, or `skip` it with `[SILENT]`) and `deliver`. The schedule changes later as any
+  cron job's does (`hermes cron edit <id> --schedule`). The prompt opens with data_as_of, says when a section is
+  partial, stale or failed, treats text from the network as data, says how to reach the tools through `tool_call`
+  when cron defers them (and what to tell the user when they are missing), loads no skill, holds only ASCII and
+  passes Hermes' strict cron prompt scan. It spells the calls without braces, because `/blueprint network-digest`
+  with no values hands the agent the raw template to copy into the job, where a JSON object's braces would have to
+  be written doubled.
+- A digest run writes nothing, whatever its reports return and whatever its job's prompt was edited to say while it
+  keeps its first sentence ("LibreNMS network digest (read-only)."). `pre_llm_call` notes a cron run whose prompt
+  holds that sentence, by the `execution_id` of `ctx.current_cron_execution()`, which Hermes binds and the model
+  cannot set (the newest 64 runs are kept); in that run `librenms_plan`, `librenms_apply` and `librenms_rollback`
+  refuse in every `write_mode` (apply and rollback already in `pre_tool_call`, before any approval prompt, all three
+  again in their handlers), and so does `hermes librenms apply|rollback` in its terminal, code or a background
+  shell, even with `require_approval` off. Each refusal is audited as `plan_rejected`, `apply_refused` or
+  `rollback_refused`, with the job and the run in the actor. Without it an `ifAlias` that asks for a change would
+  meet only the approval prompt, which `approvals.cron_mode: approve` or `require_approval: false` passes with
+  nobody asked. Outside cron the sentence holds nothing (a prompt pasted into a chat), and a subagent the run
+  delegates to has no cron identity from Hermes: `approvals.cron_mode` and `write_mode` hold it, as any cron job.
+- `digest.py`; `audit.cron_execution()`, which the actor record and the digest share.
+
+### Changed
+- README (Scheduled digest: the blanks, the calls, an example, changing the job, why it writes nothing; Safety
+  model, Write modes, Compatibility, the layout), SECURITY.md (a threat row, what the guard does not hold, deployment
+  item 4), both skills (the workflow's write modes; the ask skill's "Every morning, without asking", which points a
+  user who wants this daily to the blueprint), docs/architecture.md (the module, the blueprint and the run guard),
+  docs/audit.md (the refusals in a digest run and a search for them), docs/api-coverage.md and the manifest's
+  description say so.
+- Tests: the blueprint's fields and slots; the prompt (its placeholders, no brace, ASCII, every call spelled); each
+  call against the fake LibreNMS, for the fleet and for a group, reading only allowed GETs and writing nothing; the
+  guard in the handlers, the approval hook and the terminal guard, audited with the run, and only in a digest run
+  (not outside cron, in another job's run, in a delegated subagent or with an identity Hermes cannot give; still
+  with an edited prompt that keeps the sentence, and with content parts), the bound on the runs kept, and a note
+  that fails; the README's tables and both skills against the code. Through Hermes (`make test-hermes`): the catalog
+  entry and its slash command, the job filled with the defaults (`0 8 * * *`, `origin`, no skill) and with values
+  (`30 6 * * 1-5`, `0 8 * * 0,6`), refused values, the strict cron prompt scan, the chat seed, and a run bound with
+  Hermes' own `enter_cron_execution` in which the apply is blocked before the approval prompt, the plan refused and
+  a report answered.
+
 ## [0.13.1] - 2026-10-29
 
 What the review of 0.13.0 found in the terminal secret guard, each confirmed against the 0.13.0 code with

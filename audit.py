@@ -308,6 +308,13 @@ def clear_requests() -> None:
 # -- actor ----------------------------------------------------------------------------------------
 
 
+def cron_execution() -> Any:
+    """The cron run the current code executes inside (Hermes' ``CronExecution``: ``job_id``, ``execution_id``, ...),
+    else ``None``: outside cron, in a subagent the run delegated to, without a context, or on a Hermes that cannot
+    say."""
+    return _from_ctx("current_cron_execution")
+
+
 def capture_actor(kwargs: Dict[str, Any] | None = None, *, via: str = VIA_MODEL) -> Dict[str, Any]:
     """Who is acting and through which path. ``kwargs`` are what Hermes passed: a tool handler's ``task_id`` and
     ``session_id``, or a slash command's ``session_id``, ``source`` and ``platform``. ``via`` is ``tool`` (the model
@@ -332,7 +339,7 @@ def capture_actor(kwargs: Dict[str, Any] | None = None, *, via: str = VIA_MODEL)
     if kwargs.get("session_id"):
         actor["session_id"] = str(kwargs["session_id"])
     actor["task_id"] = str(kwargs["task_id"]) if kwargs.get("task_id") else None
-    cron = _from_ctx("current_cron_execution")
+    cron = cron_execution()
     actor["cron"] = cron is not None or _truthy(_session_env("HERMES_CRON_SESSION"))
     actor["cron_job_id"] = _named(getattr(cron, "job_id", None))
     actor["cron_execution_id"] = _named(getattr(cron, "execution_id", None))

@@ -42,6 +42,7 @@ v0 route to what the plugin does with it.
 | `schemas` | Tool schemas | none |
 | `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks (the shell tools' guards against the CLI's writes and the plugin's secrets among them), the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
 | `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
+| `digest` | The scheduled digest: its Automation Blueprint (slots, schedule, the prompt and the six report calls it makes) and the run guard the handlers and hooks ask (`refusal`) | `audit` (the cron run) |
 | `__init__` | `register(ctx)` | all |
 
 Dependencies point downward only. The engine (`client`, `redact`, `routes`, `listing`, `reports`, `diff`,
@@ -744,7 +745,31 @@ for the re-read to settle, not a second request.
 - Hooks (`pre_tool_call`, `pre_llm_call`, `post_approval_response`) are registered unconditionally
   and declared in `provides_hooks`; `pre_tool_call` takes two callbacks, the approval prompt and then
   `bind_approval` ([The approval hook](#the-approval-hook)). `pre_llm_call` remembers the user's
-  message per session for the actor record ([audit.md](audit.md)).
+  message per session for the actor record ([audit.md](audit.md)), and notes a run of the scheduled
+  digest (below).
+- The scheduled digest is an Automation Blueprint, `ctx.register_automation_blueprint("network-digest",
+  ...)`, which Hermes namespaces as `librenms:network-digest` and lists in `/blueprint`, the dashboard's
+  Blueprints tab and the Desktop's Cron page (`cron/blueprint_catalog.py`, `cron/blueprint_plugins.py`).
+  It needs no manifest field or capability; a Hermes without the registrar, or one that refuses the
+  blueprint (it logs why), loads the plugin without it. Its slots are `time` and `recurrence` (the
+  schedule `{minute} {hour} * * {dow}`), `group`, `rows`, `all_clear` and `deliver`, each with a
+  default, so Hermes fills it once at load and a broken template fails there. Filling it makes an
+  ordinary cron job (prompt, schedule, name, delivery; no skill), which Hermes owns from then on.
+  The prompt spells the six `librenms_report` calls without braces, because `/blueprint` with no
+  values hands the agent the raw template to copy into the job, where JSON's braces would have to be
+  written doubled; it says how to reach the tools through `tool_call` (cron defers plugin tools like
+  any session), passes Hermes' strict cron prompt scan, and stands without the `librenms:ask` skill.
+  A run is held read-only by the plugin, not by the prompt: `pre_llm_call` hands `digest.note_request`
+  the message the turn starts with, and when it holds the prompt's first sentence ("LibreNMS network
+  digest (read-only).") and `ctx.current_cron_execution()` names a run, that run's `execution_id` is
+  kept (the newest 64). `librenms_plan`, `librenms_apply` and `librenms_rollback` then refuse in it
+  (`digest.refusal`), apply and rollback already in `pre_tool_call`, before the approval prompt, and
+  all three in their handlers, audited as `plan_rejected`, `apply_refused` and `rollback_refused`; the
+  terminal guard blocks `hermes librenms apply|rollback` in that run whatever the settings.
+  The model cannot set the run's identity; outside cron the sentence holds nothing, and a subagent
+  the run delegates to gets no cron identity from Hermes, so `approvals.cron_mode` and `write_mode`
+  hold it as they hold any cron job. A failure to read the run's identity holds nothing back: the
+  approval prompt and `write_mode` stand as they would for any cron job.
 - `after-install.md` at the repository root is what `hermes plugins install` prints, as Markdown in a
   panel, after it has asked for `LIBRENMS_URL` and `LIBRENMS_TOKEN` and whether to enable the plugin
   (`hermes_cli/plugins_cmd_install.py`, `_display_after_install`), in place of its generic

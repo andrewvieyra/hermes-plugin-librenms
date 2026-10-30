@@ -1,7 +1,7 @@
 ---
 name: librenms-ask
 description: Answer questions about the network as LibreNMS sees it, over several turns, with the read-only librenms_report and librenms_query tools. Load when the user asks what is down, alerting or flapping, how busy a port or link is, link speeds and duplex, port descriptions and device names, LLDP/CDP neighbours, where a MAC or IP address is, VLANs, sensors and optics, BGP or OSPF sessions, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.13.1
+version: 0.14.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, network, questions]
@@ -342,6 +342,15 @@ On ports, name the columns in `params.columns` (LibreNMS sends only `ifName` wit
 | `ifLastChange` | the device's sysUpTime at the last change, in hundredths of a second: the time since is the device's `uptime` (seconds) minus `ifLastChange` / 100 |
 | `poll_time`, outages' `going_down` | unix seconds |
 | `uptime`, `bgpPeerFsmEstablishedTime`, availability `duration` | seconds |
+
+## Every morning, without asking
+
+When the user wants this on a schedule ("tell me every morning what is down"), the plugin's Automation
+Blueprint does it: `/blueprint network-digest` (the user's command, which asks them for the time, the
+days, the devices, the rows per section and where to send it) sets up a Hermes cron job that reports
+devices down, alerts firing, the busiest ports and those over 80 %, sensors out of range and BGP sessions
+down, read-only. Suggest it rather than writing a cron prompt of your own. In a run of that job,
+`librenms_plan`, `librenms_apply` and `librenms_rollback` refuse: report what needs changing instead.
 
 ## Untrusted content
 

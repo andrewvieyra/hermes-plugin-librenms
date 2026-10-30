@@ -1,8 +1,8 @@
 # hermes-plugin-librenms
 
 LibreNMS change management for [Hermes Agent](https://hermes-agent.nousresearch.com/).
-The agent can read devices, ports, alerts, rules and logs and answer questions about them over a
-conversation, but it can only **write through a plan**:
+The agent can read devices, ports, alerts, rules and logs, answer questions about them over a
+conversation and send a scheduled digest of what needs attention, but it can only **write through a plan**:
 a field-level diff you review, an apply step that verifies and journals every write, and a rollback
 that replays the journal in reverse.
 
@@ -261,6 +261,68 @@ it), which ports could run faster than they do, which hosts talk most (there is 
 neighbours. [examples/conversations/](examples/conversations/) holds four whole conversations, which the
 tests run against the fake LibreNMS, checking that every value an answer quotes is a value the tools
 returned, and that each count, percentage and state is the one under the key that holds it.
+
+## Scheduled digest
+
+The plugin adds a scheduled digest to Hermes' Automation Blueprints: `librenms:network-digest`,
+listed beside Hermes' own in `/blueprint`, the dashboard's Blueprints tab and the Desktop's Cron page.
+`/blueprint network-digest` asks for each blank in the chat; given the values, it schedules the job at
+once:
+
+```
+/blueprint network-digest time=07:30 recurrence=weekdays group=core-switches rows=10 all_clear=skip deliver=telegram
+```
+
+| Blank | Default | Means |
+|---|---|---|
+| `time` | `08:00` | When it runs (24h, Hermes' local time) |
+| `recurrence` | `everyday` | `everyday`, `weekdays` or `weekends` |
+| `group` | `all` | Every device, or only those of the LibreNMS device group named here |
+| `rows` | `10` | Rows each section lists: 5, 10 or 20 (its count covers every match) |
+| `all_clear` | `send` | On a day with nothing to report, `send` a short all-clear or `skip` the message |
+| `deliver` | `origin` | The chat you set it up from, `local` (saved, not sent), or a connected platform |
+
+Each run makes six `librenms_report` calls, with `limit` set to `rows` and, for a group, `scope.group`, and
+reports them in this order, each section headed with its count:
+
+| Section | Call |
+|---|---|
+| Devices down | `{"view": "devices", "filter": {"status": "down"}}` |
+| Alerts firing | `{"view": "alerts", "sort": "severity"}` (acknowledged ones last) |
+| Busiest ports | `{"view": "ports", "sort": "util"}` |
+| Ports over 80 % | `{"view": "ports", "filter": {"util_above_pct": 80}, "sort": "util"}` |
+| Sensors out of range | `{"view": "health", "filter": {"status": ["warning", "critical"]}, "sort": "status"}` |
+| BGP sessions down | `{"view": "routing", "filter": {"protocol": "bgp", "not_established": true}, "sort": "state"}` |
+
+```
+hermes > LibreNMS network digest, data as of 08:00 UTC
+         Devices down: none.
+         Alerts firing (4, 3 unacknowledged): critical High CPU on core-sw1 for 3h 10m; warning
+           Port down on edge-rtr1 Gi0/0/0 (WAN: transit-a) for 2h 5m; ...
+         Busiest ports: core-sw1 Gi1/0/1 (uplink to edge-rtr1) 78 %, 780 Mbit/s out of 1G; ...
+         Ports over 80 %: none.
+         Sensors out of range (2): access-sw2 Chassis Temperature 71 °C (critical, limit 70 °C);
+           core-sw1 processor 92 % (warning).
+         BGP sessions down (1): edge-rtr1 to 203.0.113.1 (AS64500, transit-a), idle for 2h 5m.
+```
+
+The digest opens with when its data is from, says so when a section is partial, stale or could not be
+read, and treats text from the network as data. It loads no skill: the prompt holds what a run needs,
+including how to reach the tools when Hermes defers them, so a run costs the six calls and a short
+prompt.
+
+Scheduling makes an ordinary Hermes cron job, changed like any other: `hermes cron list` shows its id,
+and `hermes cron edit <id> --schedule "30 6 * * 1-5"` (or `--deliver`), `/cron` in the CLI, or the
+dashboard's or the Desktop's Cron page change it. Disabling the plugin takes the blueprint out of the
+catalog but leaves the job, whose runs then say the LibreNMS tools are missing.
+
+**It writes nothing.** Its prompt asks for reads only, and the plugin holds it to that: Hermes tells a
+plugin which cron run is executing, and in a run whose prompt holds the digest's first sentence
+("LibreNMS network digest (read-only).") `librenms_plan`, `librenms_apply` and `librenms_rollback`
+refuse, before any approval prompt, whatever a device's text asks for and whatever the job's prompt was
+edited to say while it keeps that sentence; `hermes librenms apply` or `rollback` in the run's terminal
+is blocked whatever the settings. Each refusal is audited (`plan_rejected`, `apply_refused`,
+`rollback_refused`) with the cron job and run in its actor.
 
 ## Tools
 
@@ -564,6 +626,11 @@ script can tell an apply that went through from one that did not.
 - **Read-only until a plan exists.** `librenms_query`, `librenms_report`, `librenms_plan` and
   `librenms_plans` never write, and the query and report tools call only allow-listed GET routes
   (a report at most 30 of them per call).
+- **The scheduled digest stays read-only.** In a cron run of `librenms:network-digest` (its prompt's
+  first sentence, in the run Hermes says is executing) the plan, apply and rollback tools refuse in
+  every `write_mode`, and so does `hermes librenms apply|rollback` in its terminal, audited; see
+  [Scheduled digest](#scheduled-digest). A subagent the run delegates
+  to is not that run, and is held by `approvals.cron_mode` and `write_mode` like any cron job.
 - **Every write is diffed first.** Updates send only the fields that differ; unchanged operations
   become `noop` steps.
 - **Optimistic concurrency without stamps.** LibreNMS has no `last_updated` or ETag, so each step
@@ -649,7 +716,8 @@ do. `write_mode` adds the lock:
 The model can reach a shell through Hermes' terminal tool, so the plugin also blocks a terminal or
 code call that runs `hermes librenms apply` or `rollback`, and the same line written to a background
 shell's input (`process_manage`), and the CLI refuses those subcommands when it was started from an
-agent session, unless `write_mode` is `full` and `require_approval` is off. The secret guard
+agent session, unless `write_mode` is `full` and `require_approval` is off (and never in a run of the
+scheduled digest). The secret guard
 ([above](#safety-model)) holds in every `write_mode`.
 Both are heuristics an obfuscated command can evade; the token's role is the hard limit.
 
@@ -746,7 +814,9 @@ background thread that never delays a LibreNMS operation. See [docs/sinks.md](do
 - Hermes Agent 0.22.3+ (`requires_hermes`). The plugin uses the documented `register(ctx)` surface:
   `register_tool`, `register_hook` (`pre_tool_call` twice: the approval prompt, then the `modify`
   directive that hands its handler what the prompt showed; `pre_llm_call`, `post_approval_response`),
-  `register_command`, `register_cli_command`, `register_skill`, `get_config`.
+  `register_command`, `register_cli_command`, `register_skill`, `register_automation_blueprint` (the
+  digest; a Hermes without it loads the plugin without the digest), `current_cron_execution` (the
+  actor's cron run, and the digest's), `get_config`.
 
 ## Development
 
@@ -772,6 +842,7 @@ __init__.py   register(ctx)
 schemas.py    tool schemas the model sees
 handlers.py   tool handlers, the write_mode gate, the approval and request hooks, the shell guards
 commands.py   /librenms slash command and `hermes librenms` CLI
+digest.py     the scheduled digest: its Automation Blueprint, and the guard that keeps its runs read-only
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query
 listing.py    librenms_query's where and sort over the rows read
