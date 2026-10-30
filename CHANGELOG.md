@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-10-30
+
+### Fixed
+- CI's `hermes-loader` job installs hermes-agent the way Hermes installs itself, with `uv sync --frozen` from its
+  `uv.lock`, and runs the loader test and `hermes plugins validate` from that environment. On Python 3.14 a plain
+  `pip install -e` could not resolve hermes-agent's dependencies: its `[tool.uv]` override puts Pillow 13 over
+  browser-harness's exact Pillow 12 pin, and pip does not read uv's overrides.
+
 ## [0.14.5] - 2026-10-30
 
 The first CI run on GitHub failed two jobs; neither failure was in the plugin's code.
