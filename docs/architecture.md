@@ -40,9 +40,9 @@ v0 route to what the plugin does with it.
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
 | `settings` | Operator settings with fail-closed coercion (a time zone the host's zone database does not hold is refused) | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |
+| `digest` | The scheduled digest: its Automation Blueprint (slots, schedule, the prompt and the six report calls it makes) and the run guard the handlers and hooks ask (`refusal` for the write tools, `delegation_refusal` for the tools that start another agent) | `audit` (the cron run) |
 | `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks (the shell tools' guards against the CLI's writes and the plugin's secrets among them), the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
 | `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
-| `digest` | The scheduled digest: its Automation Blueprint (slots, schedule, the prompt and the six report calls it makes) and the run guard the handlers and hooks ask (`refusal`) | `audit` (the cron run) |
 | `__init__` | `register(ctx)` | all |
 
 Dependencies point downward only. The engine (`client`, `redact`, `routes`, `listing`, `reports`, `diff`,
@@ -766,10 +766,16 @@ for the re-read to settle, not a second request.
   (`digest.refusal`), apply and rollback already in `pre_tool_call`, before the approval prompt, and
   all three in their handlers, audited as `plan_rejected`, `apply_refused` and `rollback_refused`; the
   terminal guard blocks `hermes librenms apply|rollback` in that run whatever the settings.
-  The model cannot set the run's identity; outside cron the sentence holds nothing, and a subagent
-  the run delegates to gets no cron identity from Hermes, so `approvals.cron_mode` and `write_mode`
-  hold it as they hold any cron job. A failure to read the run's identity holds nothing back: the
-  approval prompt and `write_mode` stand as they would for any cron job.
+  The model cannot set the run's identity; outside cron the sentence holds nothing. Hermes gives a
+  delegated child no cron identity (`cron/execution_identity.py`: `current_cron_execution()` is
+  `None` while `is_delegated_child_context()`), and a cron job the run creates or starts fires as
+  another run, so neither would be held: `pre_tool_call` therefore blocks `delegate_task` and
+  `cronjob_manage` in a digest run (`digest.delegation_refusal`), audited as `delegation_refused` with
+  the tool, never the goal or prompt. The agent loop fires `pre_tool_call` for them as for any tool,
+  with a legacy name (`cronjob`) already mapped and a `tool_call` bridge call already unwrapped; a
+  check that fails blocks the delegation, since no handler of the plugin stands behind it. A failure
+  to read the run's identity holds nothing back: the approval prompt and `write_mode` stand as they
+  would for any cron job.
 - `after-install.md` at the repository root is what `hermes plugins install` prints, as Markdown in a
   panel, after it has asked for `LIBRENMS_URL` and `LIBRENMS_TOKEN` and whether to enable the plugin
   (`hermes_cli/plugins_cmd_install.py`, `_display_after_install`), in place of its generic

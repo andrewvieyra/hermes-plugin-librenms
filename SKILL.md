@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Plan, review, apply and roll back LibreNMS changes with the librenms_* tools: devices, locations, device groups, services, alert rules, port descriptions, alert acknowledgements and maintenance windows, each written only through a plan the user has seen and said yes to. Load when the user wants to change something in LibreNMS; for questions that change nothing, load librenms:ask.
-version: 0.14.0
+version: 0.14.1
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -118,8 +118,10 @@ The operator sets `write_mode` and `require_approval` in `config.yaml`. Read the
   change; say so and stop.
 
 In a run of the scheduled digest (the cron job `/blueprint network-digest` sets up), `librenms_plan`,
-`librenms_apply` and `librenms_rollback` refuse in every mode: the digest is read-only. Report what needs
-changing in the digest for a person to act on; do not retry, and do not reach LibreNMS another way.
+`librenms_apply` and `librenms_rollback` refuse in every mode: the digest is read-only. So do
+`delegate_task` and `cronjob_manage`: the change is not handed to a subagent or another cron job either.
+Report what needs changing in the digest for a person to act on; do not retry, and do not reach LibreNMS
+another way.
 
 Never run `hermes librenms apply` or `rollback` through a terminal or code tool, or send it to a background
 shell with `process_manage`. It is blocked, audited, and it would bypass the review the user is owed.

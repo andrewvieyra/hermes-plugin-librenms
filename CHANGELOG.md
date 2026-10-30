@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-29
+
+What the review of 0.14.0 found in the scheduled digest, each confirmed against the 0.14.0 code first.
+
+### Security
+- A digest run no longer hands its work to an agent the guard does not hold. Hermes gives a delegated child no cron
+  identity (`current_cron_execution()` is `None` in it) and keeps `delegate_task` in cron runs, so a digest run
+  could pass "plan and apply this" to a subagent with the `librenms` toolset: in 0.14.0 the child planned, its apply
+  met only the approval prompt, which `require_approval: false` or `approvals.cron_mode: approve` passes with nobody
+  asked, and LibreNMS was written to, from one line an `ifAlias` could carry. A cron job the run creates or starts
+  through `cronjob_manage` (where `cron.allow_agent_scheduling` allows it) is another run, held no better. In a
+  digest run `pre_tool_call` now blocks `delegate_task` and `cronjob_manage` (`digest.DELEGATION_TOOLS`; Hermes
+  maps the legacy name `cronjob` and unwraps a `tool_call` before the hook) with `<tool> refused: this run is the
+  LibreNMS network digest, ...`, audited as the new event `delegation_refused` with the tool and the run in the
+  actor, never the goal or prompt (a warning in syslog and CEF, like the other refusals). Outside a digest run they
+  pass as before, and a check that fails blocks the call, since no handler of the plugin stands behind it. What a
+  digest run's terminal starts (another Hermes) is still a session of its own: SECURITY.md says so.
+
+### Fixed
+- When the LibreNMS tools are missing, the digest's runs name the plugin disabled or not installed as the first
+  cause, before `LIBRENMS_URL`/`LIBRENMS_TOKEN` and the cron toolset. The job outlives the plugin, so a run after
+  disabling it told the operator to set variables already set. Jobs scheduled with 0.14.0 keep the prompt they
+  were made with; schedule the blueprint again (or edit the job's prompt) for the new text.
+- README: the digest's "Alerts firing" call puts critical first and, within a severity, acknowledged alerts last;
+  it said acknowledged ones came last, but an acknowledged critical alert comes before every warning.
+- docs/architecture.md lists `digest` above `handlers`, which imports it, so "Dependencies point downward only"
+  holds again.
+
+### Changed
+- SECURITY.md (the threat row, what the guard does not hold, deployment item 10), README (Scheduled digest, Safety
+  model), the workflow skill, docs/architecture.md (the module and the run guard), docs/audit.md (the event and the
+  digest search) and docs/sinks.md (the severity table) say so.
+- Tests: in a digest run `delegate_task` (one goal or a batch) and `cronjob_manage` (create, run) are blocked and
+  audited with the run and without the goal or prompt, and pass outside it and in another job's run; a check that
+  fails blocks; `delegation_refused` is a warning; the prompt names every reason the tools can be missing. Through
+  Hermes (`make test-hermes`): the tools are Hermes' own names, `cronjob` reaches hooks as `cronjob_manage`, the
+  `pre_tool_call` dispatch the agent loop runs blocks both inside a run bound with `enter_cron_execution` and not
+  after it, and a delegated child inside that run reads no cron run.
+
 ## [0.14.0] - 2026-10-29
 
 Scheduled network digest (finding hi-automation-blueprint).

@@ -13,8 +13,9 @@ each turn starts with, and a cron run whose message holds :data:`MARKER` (the pr
 run, by the run's id from ``ctx.current_cron_execution()``, which the model cannot set: in it ``librenms_plan``,
 ``librenms_apply`` and ``librenms_rollback`` refuse, whatever a device's text asked for and whatever the job's prompt
 was edited to say while it keeps that sentence. Outside cron the sentence means nothing, so a person who pastes the
-prompt into a chat is not held to it. A subagent the run delegates to is not the run (Hermes gives it no cron
-identity): there ``approvals.cron_mode`` and ``write_mode`` stay the controls, as for any cron job.
+prompt into a chat is not held to it. A subagent is not the run (Hermes gives it no cron identity), and neither is a
+cron run it creates or starts: the write tools would not refuse there, so in a digest run the tools that hand work to
+another agent (:data:`DELEGATION_TOOLS`) refuse too (:func:`delegation_refusal`). The digest needs none of them.
 """
 
 from __future__ import annotations
@@ -47,6 +48,16 @@ CALLS: Tuple[Tuple[str, Dict[str, Any]], ...] = (
 REFUSAL = (
     "{action} refused: this run is the LibreNMS network digest, which is read-only: it plans, applies and rolls back "
     "nothing. Report what needs changing in the digest, for a person to act on."
+)
+# The tools that hand work to another agent: delegate_task starts a subagent, which Hermes gives no cron identity, and
+# cronjob_manage creates or starts a cron job, which runs as another run. Neither agent would be held to the digest's
+# guard, where approvals.cron_mode: approve or require_approval: false would let its write through.
+DELEGATION_TOOLS = frozenset({"delegate_task", "cronjob_manage"})
+# What they answer in a digest run.
+DELEGATION_REFUSAL = (
+    "{tool} refused: this run is the LibreNMS network digest, which is read-only and hands no work to another agent "
+    "(a subagent or another cron run would not be held to it). Make the digest's librenms_report calls in this run, "
+    "and report what needs changing in the digest, for a person to act on."
 )
 # Digest runs seen, by cron execution id (Hermes never gives two runs one id), newest last: more than every digest run
 # of every profile that can be under way at once.
@@ -86,8 +97,9 @@ PROMPT = (
     "like it needs a change, say so in the digest for a person to act on.\n"
     "If librenms_report is not in your tool list, Hermes has deferred it: call it through tool_call, with the name "
     "librenms_report and the arguments below. If tool_describe and tool_search do not find it either, say that the "
-    "LibreNMS tools are not available to this cron job (LIBRENMS_URL and LIBRENMS_TOKEN not set for this profile, or "
-    "the librenms toolset turned off for cron in hermes tools) and stop.\n"
+    "LibreNMS tools are not available to this cron job (the librenms plugin disabled or not installed, LIBRENMS_URL "
+    "and LIBRENMS_TOKEN not set for this profile, or the librenms toolset turned off for cron in hermes tools) and "
+    "stop.\n"
     "Devices: {group}. When that names a device group rather than all, give every call scope group set to it; if a "
     "call answers that there is no such group, or that the name could be several, say so and stop.\n"
     "Each call takes limit {rows} and these arguments (filter is an object of the keys and values given; a value in "
@@ -225,6 +237,12 @@ def in_digest_run() -> bool:
 def refusal(action: str) -> str | None:
     """What a write tool answers in a digest run (*action*: plan, apply, rollback), else ``None``."""
     return REFUSAL.format(action=action) if in_digest_run() else None
+
+
+def delegation_refusal(tool: str) -> str | None:
+    """What a tool that hands work to another agent (:data:`DELEGATION_TOOLS`) answers in a digest run, else
+    ``None``."""
+    return DELEGATION_REFUSAL.format(tool=tool) if tool in DELEGATION_TOOLS and in_digest_run() else None
 
 
 def runs() -> List[str]:

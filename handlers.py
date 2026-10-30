@@ -11,8 +11,8 @@ plan they would run (``pre_tool_call``, audited as ``approval_requested``; a pla
 blocked instead), keep the agent's own terminal, code and background shells from running ``hermes librenms apply``
 around that prompt (audited as a refusal) and from reading the plugin's secrets (blocked, or put to the approval
 prompt when the call reads a file or an environment that holds them), remember the user's message for the audit
-trail and note a run of the scheduled digest (``pre_llm_call``), in which the write tools refuse (:mod:`digest`), and
-record the human's decision (``post_approval_response``). Hook callbacks never raise.
+trail and note a run of the scheduled digest (``pre_llm_call``), in which the write tools refuse and nothing is
+delegated (:mod:`digest`), and record the human's decision (``post_approval_response``). Hook callbacks never raise.
 
 Named ``handlers`` rather than ``tools`` so the module can never shadow Hermes' own ``tools`` package when the
 repository root is on ``sys.path`` (tests, editable checkouts).
@@ -89,7 +89,8 @@ _FALSE = frozenset({"false", "0", "no", "off"})
 # shell that terminal(background=true) started, which Hermes runs no command guard on.
 _SHELL_TOOLS = frozenset({"terminal", "execute_code", "process_manage"})
 _STDIN_ACTIONS = frozenset({"write", "submit"})
-_HOOKED_TOOLS = frozenset({*WRITE_TOOLS, *_SHELL_TOOLS})
+# With the tools that hand work to another agent, which a run of the scheduled digest refuses (digest.DELEGATION_TOOLS).
+_HOOKED_TOOLS = frozenset({*WRITE_TOOLS, *_SHELL_TOOLS, *digest.DELEGATION_TOOLS})
 # `librenms apply|rollback` in a shell command, also in the argument list of code that builds one (["hermes",
 # "librenms", "apply", ...]), and the plan named after it (options before it skipped); _cli_write looks for the word
 # hermes before it in the same command, global options allowed in between. Defence in depth only: the CLI itself
@@ -1508,16 +1509,19 @@ HANDLERS = {
 
 
 def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dict[str, Any] | None:
-    """Hermes ``pre_tool_call``: fires for every tool call, so anything but our two write tools and the agent's shell
-    tools returns at once, without reading settings or plans. A callback that raises would block the call it was
-    asked about, so neither branch raises; when in doubt they block. In a run of the scheduled digest an apply or a
-    rollback is blocked before anything is asked (:func:`_digest_block`). An approval asked for is audited as
-    ``approval_requested``: Hermes may refuse it (cron, unattended platforms) without a ``post_approval_response``,
-    and the attempt must still show in the trail. A block is audited as the refusal it is. For every apply and
-    rollback it also keeps what the prompt shows, or that none is shown, for :func:`bind_approval` to hand the
-    handler. The shell tools go to :func:`_terminal_guard`."""
+    """Hermes ``pre_tool_call``: fires for every tool call, so anything but our two write tools, the agent's shell
+    tools and the tools that hand work to another agent returns at once, without reading settings or plans. A callback
+    that raises would block the call it was asked about, so no branch raises; when in doubt they block. In a run of the
+    scheduled digest an apply or a rollback is blocked before anything is asked (:func:`_digest_block`), and so is a
+    delegation (:func:`_delegation_block`). An approval asked for is audited as ``approval_requested``: Hermes may
+    refuse it (cron, unattended platforms) without a ``post_approval_response``, and the attempt must still show in
+    the trail. A block is audited as the refusal it is. For every apply and rollback it also keeps what the prompt
+    shows, or that none is shown, for :func:`bind_approval` to hand the handler. The shell tools go to
+    :func:`_terminal_guard`."""
     if not isinstance(tool_name, str) or tool_name not in _HOOKED_TOOLS:
         return None
+    if tool_name in digest.DELEGATION_TOOLS:
+        return _delegation_block(tool_name, kwargs)
     if tool_name not in WRITE_TOOLS:
         return _terminal_guard(tool_name, args, kwargs)
     blocked = _digest_block(tool_name, args, kwargs)
@@ -1561,6 +1565,29 @@ def _digest_block(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str
     except Exception as exc:
         logger.warning("librenms digest hook: not checked (%s)", type(exc).__name__)
         return None
+
+
+def _delegation_block(tool: str, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Block ``delegate_task`` and ``cronjob_manage`` in a run of the scheduled digest
+    (:func:`digest.delegation_refusal`): the subagent or cron run they would start is not the digest run, so the write
+    tools would not refuse there, and ``approvals.cron_mode: approve`` or ``require_approval: false`` would let a
+    change through with nobody asked. Audited as ``delegation_refused`` with the tool and the run in the actor, never
+    the goal or prompt it was given. ``None`` anywhere else. A check that fails blocks, since no handler of ours
+    stands behind a delegation."""
+    try:
+        refusal = digest.delegation_refusal(tool)
+        if refusal is None:
+            return None
+        _audit_hook("delegation_refused", hook_kwargs, None, None, reason=refusal, tool=tool)
+        return {"action": "block", "message": refusal}
+    except Exception as exc:
+        error_id = new_error_id()
+        logger.warning("librenms digest hook: %s blocked after %s (%s)", tool, type(exc).__name__, error_id)
+        return {
+            "action": "block",
+            "message": f"{tool} refused: the LibreNMS plugin could not tell whether this is a run of its read-only "
+            f"network digest ({error_id}); see the Hermes log",
+        }
 
 
 def bind_approval(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dict[str, Any] | None:

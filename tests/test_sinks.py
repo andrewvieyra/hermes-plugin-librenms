@@ -154,6 +154,8 @@ class Formats(unittest.TestCase):
             self.assertEqual(sinks.severity_of(_record(event)), sinks.SEV_NOTICE, event)
         for event in ("apply_refused", "query_refused", "revert_irreversible", "run_recovered", "step_conflict"):
             self.assertEqual(sinks.severity_of(_record(event)), sinks.SEV_WARNING, event)
+        # a run of the scheduled digest tried to hand work to another agent: an alarm like the refusals
+        self.assertEqual(sinks.severity_of(_record("delegation_refused")), sinks.SEV_WARNING)
         self.assertEqual(sinks.severity_of(_record("apply_finished", outcome="failed")), sinks.SEV_WARNING)
         self.assertEqual(sinks.severity_of(_record("apply_finished", outcome="applied")), sinks.SEV_INFO)
         self.assertEqual(

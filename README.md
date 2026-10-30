@@ -288,7 +288,7 @@ reports them in this order, each section headed with its count:
 | Section | Call |
 |---|---|
 | Devices down | `{"view": "devices", "filter": {"status": "down"}}` |
-| Alerts firing | `{"view": "alerts", "sort": "severity"}` (acknowledged ones last) |
+| Alerts firing | `{"view": "alerts", "sort": "severity"}` (critical first; within a severity, acknowledged ones last) |
 | Busiest ports | `{"view": "ports", "sort": "util"}` |
 | Ports over 80 % | `{"view": "ports", "filter": {"util_above_pct": 80}, "sort": "util"}` |
 | Sensors out of range | `{"view": "health", "filter": {"status": ["warning", "critical"]}, "sort": "status"}` |
@@ -321,8 +321,10 @@ plugin which cron run is executing, and in a run whose prompt holds the digest's
 ("LibreNMS network digest (read-only).") `librenms_plan`, `librenms_apply` and `librenms_rollback`
 refuse, before any approval prompt, whatever a device's text asks for and whatever the job's prompt was
 edited to say while it keeps that sentence; `hermes librenms apply` or `rollback` in the run's terminal
-is blocked whatever the settings. Each refusal is audited (`plan_rejected`, `apply_refused`,
-`rollback_refused`) with the cron job and run in its actor.
+is blocked whatever the settings. Nor does the run hand the work on: `delegate_task` and `cronjob_manage`
+refuse in it, since Hermes gives a subagent no cron identity and a job the run created or started is
+another run, so neither would be held. Each refusal is audited (`plan_rejected`, `apply_refused`,
+`rollback_refused`, `delegation_refused`) with the cron job and run in its actor.
 
 ## Tools
 
@@ -629,8 +631,9 @@ script can tell an apply that went through from one that did not.
 - **The scheduled digest stays read-only.** In a cron run of `librenms:network-digest` (its prompt's
   first sentence, in the run Hermes says is executing) the plan, apply and rollback tools refuse in
   every `write_mode`, and so does `hermes librenms apply|rollback` in its terminal, audited; see
-  [Scheduled digest](#scheduled-digest). A subagent the run delegates
-  to is not that run, and is held by `approvals.cron_mode` and `write_mode` like any cron job.
+  [Scheduled digest](#scheduled-digest). The run starts no subagent or cron run, which would not be
+  held: `delegate_task` and `cronjob_manage` refuse in it. A Hermes its terminal starts is a session
+  of its own ([SECURITY.md](SECURITY.md#what-the-plugin-does-not-do)).
 - **Every write is diffed first.** Updates send only the fields that differ; unchanged operations
   become `noop` steps.
 - **Optimistic concurrency without stamps.** LibreNMS has no `last_updated` or ETag, so each step

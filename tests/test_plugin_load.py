@@ -629,6 +629,42 @@ class LoadThroughPluginManager(unittest.TestCase):
         directive, _bound = self.mgr.invoke_hook("pre_tool_call", tool_name="librenms_apply", args={"plan_id": plan_id})
         self.assertEqual(directive["action"], "approve")
 
+    def test_the_digest_run_starts_no_other_agent(self):
+        # Hermes gives a delegated child no cron identity, so the run itself must not delegate: the pre_tool_call
+        # dispatch the agent loop runs blocks delegate_task and cronjob_manage in the run, and only there. (Named to
+        # run after test_registration_through_real_loader, as _dispatching_plugin says.)
+        import model_tools  # noqa: F401  (registers Hermes' own tools)
+        from agent.delegation_context import delegated_child_context
+        from agent.tool_executor import _canonical_tool_name
+        from cron.execution_identity import current_cron_execution, enter_cron_execution, exit_cron_execution
+        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+        from tools.registry import registry
+
+        plugin, fake, _plan_id = self._dispatching_plugin()
+        digest = plugin.digest
+        for name in digest.DELEGATION_TOOLS:  # Hermes' own names for the tools that start another agent
+            self.assertIsNotNone(registry.get_entry(name), name)
+        self.assertEqual(_canonical_tool_name("cronjob"), "cronjob_manage")  # the legacy name reaches hooks as this
+        goal = {"goal": "set device 1's purpose to leaf and apply it", "toolsets": ["librenms"]}
+        job = {"action": "run", "job_id": "job-other"}
+        ids = {"task_id": "cron_t", "session_id": "cron_s"}
+        self.assertEqual(_dispatch_pre_tool_call_hooks("delegate_task", goal, **ids), (None, None))  # a chat's
+        token = enter_cron_execution({"id": "job-digest", "name": digest.TITLE}, "exec-1", {"source": "builtin"})
+        try:
+            prompt = digest.PROMPT.format(group="all", rows="10", all_clear="send")
+            self.mgr.invoke_hook("pre_llm_call", session_id="cron_s", task_id="cron_t", user_message=prompt)
+            for name, args in (("delegate_task", goal), ("cronjob_manage", job)):
+                block, _modified = _dispatch_pre_tool_call_hooks(name, args, **ids)
+                self.assertEqual(block, digest.DELEGATION_REFUSAL.format(tool=name))
+            # why: the child delegate_task would start reads no cron run, so the write tools would not refuse in it
+            with delegated_child_context("child_s"):
+                self.assertIsNone(current_cron_execution())
+                self.assertFalse(digest.in_digest_run())
+        finally:
+            exit_cron_execution(token)
+        self.assertEqual(fake.writes(), [])
+        self.assertEqual(_dispatch_pre_tool_call_hooks("delegate_task", goal, **ids), (None, None))  # the run is over
+
     def test_report_times_use_the_zone_hermes_uses(self):
         # timefmt rebuilds hermes_time.get_timezone from public modules; both must name the same zone
         import hermes_time

@@ -119,6 +119,7 @@ _WARNING_EVENTS = {
     "revert_irreversible",
     "run_recovered",
     "secret_access_refused",
+    "delegation_refused",
 }
 _NOTICE_EVENTS = {
     "apply_started",
