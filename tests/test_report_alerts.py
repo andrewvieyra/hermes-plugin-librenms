@@ -454,7 +454,7 @@ class AlertHistory(AlertCase):
         self.fake.seed("device_groups", {"id": 7, "name": "empty-group", "type": "static", "devices": []})
         for scope, note in (
             ({"location": "LON-3"}, "no device is at location 'LON-3'"),  # a location no device is at
-            ({"os": "junos"}, "no device has os 'junos'; the os values LibreNMS holds: asa, ios, iosxe"),
+            ({"os": "junos"}, "no device has os 'junos'; scope.os.held lists the os values LibreNMS holds"),
             ({"group": "empty-group"}, None),  # the scope says it: device_count 0
         ):
             for by in ("rule", "device", "event"):
@@ -504,8 +504,13 @@ class AlertHistory(AlertCase):
         self.assertEqual((out["rows"], "rule" in out["untrusted_fields"]), ([], True))
         # nothing logged and no rule named: a summary of counts holds no text, and no marker is needed
         self.fake.tables["rules"].clear()
-        out = self.report(view="alert_history", window="1h", scope={"os": "junos"})
+        out = self.report(view="alert_history", window="1h", scope={"location": "LON-3"})
         self.assertEqual((out["summary"]["top_rules"], "untrusted_fields" in out), ([], False))
+        # unless the scope lists what LibreNMS holds: the os values, when none is the one asked for
+        out = self.report(view="alert_history", window="1h", scope={"os": "junos"})
+        self.assertEqual(
+            (out["scope"]["os"], "held" in out["untrusted_fields"]), ({"held": ["asa", "ios", "iosxe"]}, True)
+        )
 
     def test_a_rule_whose_extra_librenms_returns_as_json_text(self):
         # LibreNMS's documented rules answer holds extra as a JSON string: muted is read from it all the same

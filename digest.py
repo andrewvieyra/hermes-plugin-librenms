@@ -15,7 +15,8 @@ run, by the run's id from ``ctx.current_cron_execution()``, which the model cann
 was edited to say while it keeps that sentence. Outside cron the sentence means nothing, so a person who pastes the
 prompt into a chat is not held to it. A subagent is not the run (Hermes gives it no cron identity), and neither is a
 cron run it creates or starts: the write tools would not refuse there, so in a digest run the tools that hand work to
-another agent (:data:`DELEGATION_TOOLS`) refuse too (:func:`delegation_refusal`). The digest needs none of them.
+another agent (:func:`delegates`: subagents, cron jobs, A2A peers, kanban workers) refuse too
+(:func:`delegation_refusal`). The digest needs none of them.
 """
 
 from __future__ import annotations
@@ -49,15 +50,20 @@ REFUSAL = (
     "{action} refused: this run is the LibreNMS network digest, which is read-only: it plans, applies and rolls back "
     "nothing. Report what needs changing in the digest, for a person to act on."
 )
-# The tools that hand work to another agent: delegate_task starts a subagent, which Hermes gives no cron identity, and
-# cronjob_manage creates or starts a cron job, which runs as another run. Neither agent would be held to the digest's
-# guard, where approvals.cron_mode: approve or require_approval: false would let its write through.
-DELEGATION_TOOLS = frozenset({"delegate_task", "cronjob_manage"})
+# The tools that hand work to another agent: delegate_task starts a subagent, which Hermes gives no cron identity;
+# cronjob_manage creates or starts a cron job, which runs as another run; the A2A plugin's a2a_call and a2a_orchestrate
+# send a task to a peer agent, which may be this gateway's own A2A endpoint; and every tool of Hermes' kanban toolset
+# (DELEGATION_PREFIXES), whose tasks the dispatcher runs as worker agents of the profile they are assigned to:
+# kanban_create starts one, and kanban_unblock, kanban_complete (which releases the tasks it gates) and the others
+# release, resume or redirect one. None of those agents would be held to the digest's guard, where
+# approvals.cron_mode: approve, an approving unattended policy or require_approval: false would let its write through.
+DELEGATION_TOOLS = frozenset({"delegate_task", "cronjob_manage", "a2a_call", "a2a_orchestrate"})
+DELEGATION_PREFIXES = ("kanban_",)
 # What they answer in a digest run.
 DELEGATION_REFUSAL = (
     "{tool} refused: this run is the LibreNMS network digest, which is read-only and hands no work to another agent "
-    "(a subagent or another cron run would not be held to it). Make the digest's librenms_report calls in this run, "
-    "and report what needs changing in the digest, for a person to act on."
+    "(a subagent, another cron run, an A2A peer or a kanban worker would not be held to it). Make the digest's "
+    "librenms_report calls in this run, and report what needs changing in the digest, for a person to act on."
 )
 # Digest runs seen, by cron execution id (Hermes never gives two runs one id), newest last: more than every digest run
 # of every profile that can be under way at once.
@@ -239,10 +245,15 @@ def refusal(action: str) -> str | None:
     return REFUSAL.format(action=action) if in_digest_run() else None
 
 
+def delegates(tool: str) -> bool:
+    """Whether *tool* hands work to another agent: one of :data:`DELEGATION_TOOLS`, or a tool of a toolset named in
+    :data:`DELEGATION_PREFIXES`. A string test, so the hook that asks for every tool call stays cheap."""
+    return tool in DELEGATION_TOOLS or tool.startswith(DELEGATION_PREFIXES)
+
+
 def delegation_refusal(tool: str) -> str | None:
-    """What a tool that hands work to another agent (:data:`DELEGATION_TOOLS`) answers in a digest run, else
-    ``None``."""
-    return DELEGATION_REFUSAL.format(tool=tool) if tool in DELEGATION_TOOLS and in_digest_run() else None
+    """What a tool that hands work to another agent (:func:`delegates`) answers in a digest run, else ``None``."""
+    return DELEGATION_REFUSAL.format(tool=tool) if delegates(tool) and in_digest_run() else None
 
 
 def runs() -> List[str]:

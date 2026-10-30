@@ -23,7 +23,7 @@ from .context import STATES, ReportContext, Request, View, brief, device_state, 
 SCOPE_KEYS = ("device", "devices", "group", "location", "os", "type")
 CHECKS = ("naming_mismatch", "no_location", "no_purpose")
 OUTAGE_READS = 20  # down devices on one page whose outages are read
-TEXT_KEYS = ("hostname", "display", "sysName", "location", "purpose", "hardware", "version")
+TEXT_KEYS = ("hostname", "display", "sysName", "location", "purpose", "hardware", "version", "type", "status_reason")
 _STATE_ORDER = {"down": 0, "ignored": 1, "disabled": 2, "up": 3}
 
 

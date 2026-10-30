@@ -89,8 +89,9 @@ _FALSE = frozenset({"false", "0", "no", "off"})
 # shell that terminal(background=true) started, which Hermes runs no command guard on.
 _SHELL_TOOLS = frozenset({"terminal", "execute_code", "process_manage"})
 _STDIN_ACTIONS = frozenset({"write", "submit"})
-# With the tools that hand work to another agent, which a run of the scheduled digest refuses (digest.DELEGATION_TOOLS).
-_HOOKED_TOOLS = frozenset({*WRITE_TOOLS, *_SHELL_TOOLS, *digest.DELEGATION_TOOLS})
+# The tools pre_tool_call reads the call of; besides these, those that hand work to another agent, which a run of the
+# scheduled digest refuses (digest.delegates).
+_HOOKED_TOOLS = frozenset({*WRITE_TOOLS, *_SHELL_TOOLS})
 # `librenms apply|rollback` in a shell command, also in the argument list of code that builds one (["hermes",
 # "librenms", "apply", ...]), and the plan named after it (options before it skipped); _cli_write looks for the word
 # hermes before it in the same command, global options allowed in between. Defence in depth only: the CLI itself
@@ -124,14 +125,16 @@ _SECRET_WORDS = ("TOKEN", "SECRET", "PASS", "KEY")
 _NAME_RE = re.compile(r"\w+", re.ASCII)
 # A variable read by name: a shell, PowerShell, cmd, Perl or PHP expansion ($N, ${N:-x}, $env:N, env:N, %N%,
 # $ENV{N}, $_ENV['N']), and a call or subscript of Python, Ruby, Node, Go, Java, C# or Rust (os.environ["N"],
-# os.environ.copy()["N"], os.getenv("N"), ENV.fetch("N"), process.env.N, System.getenv("N"),
-# System.getenv().get("N"), env::var("N")). Only a braced ${N:+x} or ${N+x} expands to x, not the value: $N+ and
-# process.env.N+"" read it.
+# os.environ.copy()["N"], os.environ.__getitem__("N"), os.getenv("N"), os.getenv(key="N"), ENV.fetch("N"),
+# ENV.values_at("N"), process.env.N, process.env?.N, process["env"].N, System.getenv("N"), System.getenv().get("N"),
+# env::var("N"), env::var_os("N")), with the name in any string form those languages write (r"N", f"N", b'N',
+# '''N''', `N`). Only a braced ${N:+x} or ${N+x} expands to x, not the value: $N+ and process.env.N+"" read it.
 _VARIABLE_READ_RE = re.compile(
     r"""(?:\$(?P<brace>\{)?(?:env:)?|%|\benv:|\$ENV\{\s*['"]?|\$_(?:ENV|SERVER)\[\s*['"]"""
-    r"""|\b(?:getenv|environb?|env|GetEnvironmentVariable|LookupEnv|var)\s*(?:\(\s*\)\s*)?"""
-    r"""(?:\.\s*(?:copy|to_h|to_hash)\s*(?:\(\s*\)\s*)?)?(?:\)\s*)?"""
-    r"""(?:(?:\.\s*(?:get|fetch|pop|setdefault|getOrDefault)\s*)?[\[(]\s*b?['"]|\.\s*))"""
+    r"""|\b(?:getenv|environb?|env|GetEnvironmentVariable|LookupEnv|var(?:_os)?)(?:\s*['"`]\s*\])?\s*"""
+    r"""(?:\(\s*\)\s*)?(?:\.\s*(?:copy|to_h|to_hash)\s*(?:\(\s*\)\s*)?)?(?:\)\s*)?"""
+    r"""(?:(?:\.\s*(?:get|fetch|pop|setdefault|getOrDefault|__getitem__|values_at|fetch_values)\s*)?"""
+    r"""(?:\?\.\s*)?[\[(]\s*(?:key\s*=\s*)?[rbuf]{0,2}(?:'{3}|"{3}|['"`])|\??\.\s*))"""
     r"""(?P<name>LIBRENMS_\w+)(?!\w)(?(brace)(?!:?\+))""",
     re.IGNORECASE | re.ASCII,
 )
@@ -144,12 +147,19 @@ _NAMES_RE = re.compile(r"(?<!\w)LIBRENMS_\w+", re.IGNORECASE | re.ASCII)
 # substitution, and after if, then, elif, else, while, until, do or !) and as the whole test (`]`, `]]`, a
 # separator or the end after it), and only where that start is outside a quoted string (_without_presence_tests).
 # The same words inside an argument, a URL or a string still read the value: echo [ -z "$N" ], "?q=test -n $N".
+# Blanks only ([^\S\n], never a newline) between its words: a newline is a lead of its own, and a lead whose blanks
+# could run on through the next leads would scan a run of newlines once for every newline in it.
 _PRESENCE_TEST_RE = re.compile(
-    r"""(?P<lead>^|[\n;&|(`])\s*(?:(?:if|then|elif|else|while|until|do|!)\s+)*"""
-    r"""(?:test|\[\[?)\s+(?:!\s+)?-[nz]\s+(?P<quote>["']?)\$\{?LIBRENMS_\w+(?!\w)(?::?-?\})?(?P=quote)"""
-    r"""(?=\s*(?:\]|[\n;&|)`]|$))""",
+    r"""(?P<lead>^|[\n;&|(`])[^\S\n]*(?:(?:if|then|elif|else|while|until|do|!)[^\S\n]+)*"""
+    r"""(?:test|\[\[?)[^\S\n]+(?:![^\S\n]+)?-[nz][^\S\n]+(?P<quote>["']?)\$\{?LIBRENMS_\w+(?!\w)(?::?-?\})?"""
+    r"""(?P=quote)(?=[^\S\n]*(?:\]|[\n;&|)`]|$))""",
     re.IGNORECASE | re.ASCII,
 )
+# What makes a shell print, or send, a presence test with the value in it, so none is excepted from a call that holds
+# one: tracing (set -x, set -o xtrace, bash -x, SHELLOPTS, BASH_XTRACEFD) prints each test it runs expanded, and a
+# here-document or here-string expands one into the text it feeds a command (_shows_tests).
+_TRACE_WORDS = ("xtrace", "shellopts", "<<")
+_TRACERS = frozenset({"set", "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash"})  # set -x, bash -x, sh -xc
 # A string as a shell quotes it ('...', "..." with backslash escapes), or one escaped character outside them
 _QUOTED_RE = re.compile(r"""'[^']*'|"[^"\\]*(?:\\.[^"\\]*)*"|\\.""", re.DOTALL)
 # A header or parameter that authenticates to LibreNMS (X-Auth-Token on API v0, Authorization: Bearer on every
@@ -166,10 +176,12 @@ _HOME_RE = re.compile(
     re.IGNORECASE,
 )
 # An environment printed whole without a command word: a process's environ file, .NET's GetEnvironmentVariables(),
-# Python printing os.environ
+# Python printing os.environ, Node printing process.env (console.log(process.env), JSON.stringify(process.env))
 _ENVIRON_RE = re.compile(
     r"""/proc/[^\s/'"]*/environ\b|\bGetEnvironmentVariables\s*\("""
-    r"""|\b(?:print|pprint|dumps)\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)""",
+    r"""|\b(?:print|pprint|dumps)\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)"""
+    r"""|\b(?:console\s*\.\s*(?:log|dir|info|error|warn|debug|table)|JSON\s*\.\s*stringify|util\s*\.\s*inspect)"""
+    r"""\s*\(\s*process\s*\.\s*env\s*[,)]""",
     re.IGNORECASE,
 )
 # Where a simple command starts: a shell separator, a pipe, a command substitution, and in code a call's argument
@@ -178,8 +190,9 @@ _COMMAND_SPLIT_RE = re.compile(r"""[\n;&|`\])]|\$\(|\((?=\s*["'\[])""")
 _WORD_SPLIT_RE = re.compile(r"[\s,]+")
 _REDIRECT_RE = re.compile(r"\d*[<>]+")  # > file, 2>, >>file, <<EOF: not an argument of the command
 # Words that run the command after them, by name (_command_name: /usr/bin/env and \env are env), each with the
-# letters of its short options that take a value (sudo -u root, nice -n 5, env -u NAME, xargs -I {}); timeout also
-# takes a duration. _command_start skips them, with their options and NAME=value assignments.
+# letters of its short options that take a value (sudo -u root, nice -n 5, env -u NAME, xargs -I {}) and, in
+# _WRAPPER_LONG, its long options that take one as the next word (sudo --user root, timeout --signal KILL 5); timeout
+# also takes a duration. _command_start skips them, with their options and NAME=value assignments.
 _WRAPPERS = {
     "sudo": "CDghpRrTtUu",
     "doas": "Cu",
@@ -198,6 +211,35 @@ _WRAPPERS = {
     "busybox": "",
     "toybox": "",
 }
+_WRAPPER_LONG = {
+    "sudo": frozenset(
+        {
+            "--chdir",
+            "--chroot",
+            "--close-from",
+            "--command-timeout",
+            "--group",
+            "--host",
+            "--other-user",
+            "--prompt",
+            "--role",
+            "--type",
+            "--user",
+        }
+    ),
+    "time": frozenset({"--format", "--output"}),
+    "nice": frozenset({"--adjustment"}),
+    "ionice": frozenset({"--class", "--classdata", "--pid", "--pgid", "--uid"}),
+    "timeout": frozenset({"--kill-after", "--signal"}),
+    "stdbuf": frozenset({"--error", "--input", "--output"}),
+    "env": frozenset({"--chdir", "--split-string", "--unset"}),
+    "xargs": frozenset({"--arg-file", "--delimiter", "--max-args", "--max-chars", "--max-procs", "--process-slot-var"}),
+}
+# Shells that run the command string their -c option gives (bash -c 'env', sh -lc env, pwsh -Command 'gci env:',
+# cmd /c set): _command_start reads that string's first word as the command. Without one the shell is the command.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish"})
+_SHELL_VALUED = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})  # bash -o pipefail -c ...
+_POWERSHELLS = frozenset({"pwsh", "powershell"})
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*=")
 _PATH_SPLIT_RE = re.compile(r"[\\/]")
 # Commands that read a directory's files recursively: grep with -r (and its kin), the searchers that recurse by
@@ -206,6 +248,8 @@ _GREPS = frozenset({"grep", "egrep", "fgrep", "zgrep"})
 _SEARCHERS = frozenset({"rg", "ag", "ack", "ugrep"})
 _FIND_RUNS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _GLOB_CHARS = frozenset("*?[")
+# Commands that change the shell's directory: a later command's relative path is then under the directory they name
+_CHANGE_DIRS = frozenset({"cd", "pushd", "chdir", "set-location", "sl"})
 # The part of a secret prompt every surface shows: Hermes cuts the reason at 300 characters on Discord, the least of
 # its surfaces, so the head line and the command line fit in that much (_secret_prompt).
 _SECRET_PROMPT_SHOWN = 300
@@ -1518,10 +1562,12 @@ def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dic
     the trail. A block is audited as the refusal it is. For every apply and rollback it also keeps what the prompt
     shows, or that none is shown, for :func:`bind_approval` to hand the handler. The shell tools go to
     :func:`_terminal_guard`."""
-    if not isinstance(tool_name, str) or tool_name not in _HOOKED_TOOLS:
+    if not isinstance(tool_name, str):
         return None
-    if tool_name in digest.DELEGATION_TOOLS:
+    if digest.delegates(tool_name):
         return _delegation_block(tool_name, kwargs)
+    if tool_name not in _HOOKED_TOOLS:
+        return None
     if tool_name not in WRITE_TOOLS:
         return _terminal_guard(tool_name, args, kwargs)
     blocked = _digest_block(tool_name, args, kwargs)
@@ -1568,12 +1614,13 @@ def _digest_block(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str
 
 
 def _delegation_block(tool: str, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Block ``delegate_task`` and ``cronjob_manage`` in a run of the scheduled digest
-    (:func:`digest.delegation_refusal`): the subagent or cron run they would start is not the digest run, so the write
-    tools would not refuse there, and ``approvals.cron_mode: approve`` or ``require_approval: false`` would let a
-    change through with nobody asked. Audited as ``delegation_refused`` with the tool and the run in the actor, never
-    the goal or prompt it was given. ``None`` anywhere else. A check that fails blocks, since no handler of ours
-    stands behind a delegation."""
+    """Block a tool that hands work to another agent (:func:`digest.delegates`: ``delegate_task``,
+    ``cronjob_manage``, ``a2a_call``, ``a2a_orchestrate``, the kanban toolset) in a run of the scheduled digest
+    (:func:`digest.delegation_refusal`): the subagent, cron run, peer or kanban worker it would start is not the digest
+    run, so the write tools would not refuse there, and ``approvals.cron_mode: approve`` or ``require_approval:
+    false`` would let a change through with nobody asked. Audited as ``delegation_refused`` with the tool and the run
+    in the actor, never the goal, prompt or task it was given. ``None`` anywhere else. A check that fails blocks,
+    since no handler of ours stands behind a delegation."""
     try:
         refusal = digest.delegation_refusal(tool)
         if refusal is None:
@@ -1898,16 +1945,20 @@ def _secret_access(text: str) -> Tuple[str, List[str]] | None:
       or an environment lookup in code (:data:`_VARIABLE_READ_RE`, :data:`_DESTRUCTURE_RE`), or ``printenv N`` or
       ``declare -p N`` however it is run (``/usr/bin/printenv``, ``sudo -E printenv``, ``echo N | xargs
       printenv``). A presence test where a command starts (``[ -n "$LIBRENMS_TOKEN" ]``), ``${#N}`` and
-      ``${N:+x}`` read nothing;
+      ``${N:+x}`` read nothing, unless the call traces or holds a here-document (:func:`_shows_tests`);
     - ``env_file``: a Hermes ``.env`` file, which holds them all, named next to a Hermes home, or reached without
-      its name by a dotfile glob or a recursive search of the home (:func:`_searches_home`);
+      its name by a dotfile glob or a recursive search of the home, also from a directory a ``cd`` entered
+      (:func:`_reads_env_file`);
     - ``environment``: an environment printed whole (``env``, ``printenv``, ``export -p``, ``declare -p``, ``set``,
-      ``Get-ChildItem env:``, a ``/proc`` environ file, ``print(os.environ)``), however it is run, while this
-      process's environment holds one of them, which the agent's local terminal inherits.
+      ``Get-ChildItem env:``, a ``/proc`` environ file, ``print(os.environ)``, ``console.log(process.env)``),
+      however it is run (by path, through a wrapper, in a shell's ``-c`` string), while this process's environment
+      holds one of them, which the agent's local terminal inherits.
 
     Hermes masks a printed ``NAME=value`` by the name and the value's shape, not always whole (part of a token can
     show) and not a password inside ``LIBRENMS_PROXY``. The first two rules block, the last two ask.
-    Every pattern is anchored on a literal and runs in linear time, since this runs before every shell call."""
+    Every pattern is anchored on a literal and runs in linear time, since this runs before every shell call, in
+    Hermes' process: a pattern that backtracked over a long call would hold the interpreter's lock for its whole
+    scan, so every other session of a gateway would stop with it."""
     folded = text.casefold()
     names = _secrets_read(text, folded) if "librenms_" in folded else []
     if any(marker in folded for marker in _AUTH_MARKERS) and _names_api(folded):
@@ -1939,7 +1990,8 @@ def _names_librenms_host(folded: str) -> bool:
 
 def _secrets_read(text: str, folded: str) -> List[str]:
     """The plugin's secrets *text* reads by name, upper-cased and sorted (see :func:`_secret_access`)."""
-    found = [match.group("name") for match in _VARIABLE_READ_RE.finditer(_without_presence_tests(text))]
+    searched = text if _shows_tests(text, folded) else _without_presence_tests(text)
+    found = [match.group("name") for match in _VARIABLE_READ_RE.finditer(searched)]
     if "process" in folded:
         for match in _DESTRUCTURE_RE.finditer(text):
             found += _NAMES_RE.findall(match.group("names"))
@@ -1972,6 +2024,22 @@ def _without_presence_tests(text: str) -> str:
         return match.group(0) if inside else match.group("lead") + " "
 
     return _PRESENCE_TEST_RE.sub(blank, text)
+
+
+def _shows_tests(text: str, folded: str) -> bool:
+    """*text* may print or send a presence test with the value in it, so it gets no exception for one: it turns on
+    tracing, which prints each test bash runs expanded (``set -x``, ``set -euxo pipefail``, ``bash -x``, ``sh -xc``,
+    ``set -o xtrace``, ``SHELLOPTS``, ``BASH_XTRACEFD``), or holds a here-document or here-string (``<<``), which
+    expands one into the text it feeds a command (``cat <<EOF | curl -d @- ...``)."""
+    if any(word in folded for word in _TRACE_WORDS):
+        return True
+    for words in _simple_commands(text):
+        after = False  # past a set or a shell in this command: an option cluster holding x traces
+        for word in words:
+            if after and word.startswith("-") and _flag(word, "x"):
+                return True
+            after = after or _command_name(word) in _TRACERS
+    return False
 
 
 def _listed_names(words: List[str]) -> Tuple[List[str], bool]:
@@ -2023,16 +2091,24 @@ def _command_name(word: str) -> str:
 
 
 def _command_start(words: List[str]) -> int:
-    """Where the command the simple command *words* runs starts: past ``NAME=value`` assignments and the wrappers of
-    :data:`_WRAPPERS` with their options (``sudo -E``, ``nice -n 5``, ``timeout -s KILL 5``, ``env -u NAME``). A
-    wrapper that runs nothing is the command itself (``env`` and ``env -0`` print the environment), and so is
-    ``command -v``, which names a command without running it."""
+    """Where the command the simple command *words* runs starts: past ``NAME=value`` assignments, the wrappers of
+    :data:`_WRAPPERS` with their options (``sudo -E``, ``sudo --user root``, ``nice -n 5``, ``timeout -s KILL 5``,
+    ``env -u NAME``), and a shell with the options before its command string (``bash -c``, ``sh -lc``, ``pwsh
+    -Command``, ``cmd /c``; :func:`_shell_string`). A wrapper or a shell that runs nothing is the command itself
+    (``env`` and ``env -0`` print the environment, ``bash script.sh`` runs bash), and so is ``command -v``, which
+    names a command without running it."""
     at, wrapper = 0, None
     while at < len(words):
         if _ASSIGNMENT_RE.match(words[at]):
             at += 1
             continue
         name = _command_name(words[at])
+        if name in _SHELLS or name in _POWERSHELLS or name == "cmd":
+            inner = _shell_string(words, at, name)
+            if inner >= len(words):
+                return at
+            wrapper, at = at, inner
+            continue
         takes = _WRAPPERS.get(name)
         if takes is None:
             return at
@@ -2042,15 +2118,44 @@ def _command_start(words: List[str]) -> int:
             at += 1
             if option == "--":
                 break
+            if option.startswith("--"):
+                if option in _WRAPPER_LONG.get(name, ()):
+                    at += 1  # the long option's value is the next word: --user root
+                continue
             if name == "command" and ("v" in option or "V" in option):
                 return wrapper
-            letters = "" if option.startswith("--") else option[1:]
+            letters = option[1:]
             first = next((index for index, letter in enumerate(letters) if letter in takes), None)
             if first is not None and first == len(letters) - 1:
                 at += 1  # the option's value is the next word: sudo -u root
         if name == "timeout":
             at += 1  # the duration
     return len(words) if wrapper is None else wrapper
+
+
+def _shell_string(words: List[str], at: int, name: str) -> int:
+    """Where the command string starts that the shell *name* at *at* in *words* runs, or ``len(words)`` when it runs
+    none (a script, its input). A Bourne-style shell or fish takes it after an option cluster holding ``c`` (``-c``,
+    ``-lc``, ``-ec``; ``-o``/``-O`` and their values skipped), PowerShell after ``-c``/``-Command``, cmd after
+    ``/c`` or ``/k``. Its quotes are gone from *words*, so its first word is the command it runs."""
+    at += 1
+    if name in _SHELLS:
+        given = False
+        while at < len(words) and words[at][:1] in "-+" and words[at] not in ("-", "+"):
+            option = words[at]
+            at += 1
+            if option == "--":
+                break
+            if option in _SHELL_VALUED:
+                at += 1
+            elif option == "--command" or _flag(option, "c"):
+                given = True
+        return at if given else len(words)
+    marks = ("-c", "-command", "/c", "/command") if name in _POWERSHELLS else ("/c", "/k")
+    for index in range(at, len(words)):
+        if words[index].lower() in marks:
+            return index + 1
+    return len(words)
 
 
 def _flag(word: str, letter: str) -> bool:
@@ -2082,36 +2187,84 @@ def _prints_environment(words: List[str]) -> bool:
 def _reads_env_file(text: str, folded: str) -> bool:
     """*text* reads a Hermes ``.env`` file: it names a Hermes home (a ``.hermes`` directory, ``HERMES_HOME``,
     ``%LOCALAPPDATA%\\hermes`` or the active home's path) and either a ``.env`` file or a way to read the home's
-    without naming it (:func:`_searches_home`)."""
+    without naming it (:func:`_searches_home`), also by a relative path after a ``cd`` into the home or below it
+    (``cd ~/.hermes && grep -r TOKEN .``, ``cd ~/.hermes; cat .e*``)."""
     home = _active_home()
     if not (_HOME_RE.search(text) or home and home in text):
         return False
     if ".env" in folded and _ENV_FILE_RE.search(text):
         return True
     xargs = "xargs" in folded
-    return any(_searches_home(words, home, xargs) for words in _commands(text))
+    below: List[str] | None = None  # where a cd went, as parts below a Hermes home: a relative path starts there
+    for words in _commands(text):
+        if _command_name(words[0]) in _CHANGE_DIRS:
+            targets = [word for word in words[1:] if not word.startswith("-")]
+            target = targets[-1] if targets else ""
+            if _names_home(target, home):
+                below = _walk([], _from_home(target, home))
+            elif below is not None and _relative(target):
+                below = _walk(below, target)
+            else:
+                below = None
+            continue
+        if _searches_home(words, home, xargs, below):
+            return True
+    return False
 
 
-def _searches_home(words: List[str], home: str, xargs: bool) -> bool:
+def _searches_home(words: List[str], home: str, xargs: bool, below: List[str] | None = None) -> bool:
     """The simple command *words* reads a Hermes home's ``.env`` without naming it: by a glob for dotfiles under the
     home (``~/.hermes/.e*``, ``~/.hermes/profiles/*/.*``; a plain ``*`` skips dotfiles), or by a recursive read
-    (``grep -r``, ``rg``, ``find -exec``, ``find`` piped to ``xargs`` when *xargs*) of the home, its ``profiles``
-    directory or a profile's, where a ``.env`` is."""
-    paths = [word for word in words[1:] if _HOME_RE.search(word) or home and home in word]
-    if not paths:
+    (``grep -r``, ``grep -d recurse``, ``rg``, ``find -exec``, ``find`` piped to ``xargs`` when *xargs*) of the
+    home, its ``profiles`` directory or a profile's, where a ``.env`` is (:func:`_reaches`). *below*: the command
+    runs in a directory under a home (a ``cd`` before it), so a relative glob or path counts too, and so does a
+    recursive grep or searcher given no path, which reads the directory it runs in."""
+    paths = [word for word in words[1:] if _names_home(word, home)]
+    relative = [word for word in words[1:] if below is not None and _relative(word)]
+    if not paths and not relative:
         return False
-    if any(_dotfile_glob(path) for path in paths):
+    if any(_dotfile_glob(path) for path in [*paths, *relative]):
         return True
     command, rest = _command_name(words[0]), words[1:]
     if command in _GREPS:
         recursive = any(
-            _flag(word, "r") or _flag(word, "R") or word in ("--recursive", "--dereference-recursive") for word in rest
+            _flag(word, "r")
+            or _flag(word, "R")
+            or word in ("--recursive", "--dereference-recursive", "--directories=recurse")
+            or (word in ("-d", "--directories") and following == "recurse")
+            for word, following in zip(rest, [*rest[1:], ""])
         )
     elif command == "find":
         recursive = xargs or any(word in _FIND_RUNS for word in rest)
     else:
         recursive = command in _SEARCHERS
-    return recursive and any(_reaches_env(path, home) for path in paths)
+    if not recursive:
+        return False
+    if any(_reaches([], _from_home(path, home)) for path in paths):
+        return True
+    if below is None:
+        return False
+    if any(_reaches(below, path) for path in relative):
+        return True
+    # a grep -r or a searcher given only its pattern reads the directory it runs in
+    return command != "find" and len(relative) <= 1 and not paths and _reaches(below, "")
+
+
+def _names_home(word: str, home: str) -> bool:
+    """*word* names a Hermes home (:data:`_HOME_RE`, or the active home's path)."""
+    return _HOME_RE.search(word) is not None or bool(home) and home in word
+
+
+def _from_home(path: str, home: str) -> str:
+    """What follows the Hermes home *path* names (:func:`_names_home`): ``/profiles/x`` of ``~/.hermes/profiles/x``."""
+    found = _HOME_RE.search(path)
+    end = found.end() if found else path.find(home) + len(home)
+    return path[end:].lstrip("}")
+
+
+def _relative(word: str) -> bool:
+    """*word* could be a relative path: not an option, nor a path from the root, a home, a variable or a drive."""
+    return bool(word) and word[0] not in "-/~$%\\" and not (len(word) > 1 and word[1] == ":")
 
 
 def _dotfile_glob(path: str) -> bool:
@@ -2120,13 +2273,39 @@ def _dotfile_glob(path: str) -> bool:
     return last.startswith(".") and not _GLOB_CHARS.isdisjoint(last)
 
 
-def _reaches_env(path: str, home: str) -> bool:
-    """A recursive read of *path*, which names a Hermes home, reaches a ``.env``: *path* is the home, its
-    ``profiles`` directory or a profile's directory, not one beside them (``~/.hermes/skills``)."""
-    found = _HOME_RE.search(path)
-    end = found.end() if found else path.find(home) + len(home)
-    parts = [part for part in _PATH_SPLIT_RE.split(path[end:].lstrip("}")) if part not in ("", ".")]
-    return not parts or (parts[0].lower() == "profiles" and len(parts) <= 2)
+def _walk(below: List[str], path: str) -> List[str] | None:
+    """The directory the relative *path* names from *below* (parts under a Hermes home), ``..`` read as the shell
+    reads it, or ``None`` above the home. *below* is changed in place."""
+    for part in _PATH_SPLIT_RE.split(path):
+        if part == "..":
+            if not below:
+                return None
+            below.pop()
+        elif part not in ("", "."):
+            below.append(part)
+    return below
+
+
+def _reaches(below: List[str], path: str) -> bool:
+    """A recursive read of the relative *path* from *below* (parts under a Hermes home) reaches a ``.env``: it ends at
+    the home, its ``profiles`` directory or a profile's, or above the home, which holds it, never at a directory
+    beside them (``~/.hermes/skills``); ``..`` goes up a part (``~/.hermes/skills/..`` is the home). *below* is left
+    as it was, and only *path* is walked."""
+    depth, added = len(below), []
+    for part in _PATH_SPLIT_RE.split(path):
+        if part == "..":
+            if added:
+                added.pop()
+            elif depth:
+                depth -= 1
+            else:
+                return True
+        elif part not in ("", "."):
+            added.append(part)
+    if depth + len(added) == 0:
+        return True
+    first = below[0] if depth else added[0]
+    return first.lower() == "profiles" and depth + len(added) <= 2
 
 
 def _active_home() -> str:

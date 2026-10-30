@@ -321,9 +321,10 @@ plugin which cron run is executing, and in a run whose prompt holds the digest's
 ("LibreNMS network digest (read-only).") `librenms_plan`, `librenms_apply` and `librenms_rollback`
 refuse, before any approval prompt, whatever a device's text asks for and whatever the job's prompt was
 edited to say while it keeps that sentence; `hermes librenms apply` or `rollback` in the run's terminal
-is blocked whatever the settings. Nor does the run hand the work on: `delegate_task` and `cronjob_manage`
-refuse in it, since Hermes gives a subagent no cron identity and a job the run created or started is
-another run, so neither would be held. Each refusal is audited (`plan_rejected`, `apply_refused`,
+is blocked whatever the settings. Nor does the run hand the work on: `delegate_task`, `cronjob_manage`,
+the A2A plugin's `a2a_call` and `a2a_orchestrate` and the kanban toolset (`kanban_*`) refuse in it,
+since Hermes gives a subagent no cron identity, a job the run created or started is another run, and an
+A2A peer or a kanban worker is another agent, so none of them would be held. Each refusal is audited (`plan_rejected`, `apply_refused`,
 `rollback_refused`, `delegation_refused`) with the cron job and run in its actor.
 
 ## Tools
@@ -631,8 +632,9 @@ script can tell an apply that went through from one that did not.
 - **The scheduled digest stays read-only.** In a cron run of `librenms:network-digest` (its prompt's
   first sentence, in the run Hermes says is executing) the plan, apply and rollback tools refuse in
   every `write_mode`, and so does `hermes librenms apply|rollback` in its terminal, audited; see
-  [Scheduled digest](#scheduled-digest). The run starts no subagent or cron run, which would not be
-  held: `delegate_task` and `cronjob_manage` refuse in it. A Hermes its terminal starts is a session
+  [Scheduled digest](#scheduled-digest). The run starts no subagent, cron run, A2A peer or kanban
+  worker, which would not be held: `delegate_task`, `cronjob_manage`, `a2a_call`, `a2a_orchestrate`
+  and `kanban_*` refuse in it. A Hermes its terminal starts is a session
   of its own ([SECURITY.md](SECURITY.md#what-the-plugin-does-not-do)).
 - **Every write is diffed first.** Updates send only the fields that differ; unchanged operations
   become `noop` steps.
@@ -671,11 +673,13 @@ script can tell an apply that went through from one that did not.
   file whose `id` is not its name. See [Write modes](#write-modes).
 - **The shell does not read the secrets.** A `terminal`, `execute_code` or `process_manage` call
   that reads `LIBRENMS_TOKEN`, `LIBRENMS_PROXY`, an SNMP credential (`LIBRENMS_SNMP_*`) or a sink's
-  collector token by name (`$LIBRENMS_TOKEN`, `printenv` however it is run, `os.environ[...]`; a
-  presence test such as `[ -n "$LIBRENMS_TOKEN" ] && ...` reads nothing), or that calls the
+  collector token by name (`$LIBRENMS_TOKEN`, `printenv` however it is run, `os.environ[...]`,
+  `os.getenv(r"...")`, `process.env?.…`; a presence test such as `[ -n "$LIBRENMS_TOKEN" ] && ...`
+  reads nothing, unless the call traces with `set -x` or holds a here-document), or that calls the
   LibreNMS API with a token (`Authorization: Bearer` or `X-Auth-Token`, API v0 or v1), is refused
   and audited as `secret_access_refused`. One that reads a Hermes `.env` file (by name, a dotfile
-  glob or a recursive search of the home), or prints an environment that holds them, goes to
+  glob or a recursive search of the home, also after a `cd` into it), or prints an environment that
+  holds them (`env`, also through `sudo --user`, `bash -c` and the like), goes to
   Hermes' approval prompt with the command, audited as `secret_access_requested`. A text heuristic,
   like the CLI block below; the token's role is the limit that holds.
 - **No secrets in plans.** The token appears only in the request header. SNMP credentials are

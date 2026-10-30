@@ -268,11 +268,19 @@ class Guard(ReportCase):
         hook = {"task_id": "cron_t", "session_id": "cron_s"}
         goal = {"goal": "GOAL-7f3a: set purpose on device 1 and apply it", "toolsets": ["librenms"]}
         job = {"action": "create", "schedule": "every 1m", "prompt": "PROMPT-7f3a: apply the newest LibreNMS plan"}
+        task = {"title": "TASK-7f3a", "body": "apply plan lnp-1 on LibreNMS", "assignee": "default"}
         calls = (
             ("delegate_task", goal),
             ("delegate_task", {"tasks": [goal, goal]}),
             ("cronjob_manage", job),
             ("cronjob_manage", {"action": "run", "job_id": "job-other"}),
+            # what 0.14.1 let through: the A2A plugin's peers (this gateway's own endpoint among them) and the kanban
+            # toolset, whose tasks the dispatcher runs as worker agents of the profile they are assigned to
+            ("a2a_call", {"agent": "self", "message": "MSG-7f3a: apply plan lnp-1"}),
+            ("a2a_orchestrate", {"capability": "*", "message": "MSG-7f3a: apply plan lnp-1"}),
+            ("kanban_create", task),
+            ("kanban_unblock", {"task_id": "t_1"}),
+            ("kanban_complete", {"task_id": "t_1", "summary": "done"}),
         )
         for tool, args in calls:  # outside the run: not the guard's
             self.assertIsNone(self.handlers.pre_tool_call(tool_name=tool, args=args, **hook), tool)
@@ -300,8 +308,14 @@ class Guard(ReportCase):
         self.assertIsNone(self.handlers.pre_tool_call(tool_name="delegate_task", args=goal, **hook))
         self.ctx.run = None
         self.assertIsNone(self.handlers.pre_tool_call(tool_name="cronjob_manage", args=job, **hook))
+        self.assertIsNone(self.handlers.pre_tool_call(tool_name="kanban_create", args=task, **hook))
         self.assertEqual(len(self.events("delegation_refused")), len(calls))
-        self.assertEqual(digest.DELEGATION_TOOLS, {"delegate_task", "cronjob_manage"})  # Hermes' names for them
+        # Hermes' names for them (tests/test_plugin_load.py checks them against Hermes); every other tool passes
+        self.assertEqual(digest.DELEGATION_TOOLS, {"delegate_task", "cronjob_manage", "a2a_call", "a2a_orchestrate"})
+        self.assertEqual(digest.DELEGATION_PREFIXES, ("kanban_",))
+        self.ctx.run = run("exec-1")
+        for tool in ("web_search", "memory", "a2a_list", "a2a_discover", "todo", "kanbanize"):
+            self.assertIsNone(self.handlers.pre_tool_call(tool_name=tool, args={}, **hook), tool)
 
     def test_a_delegation_that_cannot_be_checked_is_blocked(self):
         # no handler of ours stands behind a delegation, so a check that fails blocks it, in or out of a digest run

@@ -576,24 +576,32 @@ human to ask blocks the call.
   `TOKEN`, `SECRET`, `PASS` or `KEY`, through a shell, PowerShell, cmd, Perl or PHP expansion,
   `printenv`/`declare -p` wherever it stands in the command (by path, `\printenv`, after `sudo`,
   `env`, `timeout`, `busybox`, or from `xargs`, which hands it the names in its input), or an
-  environment lookup in code; a presence test excepted where a command starts, outside a quoted
-  string, as the whole test, and a braced `${N:+x}`) and a call to the API with a token
+  environment lookup in code, the name in any string form the language writes (`r"..."`, `f"..."`,
+  `'''...'''`, a backtick) and through an optional chain (`process.env?.N`); a presence test excepted
+  where a command starts, outside a quoted string, as the whole test, in a call that neither traces
+  (`set -x`, `bash -x`, `xtrace`, `SHELLOPTS`) nor holds a here-document, and a braced `${N:+x}`)
+  and a call to the API with a token
   (`librenms_api`: `Authorization: Bearer`, `X-Auth-Token` or `api_token` with `/api/v0`,
   `LIBRENMS_URL`, the configured `LIBRENMS_URL`'s host, or `/api/v1` beside the word librenms, since
   Kubernetes, Prometheus and others serve an `/api/v1` too), in every `write_mode`, and tells the
   model the tools carry the token. It returns `approve` for a Hermes `.env` file (`env_file`: named,
-  or reached by a dotfile glob under a home or a recursive `grep -r`, `rg`, `find -exec` of a home,
-  its `profiles` or a profile) and, while this process's environment holds one of the secrets, for
-  a whole-environment print (`environment`; wrappers with their options are skipped to find the
-  command, so `sudo -E env` and `/usr/bin/env` count and `env FOO=1 make` does not), under the rule
+  or reached by a dotfile glob under a home or a recursive `grep -r`, `grep -d recurse`, `rg`,
+  `find -exec` of a home, its `profiles` or a profile, `..` read as the shell reads it, or by a
+  relative path or glob after a `cd` into one) and, while this process's environment holds one of
+  the secrets, for a whole-environment print (`environment`; wrappers with their options, long ones
+  with a value included, and a shell before its `-c` string are skipped to find the command, so
+  `sudo -E env`, `sudo --user root env`, `bash -lc env`, `cmd /c set` and `/usr/bin/env` count and
+  `env FOO=1 make` does not), under the rule
   key `librenms:secret:<tool>:<rule>:<digest of the text>`. Its prompt opens with a line saying what
   the call reads and a line with the command, together within the 300 characters Discord shows; a
   longer command is cut there and says first how many of its characters are not shown. Then what
   Hermes' masking leaves readable. Audited as `secret_access_refused` and `secret_access_requested` with the tool,
   the rule and the variable names, never the text. It reads no settings (only the configured
   `LIBRENMS_URL`, as the client does, when a call carries a token), every pattern is anchored on a
-  literal and runs in linear time (secret names are checked by a string test, not a pattern), and a
-  failure inside it blocks the call with an error id.
+  literal and runs in linear time (secret names are checked by a string test, not a pattern, and a
+  presence test's blanks never take a newline, which starts a command of its own), since a pattern
+  holds Python's interpreter lock while it runs and a slow one would stop every session of the
+  process, and a failure inside it blocks the call with an error id.
 - **Other tools**: both callbacks return immediately, without I/O, for every other tool.
 - Every `approve` the hook returns is audited as `approval_requested` (tool, plan id, rule key,
   digest), or for a shell call as `secret_access_requested`, and `post_approval_response` records the
@@ -769,9 +777,12 @@ for the re-read to settle, not a second request.
   The model cannot set the run's identity; outside cron the sentence holds nothing. Hermes gives a
   delegated child no cron identity (`cron/execution_identity.py`: `current_cron_execution()` is
   `None` while `is_delegated_child_context()`), and a cron job the run creates or starts fires as
-  another run, so neither would be held: `pre_tool_call` therefore blocks `delegate_task` and
-  `cronjob_manage` in a digest run (`digest.delegation_refusal`), audited as `delegation_refused` with
-  the tool, never the goal or prompt. The agent loop fires `pre_tool_call` for them as for any tool,
+  another run, so neither would be held, and neither would an A2A peer (`a2a_call`,
+  `a2a_orchestrate`, which can reach this gateway's own endpoint) or a kanban worker, which Hermes'
+  dispatcher starts as its own process for the profile a task is assigned to: `pre_tool_call`
+  therefore blocks `delegate_task`, `cronjob_manage`, `a2a_call`, `a2a_orchestrate` and every
+  `kanban_*` tool in a digest run (`digest.delegates`, `digest.delegation_refusal`), audited as
+  `delegation_refused` with the tool, never the goal, prompt or task. The agent loop fires `pre_tool_call` for them as for any tool,
   with a legacy name (`cronjob`) already mapped and a `tool_call` bridge call already unwrapped; a
   check that fails blocks the delegation, since no handler of the plugin stands behind it. A failure
   to read the run's identity holds nothing back: the approval prompt and `write_mode` stand as they

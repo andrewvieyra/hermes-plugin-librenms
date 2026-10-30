@@ -6,6 +6,69 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-30
+
+What the final review of 0.14.1 found in the secret guard, the digest's delegation block and the report's untrusted
+marker, each confirmed against the 0.14.1 code first (the guard's cost and bypasses with the reviewers' probes).
+
+### Security
+- The secret guard runs in linear time again. Its presence-test exception took the blanks after a command start as
+  `\s*`, and a newline is both a command start and a blank, so in a call that named `LIBRENMS_` anywhere a run of
+  blank lines was scanned once for every newline in it: 16,000 newlines took 8 seconds in `pre_tool_call`, 64 KB about
+  two minutes. Python's regular expressions hold the interpreter's lock while they run, so every session of a gateway,
+  its cron ticker and its platform adapters stopped for that long, and Hermes' `hook_callback_timeout` could not fire
+  (through Hermes' own plugin manager a 1-second timeout returned after 1.9 seconds). The words of a presence test are
+  now separated by blanks that are never a newline, which starts a command of its own: 200,000 newlines take a tenth
+  of a second. SECURITY.md and docs/architecture.md promised linear time; they now say why it matters.
+- A presence test is no exception in a call that traces or holds a here-document. Under tracing (`set -x`, `set -euxo
+  pipefail`, `bash -x`, `sh -xc`, `set -o xtrace`, `SHELLOPTS`, `BASH_XTRACEFD`) bash prints each test it runs with
+  the value expanded (`+ '[' -n <token> ']'`), and `cat <<EOF | curl -d @- ...` (or a here-string) expands one into
+  what it sends: `set -x; [ -n "$LIBRENMS_TOKEN" ]` printed the whole token, unmasked, with nothing blocked or
+  audited. Such a call is now refused as a read by name.
+- Environment lookups SECURITY.md said were refused are refused: the name in another string form
+  (`os.getenv(r"LIBRENMS_TOKEN")`, `os.environ[f"..."]`, `R"..."`, `b'...'`, `'''...'''`, a backtick string), a
+  keyword argument (`os.getenv(key="...")`), `os.environ.__getitem__("...")`, an optional chain
+  (`process.env?.LIBRENMS_TOKEN`, `process.env?.["..."]`), `process["env"].LIBRENMS_TOKEN`, Rust's
+  `env::var_os("...")` and Ruby's `ENV.values_at("...")`. Each printed the token and passed in 0.14.1.
+- An environment printed through a shell's command string or a wrapper's long option goes to the approval prompt like
+  `env` itself: `bash -c env`, `sh -lc 'env | sort'`, `zsh -o pipefail -c ...`, `subprocess.run(['sh', '-c', 'env'])`,
+  `pwsh -Command 'Get-ChildItem env:'`, `cmd /c set`, `sudo --user root env`, `timeout --signal KILL 5 env`, and
+  Node's `console.log(process.env)` and `JSON.stringify(process.env)`. They passed without a prompt, held only by
+  Hermes' name-based masking, which leaves part of a token, and a password inside `LIBRENMS_PROXY`, readable.
+- A Hermes `.env` reached by a relative path goes to the approval prompt: a dotfile glob or a recursive read after a
+  `cd` into the home, its `profiles` directory or a profile (`cd ~/.hermes && cat .e*`,
+  `cd ~/.hermes && grep -r TOKEN .`, or a recursive grep or searcher given only its pattern there), a path `..` brings
+  back into the home (`~/.hermes/skills/..`), grep's other spelling of `-r` (`-d recurse`, `--directories=recurse`),
+  and a search in a shell's command string (`bash -c 'grep -r TOKEN ~/.hermes'`).
+- A digest run hands no work to an A2A peer or a kanban worker either. 0.14.1 blocked `delegate_task` and
+  `cronjob_manage` only, while the A2A plugin's `a2a_call` and `a2a_orchestrate` send a task to a peer agent (this
+  gateway's own endpoint among them) and Hermes' kanban tools create, release or resume tasks its dispatcher runs as
+  worker agents of the profile they are assigned to (`kanban_create` starts one; `kanban_unblock` and
+  `kanban_complete` release one), none of them with the run's cron identity. Where a profile has those opt-in toolsets
+  on, a digest run could pass "apply plan X" to such an agent, whose write met only the approval prompt. In a digest
+  run `pre_tool_call` now blocks `a2a_call`, `a2a_orchestrate` and every `kanban_*` tool as well (`digest.delegates`),
+  audited as `delegation_refused` without the message or the task; outside one they pass as before.
+- A devices row's `type` and `status_reason` and a find candidate's `type` are named in `untrusted_fields`: anyone
+  with `device.update` in LibreNMS can set a device's type through its API, and these reached the model unmarked
+  beside marked hostnames. A scope whose `os` or `type` names no device now lists the values LibreNMS holds in the
+  scope (`scope.os.held`, marked, with `held_count` past 30) rather than in a note, which is the plugin's own text and
+  never marked.
+
+### Changed
+- SECURITY.md (the digest and secret rows, the hooks row, what the guard does not hold), README (Scheduled digest,
+  Safety model), the workflow skill, docs/architecture.md (the secret guard, the digest's run guard) and docs/audit.md
+  (`delegation_refused`) say so.
+- Tests: linear time on runs of newlines, newline and blank pairs, indented blank lines, keywords and `!` between
+  them, a test followed by newlines, shells, `cd`s, `..` and optional chains; a presence test under each tracing form
+  and in a here-document or here-string blocked, and with `set +x` or `set -e` still excepted; each new lookup form
+  blocked; each shell, PowerShell, cmd and long-option dump asked about, while `bash deploy.sh env`, `bash -c 'set
+  -euo pipefail; make'`, `sh -c "env FOO=1 make"` and `sudo --preserve-env make` pass; each relative and `..` read of
+  a home asked about, while a directory beside the `.env`, a read that is not recursive and a `cd` out of the home
+  pass; the A2A and kanban tools blocked and audited in a digest run and passing outside it, with other tools
+  untouched; the marked device keys and the held values. Through Hermes (`make test-hermes`): the names are Hermes'
+  (the A2A plugin's tools, every tool of the kanban toolset) and the agent loop's `pre_tool_call` dispatch blocks
+  `kanban_create` and `a2a_call` in a digest run.
+
 ## [0.14.1] - 2026-10-29
 
 What the review of 0.14.0 found in the scheduled digest, each confirmed against the 0.14.0 code first.

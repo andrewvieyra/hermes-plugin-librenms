@@ -631,19 +631,27 @@ class LoadThroughPluginManager(unittest.TestCase):
 
     def test_the_digest_run_starts_no_other_agent(self):
         # Hermes gives a delegated child no cron identity, so the run itself must not delegate: the pre_tool_call
-        # dispatch the agent loop runs blocks delegate_task and cronjob_manage in the run, and only there. (Named to
+        # dispatch the agent loop runs blocks the tools that start another agent in the run, and only there. (Named to
         # run after test_registration_through_real_loader, as _dispatching_plugin says.)
         import model_tools  # noqa: F401  (registers Hermes' own tools)
         from agent.delegation_context import delegated_child_context
         from agent.tool_executor import _canonical_tool_name
         from cron.execution_identity import current_cron_execution, enter_cron_execution, exit_cron_execution
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+        from plugins.platforms.a2a import tools as a2a_tools
         from tools.registry import registry
 
         plugin, fake, _plan_id = self._dispatching_plugin()
         digest = plugin.digest
-        for name in digest.DELEGATION_TOOLS:  # Hermes' own names for the tools that start another agent
+        # Hermes' own names for the tools that start another agent: its own, the A2A plugin's that send a peer a
+        # task, and the kanban toolset, every tool of which the prefix covers
+        for name in ("delegate_task", "cronjob_manage"):
             self.assertIsNotNone(registry.get_entry(name), name)
+        self.assertLessEqual({"a2a_call", "a2a_orchestrate"}, set(a2a_tools._TOOLS))
+        self.assertEqual(digest.DELEGATION_TOOLS, {"delegate_task", "cronjob_manage", "a2a_call", "a2a_orchestrate"})
+        kanban = registry.get_tool_names_for_toolset("kanban")
+        self.assertIn("kanban_create", kanban)
+        self.assertTrue(all(digest.delegates(name) for name in kanban), kanban)
         self.assertEqual(_canonical_tool_name("cronjob"), "cronjob_manage")  # the legacy name reaches hooks as this
         goal = {"goal": "set device 1's purpose to leaf and apply it", "toolsets": ["librenms"]}
         job = {"action": "run", "job_id": "job-other"}
@@ -653,7 +661,13 @@ class LoadThroughPluginManager(unittest.TestCase):
         try:
             prompt = digest.PROMPT.format(group="all", rows="10", all_clear="send")
             self.mgr.invoke_hook("pre_llm_call", session_id="cron_s", task_id="cron_t", user_message=prompt)
-            for name, args in (("delegate_task", goal), ("cronjob_manage", job)):
+            task = {"title": "apply it", "body": "set device 1's purpose to leaf and apply it", "assignee": "default"}
+            for name, args in (
+                ("delegate_task", goal),
+                ("cronjob_manage", job),
+                ("kanban_create", task),
+                ("a2a_call", {"agent": "self", "message": "apply it"}),
+            ):
                 block, _modified = _dispatch_pre_tool_call_hooks(name, args, **ids)
                 self.assertEqual(block, digest.DELEGATION_REFUSAL.format(tool=name))
             # why: the child delegate_task would start reads no cron run, so the write tools would not refuse in it

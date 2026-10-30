@@ -56,7 +56,10 @@ LOG_MIN_PAGE = 25  # the fewest a request asks for while LibreNMS's answer is to
 EARLIEST_OFFSET_S = 12 * 3600
 LATEST_OFFSET_S = 14 * 3600
 # The keys of a candidate row that hold text from LibreNMS.
-CANDIDATE_TEXT = ("hostname", "display", "sysName", "location", "purpose", "hardware", "name", "desc", "port", "why")
+CANDIDATE_TEXT = (
+    "hostname", "display", "sysName", "location", "purpose", "hardware", "type", "name", "desc", "port", "why"
+)  # fmt: skip
+HELD_SHOWN = 30  # the os or type values a scope that names none shows
 # LibreNMS's device states, as its Device scopes decide them (isDisabled, isIgnored, isDown, isUp), first wins.
 STATES = ("disabled", "ignored", "down", "up")
 # A fault's state (LibreNMS's AlertState), and the ones a fault is open in.
@@ -781,10 +784,12 @@ class ReportContext:
             if key in raw:
                 wanted = term_arg(f"scope.{key}", raw[key])
                 ids = {i for i, d in devices.items() if str(d.get(key) or "").casefold() == wanted.casefold()}
-                if not ids:
+                if not ids:  # what LibreNMS holds goes in the scope, marked, not in a note
                     held = sorted({str(d.get(key)) for d in devices.values() if d.get(key)}, key=natural_key)
-                    self.notes.append(f"no device has {key} {_shown(wanted)}; the {key} values LibreNMS holds: "
-                                      + ", ".join(held[:30]) + (" ..." if len(held) > 30 else ""))  # fmt: skip
+                    summary[key] = {"held": held[:HELD_SHOWN], **({"held_count": len(held)} if len(held) > HELD_SHOWN
+                                                                  else {})}  # fmt: skip
+                    self.notes.append(f"no device has {key} {_shown(wanted)}; scope.{key}.held lists the {key} values "
+                                      "LibreNMS holds")  # fmt: skip
                 chosen = ids if chosen is None else chosen & ids
         port_ids = None
         if "port_group" in raw:
@@ -983,7 +988,7 @@ class ReportContext:
 
 def _scope_text(summary: Dict[str, Any]) -> List[str]:
     """The keys of a scope summary that hold text from LibreNMS: device names, why a phrase matched, a group's name,
-    the locations."""
+    the locations, the os or type values held when none is the one asked for."""
     keys = []
     if summary.get("devices") or summary.get("resolved"):
         keys += ["hostname", "display"]
@@ -993,6 +998,8 @@ def _scope_text(summary: Dict[str, Any]) -> List[str]:
         keys.append("name")
     if (summary.get("location") or {}).get("locations"):
         keys.append("locations")
+    if any((summary.get(key) or {}).get("held") for key in ("os", "type")):
+        keys.append("held")
     return keys
 
 
