@@ -1,7 +1,7 @@
 ---
 name: librenms-ask
 description: Answer questions about the network as LibreNMS sees it, over several turns, with the read-only librenms_report and librenms_query tools. Load when the user asks what is down, alerting or flapping, how busy a port or link is, link speeds and duplex, port descriptions and device names, LLDP/CDP neighbours, where a MAC or IP address is, VLANs, sensors and optics, BGP or OSPF sessions, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.12.1
+version: 0.13.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, network, questions]
@@ -27,7 +27,8 @@ none, or when you have no `tool_search` at all. The LibreNMS tools are then not 
 for one of two reasons: `LIBRENMS_URL` and `LIBRENMS_TOKEN` are not set in this profile's `.env`, or the
 `librenms` toolset is turned off for this platform or task (`hermes tools` turns it on). Tell the user both,
 so they can fix the one that applies and start a new session, and stop: do not reach LibreNMS another way
-(a terminal, code, a browser).
+(a terminal, code, a browser). Do not read those variables or the `.env` from a shell to check either;
+`/librenms status`, which the user can run, says what is missing.
 
 ## How to answer
 

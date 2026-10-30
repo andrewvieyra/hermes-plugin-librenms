@@ -79,7 +79,10 @@ hermes plugins install andrewvieyra/hermes-plugin-librenms
 
 Hermes prompts for `LIBRENMS_URL` and `LIBRENMS_TOKEN` and stores them in the active profile's
 `.env`: `~/.hermes/.env` for the default profile, `~/.hermes/profiles/<name>/.env` for a named one.
-Then:
+It then shows the plugin's setup notes ([after-install.md](after-install.md)): a least-privilege
+token, `operator_only` where other people or automation reach the agent, the approval prompt on, no
+local shell for the model, and `/librenms status`. Only `hermes plugins install` shows them; an
+install from the Desktop or the dashboard does not, so read the file there. Then:
 
 ```bash
 hermes plugins enable librenms
@@ -110,10 +113,12 @@ to unmask device credentials receives SNMP communities and passwords in device p
 refuses the rediscovery route in `librenms_query` (and any path that would reach it through an
 encoded `/`), never writes the eventlog, and masks credential fields in every result, but a token without those rights is the safeguard LibreNMS enforces itself.
 Hermes does not hide a standalone plugin's environment from the agent's terminal tool, so a model
-with that tool can read `LIBRENMS_TOKEN`, `LIBRENMS_PROXY` and the `LIBRENMS_SNMP_*` credentials:
-scope the token accordingly. Hermes masks a value in a printed environment by the variable's name,
-which covers `LIBRENMS_TOKEN` and the SNMP credential names the plugin accepts, but not a password
-inside `LIBRENMS_PROXY`. See [SECURITY.md](SECURITY.md).
+with that tool can read `LIBRENMS_TOKEN`, `LIBRENMS_PROXY` and the `LIBRENMS_SNMP_*` credentials.
+The plugin refuses a terminal or code call that reads one of them by name or calls the LibreNMS API
+with a token, and asks you before one reads a Hermes `.env` file or prints an environment holding
+them, but that is a heuristic a script or an encoding passes: scope the token accordingly. Hermes
+masks a value in a printed environment by the variable's name, not always whole (part of the token
+can show) and not a password inside `LIBRENMS_PROXY`. See [SECURITY.md](SECURITY.md).
 
 ### Configuration
 
@@ -594,6 +599,14 @@ script can tell an apply that went through from one that did not.
   made while the prompt was open, another plan saved under the same id), then runs exactly the plan
   it checked. A model's call that no prompt showed while one was due is refused, and so is a plan
   file whose `id` is not its name. See [Write modes](#write-modes).
+- **The shell does not read the secrets.** A `terminal`, `execute_code` or `process_manage` call
+  that reads `LIBRENMS_TOKEN`, `LIBRENMS_PROXY`, an SNMP credential (`LIBRENMS_SNMP_*`) or a sink's
+  collector token by name (`$LIBRENMS_TOKEN`, `printenv`, `os.environ[...]`; a presence test such as
+  `[ -n "$LIBRENMS_TOKEN" ]` reads nothing), or that calls the LibreNMS API with a token, is refused
+  and audited as `secret_access_refused`. One that reads a Hermes `.env` file, or prints an
+  environment that holds them, goes to Hermes' approval prompt with the command, audited as
+  `secret_access_requested`. A text heuristic, like the CLI block below; the token's role is the
+  limit that holds.
 - **No secrets in plans.** The token appears only in the request header. SNMP credentials are
   environment references in the plan and are resolved only while the step runs. Credential fields
   (communities, SNMP passwords, service parameters) are masked in every tool result and audit event;
@@ -635,7 +648,8 @@ do. `write_mode` adds the lock:
 The model can reach a shell through Hermes' terminal tool, so the plugin also blocks a terminal or
 code call that runs `hermes librenms apply` or `rollback`, and the same line written to a background
 shell's input (`process_manage`), and the CLI refuses those subcommands when it was started from an
-agent session, unless `write_mode` is `full` and `require_approval` is off.
+agent session, unless `write_mode` is `full` and `require_approval` is off. The secret guard
+([above](#safety-model)) holds in every `write_mode`.
 Both are heuristics an obfuscated command can evade; the token's role is the hard limit.
 
 Plans persist across every Hermes surface on the same `HERMES_HOME`, so `operator_only` supports
@@ -701,8 +715,9 @@ Every plan, apply and rollback is recorded for review and for SIEM ingestion:
   itself.
 - **In an append-only event stream**, `<HERMES_HOME>/plugin-data/librenms/audit.jsonl`, one JSON
   object per line: `plan_created`, `apply_started`, `step_done`, `apply_finished`, `rollback_*`,
-  `approval_requested`, `approval_decided`, and the refusals and rejections that never reached
-  LibreNMS. It is rotated at 10 MiB and daily, and rotated files are deleted after 90 days or past
+  `approval_requested`, `approval_decided`, the refusals and rejections that never reached
+  LibreNMS, and the shell calls the secret guard refused or asked about (`secret_access_refused`,
+  `secret_access_requested`). It is rotated at 10 MiB and daily, and rotated files are deleted after 90 days or past
   the newest 100 (`audit_max_mb`, `audit_retention_days`, `audit_keep_files`), each deletion recorded
   as `audit_pruned`.
 
@@ -754,7 +769,7 @@ Layout:
 plugin.yaml   manifest (tools, hooks, env, settings schema)
 __init__.py   register(ctx)
 schemas.py    tool schemas the model sees
-handlers.py   tool handlers, the write_mode gate, the approval, approval-binding and request hooks
+handlers.py   tool handlers, the write_mode gate, the approval, approval-binding and request hooks, the shell guards
 commands.py   /librenms slash command and `hermes librenms` CLI
 client.py     LibreNMS REST client (transport checks, errors, retries, size caps)
 routes.py     the read-route allow-list behind librenms_query
@@ -773,6 +788,7 @@ settings.py   operator settings, fail-closed
 SKILL.md      bundled skill librenms:workflow: the change workflow the model follows
 skills/ask/   bundled skill librenms:ask: answering questions, the question-to-call table, follow-ups
 examples/     plan payloads, and conversations the tests run
+after-install.md  the setup notes `hermes plugins install` prints
 ```
 
 ## License

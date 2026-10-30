@@ -332,6 +332,20 @@ class LoadThroughPluginManager(unittest.TestCase):
         )
         self.assertEqual(mgr.invoke_hook("pre_tool_call", tool_name="web_search", args={"query": "x"}), [])
 
+        # the shell guard as Hermes invokes it: a secret read by name is blocked, a .env read asked about, a plain
+        # command left alone
+        def shell(command):
+            return mgr.invoke_hook(
+                "pre_tool_call", tool_name="terminal", args={"command": command}, task_id="t", session_id="s"
+            )
+
+        [blocked] = shell('curl -H "X-Auth-Token: $LIBRENMS_TOKEN" "$LIBRENMS_URL/api/v0/devices"')
+        self.assertEqual(blocked, {"action": "block", "message": mod.handlers.API_BLOCK})
+        [asked] = shell("cat ~/.hermes/.env")
+        self.assertEqual(asked["action"], "approve")
+        self.assertTrue(asked["rule_key"].startswith("librenms:secret:terminal:env_file:"))
+        self.assertEqual(shell("ls -la"), [])
+
     def test_under_the_default_tool_search_the_tools_are_deferred_yet_found_and_approved(self):
         # tools.tool_search.enabled is "auto" by default: the model is given tool_search / tool_describe / tool_call
         # and a catalog line per plugin tool, the first sentence of its description cut at 60 characters

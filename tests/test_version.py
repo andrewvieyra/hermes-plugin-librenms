@@ -1,6 +1,6 @@
 """Consistency of what ships beside the code: one version everywhere, a manifest that declares every tool, hook and
 setting the code registers or reads (as Hermes' validate checks), README and the two skills documenting them, the
-schema budget, the requests floor, and examples that still plan."""
+install notes, the schema budget, the requests floor, and examples that still plan."""
 
 from __future__ import annotations
 
@@ -338,6 +338,57 @@ class Documentation(unittest.TestCase):
         for word in ("`librenms:ask`", "/librenms:ask", "examples/conversations/"):
             self.assertIn(word, text)
         self.assertGreaterEqual(text.count("you    >"), 4)  # dialogues, with follow-ups
+
+
+class AfterInstall(unittest.TestCase):
+    """after-install.md: what ``hermes plugins install`` prints (as Markdown, in place of its generic panel) once it has
+    asked for the variables, the one moment a user is sure to read setup text. Hermes' install scan reads it as text
+    a model is given, at full severity."""
+
+    def setUp(self):
+        path = REPO_ROOT / "after-install.md"  # Hermes reads <plugin dir>/after-install.md
+        self.assertTrue(path.is_file(), "after-install.md is missing")
+        self.text = path.read_text(encoding="utf-8")
+        self.flat = " ".join(self.text.split())
+
+    def test_it_gives_the_security_setup_steps(self):
+        for step in (
+            "least-privilege token",
+            "`global-read`",
+            "never `admin`",
+            "`write_mode: operator_only`",
+            "`plugins.entries.librenms.settings`",
+            "`require_approval: true`",
+            "YOLO",
+            "container or remote backend",
+            "`hermes plugins enable librenms`",
+            "`/librenms status`",
+            "SECURITY.md",
+        ):
+            self.assertIn(step, self.flat)
+
+    def test_what_it_names_exists(self):
+        defaults, modes = settings_defaults(), submodule("settings").WRITE_MODES
+        named = re.findall(r"`(\w+): (\w+)`", self.text)
+        self.assertGreaterEqual({name for name, _value in named}, {"write_mode", "require_approval"})
+        for name, value in named:
+            if name in defaults:
+                self.assertEqual(type(scalar(value)), type(defaults[name]), name)
+            if name == "write_mode":
+                self.assertIn(value, modes)
+        for mode in re.findall(r"`(\w+_only)`", self.text):
+            self.assertIn(mode, modes)
+        for name in ("README.md", "SECURITY.md"):  # where an install from the Desktop, which shows none of it, points
+            self.assertIn("[after-install.md](after-install.md)", (REPO_ROOT / name).read_text(encoding="utf-8"))
+
+    def test_it_holds_nothing_the_install_scan_or_a_model_would_act_on(self):
+        lowered = self.text.lower()
+        for pattern in HERMES_INJECTION_PATTERNS:
+            self.assertNotIn(pattern, lowered)
+        for token in (*HERMES_EXPANDS, "${", "curl ", "wget ", "| sh", "| bash"):
+            self.assertNotIn(token, self.text)
+        hidden = [f"U+{ord(c):04X}" for c in self.text if unicodedata.category(c) in ("Cf", "Cc") and c != "\n"]
+        self.assertEqual(hidden, [])
 
 
 # Hermes' rule for a deferred tool's catalog line (tools/tool_search_catalog.py, _short_desc): the description's

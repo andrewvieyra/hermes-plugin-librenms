@@ -40,7 +40,7 @@ v0 route to what the plugin does with it.
 | `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
 | `settings` | Operator settings with fail-closed coercion (a time zone the host's zone database does not hold is refused) | Hermes `ctx.get_config` (optional) |
 | `schemas` | Tool schemas | none |
-| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks, the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
+| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks (the shell tools' guards against the CLI's writes and the plugin's secrets among them), the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
 | `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
 | `__init__` | `register(ctx)` | all |
 
@@ -569,10 +569,24 @@ human to ask blocks the call.
   from their own terminal; in `read_only`, that writes are disabled and queries and plans still work.
   The block is audited as `apply_refused` or `rollback_refused` with `reason: "blocked in the agent's
   terminal/execute_code"`, `tool`, `write_mode` and the plan id it names, never the command text.
+- **Secrets**: when the write block lets the same call through, the secret guard reads its text. It
+  blocks a read of one of the plugin's secrets by name (`secret_variable`: `LIBRENMS_TOKEN`,
+  `LIBRENMS_PROXY`, `LIBRENMS_SNMP_*`, `LIBRENMS_AUDIT_SINK_SECRET` and any `LIBRENMS_` name holding
+  `TOKEN`, `SECRET`, `PASS` or `KEY`, through a shell, PowerShell, cmd, Perl or PHP expansion,
+  `printenv`/`declare -p`, or an environment lookup in code; presence tests excepted) and a call to the
+  API with a token (`librenms_api`: `X-Auth-Token` or `api_token` with `/api/v0` or `LIBRENMS_URL`),
+  in every `write_mode`, and tells the model the tools carry the token. It returns `approve` for a
+  Hermes `.env` file (`env_file`) and, while this process's environment holds one of the secrets,
+  for a whole-environment print (`environment`), with a prompt that names what Hermes' masking leaves
+  readable and the command, cut to one line, under the rule key
+  `librenms:secret:<tool>:<rule>:<digest of the text>`. Audited as `secret_access_refused` and
+  `secret_access_requested` with the tool, the rule and the variable names, never the text. It reads
+  no settings, every pattern is anchored on a literal and runs in linear time, and a failure inside
+  it blocks the call with an error id.
 - **Other tools**: both callbacks return immediately, without I/O, for every other tool.
 - Every `approve` the hook returns is audited as `approval_requested` (tool, plan id, rule key,
-  digest), and `post_approval_response` records the decision as `approval_decided` (choice, tool,
-  plan id, digest).
+  digest), or for a shell call as `secret_access_requested`, and `post_approval_response` records the
+  decision as `approval_decided` (choice, tool, plan id or rule, digest).
   Hermes decides some requests without a person and without `post_approval_response`, so a request
   with no decision after it shows one passed or blocked by policy.
 
@@ -592,6 +606,8 @@ the setting the plugin controls, and the one to use on a profile that serves una
 | `/librenms apply`, `/librenms rollback` | yes | yes | refused |
 | `hermes librenms apply`, `rollback` | yes; from a shell an agent session started, only when `require_approval` is off | yes, but not from a shell an agent session started | refused |
 | `terminal` / `execute_code` / `process_manage` input running `hermes librenms apply\|rollback` | blocked unless `require_approval` is off | blocked | blocked |
+| The same input reading a plugin secret by name, or calling the API with a token | blocked | blocked | blocked |
+| The same input reading a Hermes `.env`, or printing an environment that holds a plugin secret | approval prompt | approval prompt | approval prompt |
 
 "A shell an agent session started" is detected by `HERMES_SESSION_ID` or `HERMES_SESSION_KEY` in
 the environment, which Hermes binds into its terminal tool's children. Every refusal is audited
@@ -719,6 +735,13 @@ for the re-read to settle, not a second request.
   and declared in `provides_hooks`; `pre_tool_call` takes two callbacks, the approval prompt and then
   `bind_approval` ([The approval hook](#the-approval-hook)). `pre_llm_call` remembers the user's
   message per session for the actor record ([audit.md](audit.md)).
+- `after-install.md` at the repository root is what `hermes plugins install` prints, as Markdown in a
+  panel, after it has asked for `LIBRENMS_URL` and `LIBRENMS_TOKEN` and whether to enable the plugin
+  (`hermes_cli/plugins_cmd_install.py`, `_display_after_install`), in place of its generic
+  "Plugin installed" panel. The dashboard and Desktop installs return its path, which the dashboard
+  drops and no client shows, so the README and SECURITY.md say the same. Hermes' install scan reads
+  it as agent-facing, at full severity, so it holds only steps for a person (no command for a model
+  to run, no link carrying a variable); tests/test_version.py checks it.
 - The plan store and the audit file follow the active Hermes profile: `plugins.plugin_storage.
   plugin_data_dir` when available, with a `$HERMES_HOME/plugin-data/librenms` fallback, resolved on
   every use.

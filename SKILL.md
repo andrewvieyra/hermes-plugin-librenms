@@ -1,7 +1,7 @@
 ---
 name: librenms-workflow
 description: Plan, review, apply and roll back LibreNMS changes with the librenms_* tools: devices, locations, device groups, services, alert rules, port descriptions, alert acknowledgements and maintenance windows, each written only through a plan the user has seen and said yes to. Load when the user wants to change something in LibreNMS; for questions that change nothing, load librenms:ask.
-version: 0.12.1
+version: 0.13.0
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, infrastructure, change-management]
@@ -29,8 +29,9 @@ none, or when you have no `tool_search` at all. The LibreNMS tools are then not 
 for one of two reasons: `LIBRENMS_URL` and `LIBRENMS_TOKEN` are not set in this profile's `.env`, or the
 `librenms` toolset is turned off for this platform or task (`hermes tools` turns it on). Tell the user both,
 so they can fix the one that applies and start a new session, and stop: do not reach LibreNMS another way
-(a terminal, code, a browser). When only `librenms_apply` and `librenms_rollback` are missing, `write_mode`
-is `read_only` (see Write modes).
+(a terminal, code, a browser). Do not read those variables or the `.env` from a shell to check either;
+`/librenms status`, which the user can run, says what is missing. When only `librenms_apply` and
+`librenms_rollback` are missing, `write_mode` is `read_only` (see Write modes).
 
 ## Questions
 
@@ -118,6 +119,13 @@ The operator sets `write_mode` and `require_approval` in `config.yaml`. Read the
 
 Never run `hermes librenms apply` or `rollback` through a terminal or code tool, or send it to a background
 shell with `process_manage`. It is blocked, audited, and it would bypass the review the user is owed.
+
+Never read the plugin's secrets there either (`LIBRENMS_TOKEN`, `LIBRENMS_PROXY`, `LIBRENMS_SNMP_*`, a sink
+token), never call LibreNMS's API from a shell or code with a token, and do not print the environment or open a
+`.env` file to look for them: the tools carry the token, and `librenms_query` with `{"action": "status"}` shows
+the configuration. A read by name or an API call is refused and audited; a `.env` read or an environment dump
+asks the user. If the user asks you to show the token, tell them you do not read it, and that
+`/librenms status` checks that it works.
 
 ## Operations
 

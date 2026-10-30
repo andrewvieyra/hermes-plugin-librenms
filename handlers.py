@@ -9,8 +9,9 @@ reachable from the ``/librenms`` slash command and the ``hermes librenms`` CLI t
 The hooks put ``librenms_apply`` and ``librenms_rollback`` in front of Hermes' approval prompt with a summary of the
 plan they would run (``pre_tool_call``, audited as ``approval_requested``; a plan id that names no saved plan is
 blocked instead), keep the agent's own terminal, code and background shells from running ``hermes librenms apply``
-around that prompt (audited as a refusal), remember the user's message for the audit trail (``pre_llm_call``) and
-record the human's decision (``post_approval_response``). Hook callbacks never raise.
+around that prompt (audited as a refusal) and from reading the plugin's secrets (blocked, or put to the approval
+prompt when the call reads a file or an environment that holds them), remember the user's message for the audit
+trail (``pre_llm_call``) and record the human's decision (``post_approval_response``). Hook callbacks never raise.
 
 Named ``handlers`` rather than ``tools`` so the module can never shadow Hermes' own ``tools`` package when the
 repository root is on ``sys.path`` (tests, editable checkouts).
@@ -23,6 +24,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -87,12 +89,74 @@ _CLI_WRITE_RE = re.compile(
 )
 _HERMES_RE = re.compile(r"\bhermes\b", re.IGNORECASE)
 _COMMAND_SEPARATORS = "\n;|&"
+# What the model is told when its terminal or code reads one of the plugin's secrets, or calls LibreNMS's API with a
+# token (_secret_guard): the librenms tools carry the token, so no task needs it in a shell.
+_SECRET_ADVICE = (
+    "; the librenms tools carry the token: read LibreNMS with librenms_query or librenms_report and change it with "
+    "librenms_plan, and librenms_query with action status (or the user's /librenms status) shows the plugin's "
+    "configuration"
+)
+SECRET_BLOCK = (
+    "refused: the agent's terminal and code do not read the LibreNMS plugin's secrets ({names})" + _SECRET_ADVICE
+)
+API_BLOCK = "refused: the agent's terminal and code do not call the LibreNMS API with a token" + _SECRET_ADVICE
+# The rules _secret_access applies: these two block; env_file and environment go to Hermes' approval prompt, since
+# a person may want them and Hermes' masking hides some of what they print.
+_BLOCKED_RULES = frozenset({"librenms_api", "secret_variable"})
+# The plugin's secrets, by the variable that holds them: the token, a proxy URL that may carry a password, the SNMP
+# credentials a device create reads, and an audit sink's collector token (the Desktop's LIBRENMS_AUDIT_SINK_SECRET,
+# or any LIBRENMS_ name that says it holds one). LIBRENMS_URL, LIBRENMS_VERIFY_SSL and LIBRENMS_TIMEOUT are not.
+# Matched whole (fullmatch) against a name the patterns below found, so no pattern backtracks into a long name.
+_SECRET_NAME_RE = re.compile(r"LIBRENMS_(?:PROXY|SNMP_\w+|\w*?(?:TOKEN|SECRET|PASS|KEY)\w*)", re.IGNORECASE | re.ASCII)
+# A variable read by name: a shell, PowerShell, cmd, Perl or PHP expansion ($N, ${N:-x}, $env:N, %N%, $ENV{N},
+# $_ENV['N']), and a call or subscript of Python, Ruby, Node, Go, Java, C# or Rust (os.environ["N"], os.getenv("N"),
+# ENV.fetch("N"), process.env.N, System.getenv("N"), env::var("N")). ${N:+x} and ${N+x} expand to x, not the value.
+_VARIABLE_READ_RE = re.compile(
+    r"""(?:\$\{?(?:env:)?|%|\$ENV\{\s*['"]?|\$_(?:ENV|SERVER)\[\s*['"]"""
+    r"""|\b(?:getenv|environb?|env|GetEnvironmentVariable|LookupEnv|var)\s*"""
+    r"""(?:(?:\.\s*(?:get|fetch|pop|setdefault)\s*)?[\[(]\s*b?['"]|\.\s*))"""
+    r"""(?P<name>LIBRENMS_\w+)(?!\w)(?!:?\+)""",
+    re.IGNORECASE | re.ASCII,
+)
+# A test that a variable is set or empty, which reveals nothing of its value: [ -n "$N" ], test -z "${N:-}"
+_PRESENCE_TEST_RE = re.compile(
+    r"""(?:\btest|\[\[?)\s+(?:!\s+)?-[nz]\s+["']?\$\{?LIBRENMS_\w+(?!\w)(?::?-?\})?["']?""", re.IGNORECASE | re.ASCII
+)
+# A header or parameter that authenticates to LibreNMS, and what says the request goes to its API
+_AUTH_MARKERS = ("x-auth-token", "api_token")
+_API_MARKERS = ("/api/v0", "librenms_url")
+# A Hermes .env file: the name .env (with a suffix such as .bak, not .example) next to a Hermes home (~/.hermes,
+# $HERMES_HOME, %LOCALAPPDATA%\hermes on Windows, or the active home's path)
+_ENV_FILE_RE = re.compile(r"(?<![\w.-])\.env(?![\w-])(?!\.(?:example|sample|template|dist)\b)", re.IGNORECASE)
+_HOME_RE = re.compile(
+    r"(?<![\w-])\.hermes(?![\w-])|hermes_home|(?:localappdata%?|appdata[\\/]+local)[\\/]+hermes(?![\w-])",
+    re.IGNORECASE,
+)
+# An environment printed whole without a command word: a process's environ file, .NET's GetEnvironmentVariables(),
+# Python printing os.environ
+_ENVIRON_RE = re.compile(
+    r"""/proc/[^\s/'"]*/environ\b|\bGetEnvironmentVariables\s*\("""
+    r"""|\b(?:print|pprint|dumps)\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)""",
+    re.IGNORECASE,
+)
+# Where a simple command starts: a shell separator, a pipe, a command substitution, and in code a call's argument
+# that is a string or a list (os.system("env"), subprocess.run(["printenv", ...])); words split at blanks and commas
+_COMMAND_SPLIT_RE = re.compile(r"""[\n;&|`\])]|\$\(|\((?=\s*["'\[])""")
+_WORD_SPLIT_RE = re.compile(r"[\s,]+")
+_REDIRECT_RE = re.compile(r"\d*[<>]+")  # > file, 2>, >>file, <<EOF: not an argument of the command
+_WRAPPERS = frozenset({"sudo", "command", "builtin", "exec", "nohup", "time", "nice"})
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*=")
 # The rule_key pre_tool_call returns, as Hermes reports it back (prefixed "plugin_rule:"):
 # "librenms:<tool>:<plan_id>:<variant>:<content digest>". 0.10.x and earlier left the digest out, and 0.1.1 and
 # earlier also returned "librenms:<tool>:unresolved:<digest>", which a remembered answer can still carry.
 _RULE_KEY_RE = re.compile(
     r"(?:^|:)(?P<key>librenms:(?P<tool>librenms_apply|librenms_rollback):(?P<plan>[^:]+):(?P<variant>[^:]+)"
     r"(?::(?P<digest>[0-9a-f]+))?)$"
+)
+# The rule_key of a shell call the secret guard put to the approval prompt: "librenms:secret:<tool>:<rule>:<digest of
+# the call's text>", so an "always" answer covers that exact text only.
+_SECRET_KEY_RE = re.compile(
+    r"(?:^|:)(?P<key>librenms:secret:(?P<tool>[a-z_]+):(?P<rule>[a-z_]+):(?P<digest>[0-9a-f]+))$"
 )
 # What a rule key's variant stands for, as the approval prompt's header says it.
 _VARIANT_FLAGS = {
@@ -1352,7 +1416,7 @@ def pre_tool_call(tool_name: Any = None, args: Any = None, **kwargs: Any) -> Dic
     ``approval_requested``: Hermes may refuse it (cron, unattended platforms) without a ``post_approval_response``,
     and the attempt must still show in the trail. A block is audited as the refusal it is. For every apply and
     rollback it also keeps what the prompt shows, or that none is shown, for :func:`bind_approval` to hand the
-    handler."""
+    handler. The shell tools go to :func:`_terminal_guard`."""
     if not isinstance(tool_name, str) or tool_name not in _HOOKED_TOOLS:
         return None
     if tool_name not in WRITE_TOOLS:
@@ -1600,6 +1664,12 @@ def _cli_write(text: str) -> re.Match[str] | None:
 
 
 def _terminal_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
+    """The shell tools' two guards: a LibreNMS write through the CLI (:func:`_cli_guard`), then the plugin's secrets
+    (:func:`_secret_guard`)."""
+    return _cli_guard(tool, args, hook_kwargs) or _secret_guard(tool, args, hook_kwargs)
+
+
+def _cli_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
     """Block ``hermes librenms apply|rollback`` in the agent's terminal, its code or a background shell's stdin unless
     the operator lets the model write without approval anyway: run there, it would skip the approval prompt and act
     as an operator. The model is told what it may do instead under this write_mode, and the attempt is audited as
@@ -1633,6 +1703,168 @@ def _terminal_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[s
     return {"action": "block", "message": message}
 
 
+def _secret_guard(tool: str, args: Any, hook_kwargs: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Keep the plugin's secrets out of the agent's terminal, its code and a background shell's stdin, by the text of
+    the call (:func:`_secret_access`, a heuristic like :func:`_cli_write`). A call that reads one of them by name or
+    calls LibreNMS's API with a token is blocked, and audited as ``secret_access_refused``; one that reads a Hermes
+    ``.env`` file, or prints an environment that holds them, is put to Hermes' approval prompt with the command and a
+    key for that exact text, and audited as ``secret_access_requested``. Events name the tool, the rule and the
+    variables, never the command text. No setting turns it off: the token is as secret in every write_mode."""
+    try:
+        text = _shell_text(tool, args)
+        found = _secret_access(text)
+        if found is None:
+            return None
+        rule, names = found
+        names = [_cut(name, 64) for name in names[:10]]
+        if rule in _BLOCKED_RULES:
+            _audit_hook("secret_access_refused", hook_kwargs, None, None, tool=tool, rule=rule, variables=names)
+            message = API_BLOCK if rule == "librenms_api" else SECRET_BLOCK.format(names=", ".join(names))
+            return {"action": "block", "message": message}
+        digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+        rule_key = f"librenms:secret:{tool}:{rule}:{digest}"
+        _audit_hook(
+            "secret_access_requested", hook_kwargs, None, None, tool=tool, rule=rule, variables=names, rule_key=rule_key
+        )
+        return {"action": "approve", "message": _secret_prompt(tool, rule, names, text), "rule_key": rule_key}
+    except Exception as exc:
+        error_id = new_error_id()
+        logger.warning("librenms secret guard: blocking after %s (%s)", type(exc).__name__, error_id)
+        return {
+            "action": "block",
+            "message": f"refused: the LibreNMS plugin could not check this call for its secrets ({error_id}); see "
+            "the Hermes log",
+        }
+
+
+def _secret_access(text: str) -> Tuple[str, List[str]] | None:
+    """The rule a shell tool's *text* breaks, and the secrets it names, or None. In order:
+
+    - ``librenms_api``: an ``X-Auth-Token`` header or ``api_token`` parameter with ``/api/v0`` or ``LIBRENMS_URL``,
+      a call to LibreNMS's API past every control of the plugin, whatever the token's source;
+    - ``secret_variable``: a read of one of the plugin's secrets by name (:data:`_SECRET_NAME_RE`): an expansion
+      or an environment lookup in code (:data:`_VARIABLE_READ_RE`), ``printenv N`` or ``declare -p N``. A presence
+      test (``[ -n "$LIBRENMS_TOKEN" ]``) and ``${#N}`` or ``${N:+x}`` read nothing;
+    - ``env_file``: a Hermes ``.env`` file named, which holds them all;
+    - ``environment``: an environment printed whole (``env``, ``printenv``, ``export -p``, ``declare -p``, ``set``,
+      ``Get-ChildItem env:``, a ``/proc`` environ file, ``print(os.environ)``) while this process's environment
+      holds one of them, which the agent's local terminal inherits.
+
+    Hermes masks a printed ``NAME=value`` by the name and the value's shape, not always whole (part of a token can
+    show) and not a password inside ``LIBRENMS_PROXY``. The first two rules block, the last two ask.
+    Every pattern is anchored on a literal and runs in linear time, since this runs before every shell call."""
+    folded = text.casefold()
+    names = _secrets_read(text, folded) if "librenms_" in folded else []
+    if any(marker in folded for marker in _AUTH_MARKERS) and any(marker in folded for marker in _API_MARKERS):
+        return "librenms_api", names
+    if names:
+        return "secret_variable", names
+    if ".env" in folded and _ENV_FILE_RE.search(text) and _names_home(text):
+        return "env_file", []
+    held = _held_secrets()
+    if held and (_ENVIRON_RE.search(text) or any(map(_prints_environment, _commands(text)))):
+        return "environment", held
+    return None
+
+
+def _secrets_read(text: str, folded: str) -> List[str]:
+    """The plugin's secrets *text* reads by name, upper-cased and sorted (see :func:`_secret_access`)."""
+    found = (match.group("name") for match in _VARIABLE_READ_RE.finditer(_PRESENCE_TEST_RE.sub(" ", text)))
+    names = {name.upper() for name in found if _SECRET_NAME_RE.fullmatch(name)}
+    if "printenv" in folded or "declare" in folded or "typeset" in folded:
+        for words in _commands(text):
+            command = words[0].lower()
+            if command == "printenv" or (command in ("declare", "typeset") and any(_flag(word, "p") for word in words)):
+                names.update(word.upper() for word in words[1:] if _SECRET_NAME_RE.fullmatch(word))
+    return sorted(names)
+
+
+def _commands(text: str):
+    """The simple commands in *text*, each as its words: split at shell separators, pipes and command substitutions,
+    and in code at a call's string or list argument; quotes and brackets stripped, redirections and their targets
+    left out, and leading wrappers (``sudo``, ``nohup``, ...) and ``NAME=value`` assignments skipped."""
+    for piece in _COMMAND_SPLIT_RE.split(text):
+        words: List[str] = []
+        target = False  # the word after a bare redirection operator is its file
+        for raw in _WORD_SPLIT_RE.split(piece):
+            word = raw.strip("\"'[](){}")
+            redirect = _REDIRECT_RE.match(word)
+            if target or redirect:
+                target = not target and redirect is not None and redirect.end() == len(word)
+            elif word:
+                words.append(word)
+        start = 0
+        while start < len(words) and (words[start] in _WRAPPERS or _ASSIGNMENT_RE.match(words[start])):
+            start += 1
+        if start < len(words):
+            yield words[start:]
+
+
+def _flag(word: str, letter: str) -> bool:
+    """*word* is a short-option cluster holding *letter* (``-p``, ``-px``)."""
+    return word.startswith("-") and not word.startswith("--") and letter in word
+
+
+def _prints_environment(words: List[str]) -> bool:
+    """The simple command *words* prints the whole environment: ``env`` or ``printenv`` with only options,
+    ``export`` or ``export -p``, ``declare``/``typeset`` alone or with ``-p``/``-x``, ``set`` alone, or PowerShell's
+    ``env:`` drive listed."""
+    command, rest = words[0].lower(), words[1:]
+    if command in ("env", "printenv"):
+        return all(word.startswith("-") for word in rest)
+    if command == "export":
+        return all(word == "-p" for word in rest)
+    if command in ("declare", "typeset"):
+        flags = all(word.startswith("-") for word in rest)
+        return flags and (not rest or any(_flag(word, "p") or _flag(word, "x") for word in rest))
+    if command == "set":
+        return not rest
+    if command in ("get-childitem", "gci", "ls", "dir", "get-item", "gi"):
+        return any(word.lower().startswith("env:") for word in rest)
+    return False
+
+
+def _names_home(text: str) -> bool:
+    """*text* names a Hermes home: a ``.hermes`` directory, ``HERMES_HOME``, or the active home's path."""
+    if _HOME_RE.search(text):
+        return True
+    home = ""
+    with contextlib.suppress(Exception):
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        home = str(get_hermes_home())
+    home = home or os.environ.get("HERMES_HOME", "")
+    return len(home) > 3 and home.rstrip("/\\") in text
+
+
+def _held_secrets() -> List[str]:
+    """The plugin's secrets this process's environment holds, by name: what the agent's terminal inherits on Hermes'
+    local backend (a single-profile process loads its profile's .env into the environment; a multiplexed gateway
+    keeps each profile's in its secret scope instead)."""
+    return sorted(
+        name.upper()
+        for name, value in os.environ.items()
+        if value and name[:9].upper() == "LIBRENMS_" and _SECRET_NAME_RE.fullmatch(name)
+    )
+
+
+def _secret_prompt(tool: str, rule: str, names: List[str], text: str) -> str:
+    """What Hermes' approval prompt says about a call :func:`_secret_access` asks about: what it reads, what of it
+    Hermes' masking leaves readable, and the command, on one line and cut."""
+    if rule == "env_file":
+        head = f"LibreNMS secrets: this {tool} call reads a Hermes .env file, which holds LIBRENMS_TOKEN"
+    else:
+        head = f"LibreNMS secrets: this {tool} call prints the environment, which holds {', '.join(names)}"
+    return "\n".join(
+        (
+            head,
+            "Hermes' masking can leave part of a token, and a password inside LIBRENMS_PROXY, readable.",
+            f"Command: {_cut(one_line(text), 2 * APPROVAL_LINE_CHARS)}",
+            "Allow it only if you asked for it: the librenms tools never need it.",
+        )
+    )
+
+
 def pre_llm_call(**kwargs: Any) -> None:
     """Hermes ``pre_llm_call``: remember the user's message for this session so the audit trail can say what the
     model was asked when it plans or applies. Injects nothing."""
@@ -1646,24 +1878,29 @@ def pre_llm_call(**kwargs: Any) -> None:
 def post_approval_response(**kwargs: Any) -> None:
     """Hermes ``post_approval_response``: audit the human's answer to an approval about LibreNMS (our rule keys, or a
     command that mentions librenms) as ``approval_decided``. Records the choice, tool, plan id and the content digest
-    the answer covers, never the command text."""
+    the answer covers (for a shell call the secret guard asked about, the rule and the digest of the call's text),
+    never the command text."""
     try:
         keys = [str(key) for key in [kwargs.get("pattern_key"), *(kwargs.get("pattern_keys") or [])] if key]
         ours = next((found for found in map(_RULE_KEY_RE.search, keys) if found), None)
+        secret = next((found for found in map(_SECRET_KEY_RE.search, keys) if found), None) if ours is None else None
         mentioned = "librenms" in str(kwargs.get("command") or "").lower() or any("librenms" in k.lower() for k in keys)
         if ours is None and not mentioned:
             return None
         plan_id = ours.group("plan") if ours is not None and ours.group("plan") != "unresolved" else None
         where: Dict[str, Any] = {"pattern_key": keys[0] if keys else None}
+        found = ours or secret
         if ours is not None:
             where = {"rule_key": ours.group("key"), "digest": ours.group("digest")}
+        elif secret is not None:
+            where = {"rule_key": secret.group("key"), "rule": secret.group("rule"), "digest": secret.group("digest")}
         audit.emit(
             "approval_decided",
             plan_id=plan_id,
             actor=audit.capture_actor({}, via=audit.VIA_MODEL),
             librenms_url=None,
             choice=kwargs.get("choice"),
-            tool=ours.group("tool") if ours is not None else None,
+            tool=found.group("tool") if found is not None else None,
             decided_by=kwargs.get("decided_by"),
             surface=kwargs.get("surface"),
             **where,

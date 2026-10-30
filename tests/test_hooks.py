@@ -2,8 +2,10 @@
 parsing, rule keys per plan, variant and content, the message laid out for what each Hermes surface shows, escaping
 and clipping, exact plan ids, blocking what does not resolve and failing closed), what bind_approval hands the
 handler and the handler's refusal of a call or plan other than the prompt showed, the terminal guard against ``hermes
-librenms apply|rollback`` in a command, code or a background shell's input (in linear time), no work for unrelated
-tools, the request cache behind ``pre_llm_call``, and ``approval_decided`` from ``post_approval_response``."""
+librenms apply|rollback`` in a command, code or a background shell's input (in linear time), the secret guard (a read
+of the plugin's secrets by name or an API call with a token blocked, a .env read or an environment dump asked about),
+no work for unrelated tools, the request cache behind ``pre_llm_call``, and ``approval_decided`` from
+``post_approval_response``."""
 
 import hashlib
 import json
@@ -873,6 +875,251 @@ class Terminal(HookCase):
         self.assertEqual(directive["action"], "block")
 
 
+class SecretGuard(HookCase):
+    """The plugin's secrets in the agent's terminal, code and background shells: a read by name or a call to the API
+    with a token is blocked, a Hermes .env file or a printed environment holding them goes to the approval prompt."""
+
+    def setUp(self):
+        super().setUp()
+        for name in [name for name in os.environ if name.upper().startswith("LIBRENMS_")]:
+            self.addCleanup(_restore_env, name, os.environ.pop(name))
+
+    def hold(self, **values):
+        """Put *values* in the environment, as a single-profile Hermes process loads its .env, for this test."""
+        for name, value in values.items():
+            self.addCleanup(_restore_env, name, os.environ.get(name))
+            os.environ[name] = value
+
+    def refused(self):
+        return [(event["tool"], event["rule"], event["variables"]) for event in self.events("secret_access_refused")]
+
+    def test_a_secret_read_by_name_is_blocked_and_audited_without_the_text(self):
+        reads = (
+            ("terminal", {"command": "echo $LIBRENMS_TOKEN"}, ["LIBRENMS_TOKEN"]),
+            ("terminal", {"command": 'echo "${LIBRENMS_TOKEN:-unset}" | base64'}, ["LIBRENMS_TOKEN"]),
+            ("terminal", {"command": "printenv LIBRENMS_PROXY LIBRENMS_URL", "background": False}, ["LIBRENMS_PROXY"]),
+            ("terminal", {"command": "declare -p LIBRENMS_SNMP_V3_AUTH_PASS"}, ["LIBRENMS_SNMP_V3_AUTH_PASS"]),
+            (
+                "terminal",
+                {"command": "echo %LIBRENMS_TOKEN% & echo $env:LIBRENMS_PROXY"},
+                ["LIBRENMS_PROXY", "LIBRENMS_TOKEN"],
+            ),
+            ("terminal", {"command": "perl -e 'print $ENV{LIBRENMS_SPLUNK_TOKEN}'"}, ["LIBRENMS_SPLUNK_TOKEN"]),
+            ("terminal", {"command": "node -e 'console.log(process.env.LIBRENMS_TOKEN)'"}, ["LIBRENMS_TOKEN"]),
+            ("terminal", {"command": "ruby -e 'puts ENV.fetch(\"LIBRENMS_PROXY\")'"}, ["LIBRENMS_PROXY"]),
+            (
+                "execute_code",
+                {"code": "import os\nprint(os.environ['LIBRENMS_SNMP_COMMUNITY_SECRET'])"},
+                ["LIBRENMS_SNMP_COMMUNITY_SECRET"],
+            ),
+            (
+                "execute_code",
+                {"code": 'import os\nsecret = os.getenv("librenms_audit_sink_secret")'},
+                ["LIBRENMS_AUDIT_SINK_SECRET"],
+            ),
+            (
+                "execute_code",
+                {"code": 'subprocess.run(["printenv", "LIBRENMS_TOKEN"], check=True)'},
+                ["LIBRENMS_TOKEN"],
+            ),
+            (
+                "process_manage",
+                {"action": "submit", "session_id": "p", "data": "echo $LIBRENMS_TOKEN"},
+                ["LIBRENMS_TOKEN"],
+            ),
+            (
+                "process_manage",
+                {"action": "write", "session_id": "p", "data": "printenv LIBRENMS_TOKEN\n"},
+                ["LIBRENMS_TOKEN"],
+            ),
+        )
+        for tool, args, names in reads:
+            directive = self.hook(tool, args)
+            self.assertEqual(directive["action"], "block", args)
+            self.assertEqual(directive["message"], self.handlers.SECRET_BLOCK.format(names=", ".join(names)), args)
+            self.assertIn("/librenms status", directive["message"])
+        self.assertEqual(self.refused(), [(tool, "secret_variable", names) for tool, _args, names in reads])
+        event = self.events("secret_access_refused")[0]
+        self.assertEqual(
+            (event["plan_id"], event["actor"]["kind"], event["actor"]["session_id"]), (None, "model", "s1")
+        )
+        text = self.audit_path.read_text(encoding="utf-8")
+        for fragment in ("echo", "base64", "printenv", "print(", "subprocess", "console.log"):
+            self.assertNotIn(fragment, text)
+
+    def test_it_holds_in_every_write_mode(self):
+        # the CLI write block steps aside when the model may write unprompted; the token does not stop being a secret
+        for values in ({"write_mode": "full", "require_approval": False}, {"write_mode": "read_only"}):
+            self.configure(**values)
+            self.assertEqual(self.hook("terminal", {"command": "echo $LIBRENMS_TOKEN"})["action"], "block", values)
+
+    def test_a_test_for_presence_and_a_mere_mention_read_nothing(self):
+        def no_settings():
+            raise AssertionError("settings read by the secret guard")
+
+        self.stub("get_settings", no_settings)
+        self.hold(LIBRENMS_URL="https://librenms.test")  # not a secret: the environment holds none of them
+        for command in (
+            'test -n "$LIBRENMS_TOKEN" && echo set',
+            '[ -z "${LIBRENMS_TOKEN:-}" ] && echo "LIBRENMS_TOKEN is not set"',
+            "[[ ! -n $LIBRENMS_PROXY ]] || echo proxied",
+            "echo ${#LIBRENMS_TOKEN} ${LIBRENMS_TOKEN:+set} ${LIBRENMS_PROXY+set}",
+            "echo $LIBRENMS_URL; printenv LIBRENMS_VERIFY_SSL LIBRENMS_TIMEOUT",
+            "grep -rn LIBRENMS_TOKEN ~/src/hermes-plugin-librenms/README.md",
+            "unset LIBRENMS_PROXY; hermes librenms status",
+            'curl -H "X-Auth-Token: $OS_TOKEN" https://keystone.example.net/v3/auth/tokens',
+            'curl -s "$LIBRENMS_URL/api/v0/system"',  # no token: LibreNMS answers 401
+            "cat ./project/.env",  # a project's own; Hermes' file tools refuse it themselves
+            "cat ~/.hermes/.env.example",
+            "ls -la ~/.hermes/plugin-data/librenms",
+            "env; printenv; export -p; set; declare -x",
+        ):
+            self.assertIsNone(self.hook("terminal", {"command": command}), command)
+        self.assertIsNone(self.hook("execute_code", {"code": 'import os\nprint("LIBRENMS_TOKEN" in os.environ)'}))
+        self.assertEqual(self.events(), [])
+
+    def test_a_call_to_the_api_with_a_token_is_blocked_whatever_the_token_s_source(self):
+        calls = (
+            (
+                "terminal",
+                {"command": 'curl -X DELETE -H "X-Auth-Token: $LIBRENMS_TOKEN" "$LIBRENMS_URL/api/v0/devices/12"'},
+                ["LIBRENMS_TOKEN"],
+            ),
+            ("terminal", {"command": "curl -H 'X-Auth-Token: 3f2a9c' https://nms.example.com/api/v0/devices"}, []),
+            ("terminal", {"command": "wget -qO- 'https://nms.example.com/api/v0/devices?api_token=3f2a9c'"}, []),
+            (
+                "execute_code",
+                {"code": 'requests.get(os.environ["LIBRENMS_URL"] + "/devices", headers={"X-Auth-Token": key})'},
+                [],
+            ),
+        )
+        for tool, args, _names in calls:
+            self.assertEqual(self.hook(tool, args), {"action": "block", "message": self.handlers.API_BLOCK}, args)
+        self.assertEqual(self.refused(), [(tool, "librenms_api", names) for tool, _args, names in calls])
+        self.assertNotIn("3f2a9c", self.audit_path.read_text(encoding="utf-8"))
+
+    def test_a_hermes_env_file_goes_to_the_approval_prompt(self):
+        commands = (
+            "cat ~/.hermes/.env",
+            "cd ~/.hermes/profiles/netops && grep -i librenms .env",
+            "source $HERMES_HOME/.env && env",
+            f"tail -n 5 {self.home}/.env.bak",  # the active home, wherever it is (/opt/data in Hermes' container)
+            r"type %LOCALAPPDATA%\hermes\.env",
+        )
+        for command in commands:
+            directive = self.hook("terminal", {"command": command})
+            self.assertEqual(directive["action"], "approve", command)
+            lines = directive["message"].split("\n")
+            self.assertEqual(
+                lines[0], "LibreNMS secrets: this terminal call reads a Hermes .env file, which holds LIBRENMS_TOKEN"
+            )
+            self.assertEqual(lines[2], f"Command: {command}")
+            digest = hashlib.sha256(command.encode()).hexdigest()[:16]
+            self.assertEqual(directive["rule_key"], f"librenms:secret:terminal:env_file:{digest}")
+        # an answer covers that exact call: another text or another tool is asked about again
+        first = self.hook("terminal", {"command": commands[0]})["rule_key"]
+        self.assertEqual(self.hook("terminal", {"command": commands[0]})["rule_key"], first)
+        self.assertNotEqual(self.hook("terminal", {"command": commands[0] + " "})["rule_key"], first)
+        code = self.hook("execute_code", {"code": "print(open(os.path.expanduser('~/.hermes/.env')).read())"})
+        self.assertTrue(code["rule_key"].startswith("librenms:secret:execute_code:env_file:"))
+        events = self.events("secret_access_requested")
+        self.assertEqual(len(events), len(commands) + 4)
+        self.assertEqual(
+            (events[0]["tool"], events[0]["rule"], events[0]["variables"], events[0]["rule_key"]),
+            ("terminal", "env_file", [], self.hook("terminal", {"command": commands[0]})["rule_key"]),
+        )
+        self.assertNotIn("cat ~/.hermes", self.audit_path.read_text(encoding="utf-8"))
+        # a read by name blocks, whatever file it comes from
+        directive = self.hook("terminal", {"command": "source ~/.hermes/.env; echo $LIBRENMS_TOKEN"})
+        self.assertEqual(directive["action"], "block")
+
+    def test_a_printed_environment_asks_only_while_it_holds_a_secret(self):
+        dumps = (
+            "env",
+            "env -0 | grep -i librenms",
+            "printenv > /tmp/e",
+            "export -p",
+            "set | less",
+            "declare -px",
+            "sudo env",
+            "cat /proc/self/environ | tr '\\0' '\\n'",
+            "Get-ChildItem Env:",
+            "echo $(env)",
+        )
+        code = ("print(dict(os.environ))", 'os.system("env")', 'subprocess.run(["env"], check=True)')
+        for command in dumps:
+            self.assertIsNone(self.hook("terminal", {"command": command}), command)
+        self.hold(LIBRENMS_TOKEN=TOKEN, LIBRENMS_PROXY="https://svc:pw@proxy.example.net:3128", LIBRENMS_URL="x")
+        for command in dumps:
+            directive = self.hook("terminal", {"command": command})
+            self.assertEqual(directive["action"], "approve", command)
+            self.assertEqual(
+                directive["message"].split("\n")[:2],
+                [
+                    "LibreNMS secrets: this terminal call prints the environment, which holds LIBRENMS_PROXY, "
+                    "LIBRENMS_TOKEN",
+                    "Hermes' masking can leave part of a token, and a password inside LIBRENMS_PROXY, readable.",
+                ],
+            )
+        for text in code:
+            self.assertEqual(self.hook("execute_code", {"code": text})["action"], "approve", text)
+        # running a command with an environment, setting shell options or naming a variable env prints nothing
+        for command in ("env FOO=1 make", "env -u LIBRENMS_PROXY curl https://example.net", "set -euo pipefail"):
+            self.assertIsNone(self.hook("terminal", {"command": command}), command)
+        self.assertIsNone(self.hook("execute_code", {"code": "env = dict(os.environ)\nprint(env['PATH'])"}))
+        events = self.events("secret_access_requested")
+        self.assertEqual(len(events), len(dumps) + len(code))
+        self.assertEqual(
+            {(event["rule"], tuple(event["variables"])) for event in events},
+            {("environment", ("LIBRENMS_PROXY", "LIBRENMS_TOKEN"))},
+        )
+        self.assertNotIn(TOKEN, self.audit_path.read_text(encoding="utf-8"))
+
+    def test_the_write_block_comes_first(self):
+        self.configure(write_mode="operator_only")
+        command = "hermes librenms apply ab12 && echo $LIBRENMS_TOKEN"
+        self.assertIn("/librenms apply ab12", self.hook("terminal", {"command": command})["message"])
+        self.assertEqual([event["event"] for event in self.events()], ["apply_refused"])
+        self.configure(write_mode="full", require_approval=False)
+        self.assertEqual(
+            self.hook("terminal", {"command": command})["message"],
+            self.handlers.SECRET_BLOCK.format(names="LIBRENMS_TOKEN"),
+        )
+
+    def test_a_long_line_costs_linear_time(self):
+        self.hold(LIBRENMS_TOKEN=TOKEN)
+        for text in (
+            "$LIBRENMS_" * 60_000,
+            "${LIBRENMS_" + "TOKEN" * 30_000 + ":+x}",
+            "printenv " * 60_000 + "LIBRENMS_TOKEN",
+            "declare -p " * 60_000,
+            "test -n $LIBRENMS_TOKEN " * 60_000,
+            "os.environ.get " * 60_000,
+            '[[ -n "${LIBRENMS_' + "A" * 200_000,
+            "x-auth-token " * 60_000,
+            ".env " * 60_000,
+            "sudo " * 60_000 + "env",
+            "/proc/" * 60_000,
+            '("' * 60_000,
+        ):
+            started = time.monotonic()
+            self.hook("execute_code", {"code": text})
+            self.assertLess(time.monotonic() - started, 1.0, text[:40])
+
+    def test_a_failing_check_blocks(self):
+        def broken(_text):
+            raise RuntimeError("bug")
+
+        self.stub("_secret_access", broken)
+        with self.assertLogs(self.handlers.logger, "WARNING") as logs:
+            directive = self.hook("terminal", {"command": "ls /srv/quarterly-report"})
+        self.assertEqual(directive["action"], "block")
+        found = re.search(r"could not check this call for its secrets \((err-[0-9a-f]{12})\)", directive["message"])
+        self.assertIn(found.group(1), logs.output[0])  # the log line says which call, never its text
+        self.assertNotIn("quarterly", "".join(logs.output))
+        self.assertEqual(self.events(), [])
+
+
 class UnrelatedTools(HookCase):
     def test_no_io_for_unrelated_tools(self):
         touched = []
@@ -985,6 +1232,18 @@ class ApprovalDecided(HookCase):
             (mentioned["tool"], mentioned["pattern_key"], mentioned["choice"]), (None, "recursive delete", "always")
         )
         self.assertNotIn("rm -rf", json.dumps(mentioned))
+
+    def test_an_answer_about_a_secret_is_audited_by_its_rule(self):
+        directive = self.hook("terminal", {"command": "cat ~/.hermes/.env"})
+        key = f"plugin_rule:{directive['rule_key']}"
+        self.respond(command="<terminal> (plugin approval rule)", pattern_key=key, pattern_keys=[key], choice="session")
+        [event] = self.events("approval_decided")
+        digest = directive["rule_key"].rsplit(":", 1)[1]
+        self.assertEqual(
+            (event["plan_id"], event["tool"], event["rule"], event["rule_key"], event["digest"], event["choice"]),
+            (None, "terminal", "env_file", directive["rule_key"], digest, "session"),
+        )
+        self.assertNotIn("cat ~/.hermes", self.audit_path.read_text(encoding="utf-8"))
 
     def test_other_approvals_and_garbage_are_ignored(self):
         self.respond(pattern_key="recursive delete", command="rm -rf /tmp/x", choice="once")

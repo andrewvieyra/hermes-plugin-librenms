@@ -6,6 +6,77 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-29
+
+Terminal secret guard and install notes (findings feat-terminal-secret-guard, hi-after-install).
+
+### Security
+- The agent's shell no longer reads the plugin's secrets or calls LibreNMS past the plugin unnoticed. Hermes
+  leaves a standalone plugin's variables in the environment of its local terminal, and the `pre_tool_call` guard
+  matched only `hermes librenms apply|rollback`: a prompt-injected `curl -X DELETE -H "X-Auth-Token:
+  $LIBRENMS_TOKEN" "$LIBRENMS_URL/api/v0/devices/12"`, `printenv LIBRENMS_PROXY` or `cat ~/.hermes/.env` ran with no
+  block and no trace in the audit stream. A second guard now reads the text of every `terminal` and
+  `execute_code` call and every `process_manage` write or submit to a background shell, after the CLI block and in
+  every `write_mode`:
+  - **refused**, audited as `secret_access_refused`: a read of one of the plugin's secrets by name
+    (`secret_variable`; `LIBRENMS_TOKEN`, `LIBRENMS_PROXY`, `LIBRENMS_SNMP_*`, `LIBRENMS_AUDIT_SINK_SECRET` and any
+    other `LIBRENMS_` name holding `TOKEN`, `SECRET`, `PASS` or `KEY`, read through a shell, PowerShell, cmd, Perl or
+    PHP expansion, `printenv` or `declare -p`, or an environment lookup in Python, Ruby, Node, Go, Java, C# or
+    Rust), and a call to LibreNMS's API with a token (`librenms_api`: an `X-Auth-Token` header or `api_token` with
+    `/api/v0` or `LIBRENMS_URL`, whatever the token's source). The model is told the tools carry the token and that
+    `librenms_query` status shows the configuration. A presence test (`[ -n "$LIBRENMS_TOKEN" ]`, `test -z
+    "${LIBRENMS_TOKEN:-}"`, `${LIBRENMS_TOKEN:+set}`, `${#LIBRENMS_TOKEN}`), a mention (`grep -rn LIBRENMS_TOKEN`,
+    `unset`, `"LIBRENMS_TOKEN" in os.environ`) and the non-secret `LIBRENMS_URL`, `LIBRENMS_VERIFY_SSL` and
+    `LIBRENMS_TIMEOUT` pass;
+  - **put to Hermes' approval prompt**, audited as `secret_access_requested`: a call that reads a Hermes `.env`
+    file (`env_file`: `.env`, or `.env.bak`, but not `.env.example`, next to `~/.hermes`, `$HERMES_HOME`,
+    `%LOCALAPPDATA%\hermes` or the active home's path), and, while this process's environment holds one of the
+    secrets (as a single-profile process loads its `.env`), one that prints the whole environment (`environment`:
+    `env` or `printenv` with only options, `export -p`, `declare -p`/`-x`, `set` alone, `Get-ChildItem env:`, a
+    `/proc` environ file, `print(os.environ)`, `os.system("env")`). Hermes masks such output by variable name and
+    the value's shape, not always whole (part of the token can show) and not a password inside `LIBRENMS_PROXY`,
+    which is what the prompt says, with the command on one line. Its rule key,
+    `librenms:secret:<tool>:<rule>:<digest of the text>`, makes an "always" cover that exact call only, and the
+    answer is audited as `approval_decided` with the rule and the digest.
+
+  Events carry the tool, the rule and the variable names (at most ten), never the command text. The guard reads no
+  settings, every pattern is anchored on a literal and stays linear on 600 KB of adversarial input (under 0.1 s),
+  and a failure inside it blocks the call with an error id. It is a heuristic, like the CLI block: a name built from
+  parts, a script file, an encoding or a renamed copy of `.env` passes, and YOLO mode, `approvals.mode: off` and an
+  "approve" unattended policy pass what it asks about; a container or remote terminal backend and the token's role
+  stay the controls that hold (SECURITY.md).
+
+### Added
+- after-install.md, which `hermes plugins install` prints after asking for `LIBRENMS_URL` and `LIBRENMS_TOKEN`, in
+  place of its generic "Plugin installed" panel (`hermes_cli/plugins_cmd_install.py`, `_display_after_install`,
+  rendered as Markdown): a least-privilege token (`global-read` for `read_only`, never `admin`, and replacing one
+  entered at the prompt), `write_mode: operator_only` on shared gateways and profiles with cron, webhooks or the API
+  server, `require_approval` on with no YOLO, the terminal on a container or remote backend, enabling the plugin and
+  `/librenms status`, and where the rest is. An install from the dashboard or the Desktop returns the file's path,
+  which the dashboard drops and no client shows; the README and SECURITY.md point to the file for those.
+- `handlers.SECRET_BLOCK`, `handlers.API_BLOCK`; audit events `secret_access_refused` and
+  `secret_access_requested`.
+
+### Changed
+- The workflow skill says not to read the secrets, call the API from a shell, print the environment or open `.env`,
+  and to point a user who asks to see the token to `/librenms status`; both skills say not to check the variables
+  from a shell when the tools are missing.
+- README (Install, The token, Safety model, Write modes, the audit trail, the layout), SECURITY.md (a threat row,
+  the shell residual risk with Hermes' masking as it behaves, deployment items 7 and 10, the install notes),
+  docs/audit.md (the two events, `approval_decided` for a shell call, searches) and docs/architecture.md (the
+  guard, the write-modes table, how Hermes shows after-install.md) say so. SECURITY.md and README no longer say
+  Hermes masks the token whole in a printed environment: beside a URL with credentials it shows the first six and
+  last four characters, and it leaves a short value under a `TOKEN` name as it is.
+- `hermes plugins validate`: the scan verdict is unchanged (caution); the guard's own command names add medium
+  findings (`dump_all_env`, `sudo_usage`) in handlers.py and tests.
+- Tests: reads by name in each language form and through each shell tool, blocked and audited without the text;
+  presence tests and mentions passing without reading settings; API calls with a token from the environment, a
+  literal or a query parameter; `.env` reads asked about under a key per exact text; environment dumps asked about
+  only while a secret is held, and commands that run with an environment passing; the CLI block first; linear time
+  on adversarial input; a failing check blocking; `approval_decided` for a secret key; the block and the approval
+  request through Hermes' real `PluginManager` (`make test-hermes`); after-install.md's steps, the settings it names
+  and nothing the install scan or a model would act on.
+
 ## [0.12.1] - 2026-10-29
 
 What the review of 0.12.0 found in its own changes, each confirmed against the 0.12.0 code first.
