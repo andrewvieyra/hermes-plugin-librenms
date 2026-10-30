@@ -318,7 +318,7 @@ class Alerts(AlertCase):
         self.assertEqual(out["timezone"], "Europe/Amsterdam")
         self.assertFalse([note for note in out["notes"] if "after data_as_of" in note])
 
-    def test_a_time_zone_east_of_the_server_s_leaves_no_age_and_says_so(self):
+    def test_a_time_zone_west_of_the_server_s_leaves_no_age_and_says_so(self):
         # what 0.14.1 answered with librenms_timezone America/New_York on a server that writes UTC: every alert of
         # the last few hours read 0s old, so the model said they had just started
         self.settings_with(librenms_timezone="America/New_York")

@@ -166,11 +166,13 @@ it as UTC when LibreNMS runs in Amsterdam. Every `librenms_report` answer names 
 billing times (`alerts`, `alert_history`, the `port` view's open faults, `events`, and a bill's last
 calculation in `bills`) read them in this zone, and without it show them as LibreNMS wrote them,
 with no age; `alert_history` and `events` then read their window from a bound early enough to hold
-it in any zone, and say so, and refuse `today`. A zone that is not LibreNMS's shows: a time that reads
-more than five minutes after LibreNMS's clock (`librenms_timezone` east of the server's, such as
+it in any zone, and say so, and refuse `today`. A zone west of LibreNMS's shows: a time that reads
+more than five minutes after LibreNMS's clock (`librenms_timezone` west of the server's, such as
 `America/New_York` on a server that writes UTC) has no age, and a note says the setting is wrong, rather
-than calling a 3-hour-old alert new. Every other time a report shows is exact in any
-zone: device times (ISO-8601 UTC), outages and port polls (unix seconds), uptimes and the age of a
+than calling a 3-hour-old alert new. A zone east of the server's cannot be told from the times: they
+read earlier than they are, and every age is too large by the difference between the zones (an hour or
+two with `Europe/Berlin` on a server that writes UTC), with no note. Every other time a report shows
+is exact in any zone: device times (ISO-8601 UTC), outages and port polls (unix seconds), uptimes and the age of a
 port's last change (counted from the device's uptime), a billing period's dates (LibreNMS's
 calendar), every age counted to LibreNMS's own clock (the `Date` of its answer). A name the host's
 zone database does not hold is refused and the setting stays empty.

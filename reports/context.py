@@ -56,7 +56,8 @@ LOG_MIN_PAGE = 25  # the fewest a request asks for while LibreNMS's answer is to
 EARLIEST_OFFSET_S = 12 * 3600
 LATEST_OFFSET_S = 14 * 3600
 # How far after data_as_of a server-local time may read (clocks a little apart) before librenms_timezone is taken to be
-# wrong: a zone east of the server's puts every recent time in the future.
+# wrong: a zone west of the server's puts every recent time in the future. One east of it puts every time in the past,
+# by the zones' difference, which no check of the times can see: the ages are then that much too large.
 FUTURE_SLACK_S = 300
 # The keys of a candidate row that hold text from LibreNMS.
 CANDIDATE_TEXT = (
@@ -584,8 +585,8 @@ class ReportContext:
         """``<prefix>``: a fault, log or bill time, ISO-8601 in ``librenms_timezone`` (without it as LibreNMS wrote
         it), and its age in seconds (``<prefix>_age_s``) and in words (``<prefix>_age``), none without a zone. A time
         more than :data:`FUTURE_SLACK_S` after ``data_as_of`` has no age either: ``librenms_timezone`` is then not
-        the zone LibreNMS's server writes in, and a note says so once (:meth:`_doubt_zone`), where an age of 0 would
-        read as just now."""
+        the zone LibreNMS's server writes in (it is west of it), and a note says so once (:meth:`_doubt_zone`),
+        where an age of 0 would read as just now."""
         moment = units.server_time(value, self.zone)
         age = units.age(moment, self.now)
         if moment is not None and (moment - self.now).total_seconds() > FUTURE_SLACK_S:

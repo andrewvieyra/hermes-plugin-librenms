@@ -579,8 +579,9 @@ human to ask blocks the call.
   `TOKEN`, `SECRET`, `PASS` or `KEY`, through a shell, PowerShell, cmd, Perl or PHP expansion,
   `printenv`/`declare -p` wherever it stands in the command (by path, `\printenv`, after `sudo`,
   `env`, `timeout`, `busybox`, or from `xargs`, which hands it the names in its input), or an
-  environment lookup in code, the name in any string form the language writes (`r"..."`, `f"..."`,
-  `'''...'''`, a backtick) and through an optional chain (`process.env?.N`); a presence test excepted
+  environment lookup in code, the name in a string literal of the forms the language writes
+  (`r"..."`, `f"..."`, `'''...'''`, a backtick, a Java text block, C#'s `@"..."` and `$"..."`,
+  Rust's `r#"..."#`, Ruby's `%q(...)`) and through an optional chain (`process.env?.N`); a presence test excepted
   where a command starts, outside a quoted string, as the whole test, in a call that neither traces
   (`set -x`, `bash -x`, `xtrace`, `SHELLOPTS`) nor holds a here-document, and a braced `${N:+x}`)
   and a call to the API with a token
@@ -589,12 +590,13 @@ human to ask blocks the call.
   Kubernetes, Prometheus and others serve an `/api/v1` too), in every `write_mode`, and tells the
   model the tools carry the token. It returns `approve` for a Hermes `.env` file (`env_file`: named,
   or reached by a dotfile glob under a home or a recursive `grep -r`, `grep -d recurse`, `rg`,
-  `find -exec` of a home, its `profiles` or a profile, `..` read as the shell reads it, or by a
-  relative path or glob after a `cd` into one) and, while this process's environment holds one of
-  the secrets, for a whole-environment print (`environment`; wrappers with their options, long ones
-  with a value included, and a shell before its `-c` string are skipped to find the command, so
-  `sudo -E env`, `sudo --user root env`, `bash -lc env`, `cmd /c set` and `/usr/bin/env` count and
-  `env FOO=1 make` does not), under the rule
+  `find -exec` of a home, its `profiles` or a profile, `..` read as the shell reads it, a glob the
+  shell may expand to `profiles` counted as it, or by a relative path or glob after a `cd` into one)
+  and, while this process's environment holds one of the secrets, for a whole-environment print
+  (`environment`; wrappers with their options, long ones with a value included, and a shell before
+  its `-c` string, past the values of `-o` and `-O` as that shell reads them, are skipped to find the
+  command, so `sudo -E env`, `sudo --user root env`, `bash -lc env`, `bash -euo pipefail -c env`,
+  `cmd /c set` and `/usr/bin/env` count and `env FOO=1 make` does not), under the rule
   key `librenms:secret:<tool>:<rule>:<digest of the text>`. Its prompt opens with a line saying what
   the call reads and a line with the command, together within the 300 characters Discord shows; a
   longer command is cut there and says first how many of its characters are not shown. Then what

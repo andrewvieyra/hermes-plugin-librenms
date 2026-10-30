@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-10-30
+
+What the final review of 0.14.2 and 0.14.3 found in the secret guard and in what the docs claim, each confirmed
+against the 0.14.3 code first (the guard's gaps with the reviewers' probes, the shells' options with bash, dash, zsh
+and ksh themselves).
+
+### Security
+- An environment printed in a shell's command string goes to the approval prompt when the shell's option cluster
+  holds `-o` or `-O`: `bash -euo pipefail -c 'env | sort'`, `sh -eo pipefail -c printenv`,
+  `sudo -u root bash -eo pipefail -c env`, and a recursive read of a Hermes home there
+  (`bash -euo pipefail -c 'grep -r TOKEN ~/.hermes'`). 0.14.2 skipped the value only after a bare `-o`, so it read
+  `pipefail` as a script the shell runs and the shell as the command: no prompt and no audit event, while bash
+  printed the token. The value is now skipped as each shell reads it: bash, dash and ash take a word for every `o` or
+  `O` in the cluster (`-oe pipefail`, `-ouo errexit nounset`), zsh, ksh, mksh and fish the rest of the cluster, or the
+  next word when the `o` ends it (`-opipefail`, `-euo pipefail`). A `c` anywhere in the cluster, or `+c`, gives the
+  command string.
+- A recursive read of a glob under a Hermes home that the shell may expand to `profiles` goes to the approval prompt:
+  `grep -r TOKEN ~/.hermes/*`, `cd ~/.hermes; grep -r TOKEN *`, `grep -r TOKEN ~/.hermes/p*/work`. Only a path that
+  ends at the home, `profiles` or a profile counted, and `*` is none of them, while grep reached every profile's
+  `.env` through it.
+- Environment lookups with the name in a string form SECURITY.md said was refused are refused: C#'s verbatim and
+  interpolated strings (`@"LIBRENMS_TOKEN"`, `$"..."`, `$@"..."`), Rust's raw strings with hashes (`r#"..."#`), Ruby's
+  percent literals (`%q(...)`, `%Q{...}`, `%(...)`, `%w[...]`), a Java text block, and Python's
+  `os.getenvb(b"...")`. SECURITY.md said "any of their string forms"; it now names the forms, and lists a name in a
+  here-document or a form the guard does not know (Perl's `q(...)`) among what passes.
+
+### Fixed
+- README, `reports/context.py`, the 0.14.3 entry and a test name said that a `librenms_timezone` east of the server's
+  puts times after LibreNMS's clock, with `America/New_York` on a server that writes UTC as the example. New York is
+  west of UTC: a zone west of the server's reads every time late, which the note catches, and one east of it reads
+  every time early, so each age is too large by the difference between the zones, with no note (an alert first seen
+  20 minutes ago read 9h 20m old with `Asia/Tokyo` on a UTC server). The README says that only a zone west of the
+  server's shows, and what one east of it does.
+- CHANGELOG: 0.1.0 is dated 2026-10-29, the day its commit was made.
+
+### Changed
+- SECURITY.md (the secret row and what the guard does not hold), docs/architecture.md (the secret guard) and the
+  guard's comments say so.
+- Tests: each option-cluster form through the hook for bash, dash, zsh and ksh, and a script after one, which prints
+  nothing; each glob that may reach `profiles` and one that cannot; each new string form; linear time on long option
+  clusters, runs of `*`, `[` and `?` under the home, Rust's hashes, a text block's blanks and Ruby's percents.
+
 ## [0.14.3] - 2026-10-30
 
 What the final review of 0.14.1 found in the answers the reports give and in what ships beside the code, each
@@ -68,7 +110,7 @@ confirmed against the 0.14.2 code first (the report findings with the reviewers'
 - README (Configuration, the ports, capacity and health rows), the question skill (Q16, Q18, Q20, units, flaps, time
   zones, step 1), view help (ports, port, capacity, health, find, units) and docs/architecture.md say so.
 - Tests: the interface speed in rows, filters, sorts and free ports; flaps across faults, beside another port's
-  recovery and without details; prefixed readings and significant margins; null ages and the note under a zone east of
+  recovery and without details; prefixed readings and significant margins; null ages and the note under a zone west of
   the server's, and none for a clock a few minutes apart; the find note and the call it names; the why; each events
   note; stale discards; the shared maintenance checks, and a fullwidth duration and start refused by all three
   resources; every module listed after what it imports; every bounded setting stating its limit; the fake's one clock.
@@ -1612,7 +1654,7 @@ question guidance in 0.10.0 (`librenms:ask` says 26h, as the code, help, README 
   naming them are refused with the rule, so rename those variables. The SNMPv3 user name may keep any
   `LIBRENMS_SNMP_` name.
 
-## [0.1.0] - 2026-10-28
+## [0.1.0] - 2026-10-29
 
 ### Added
 - `librenms_query`: any GET route of an allow-list built from LibreNMS' own route table, in its registration order,

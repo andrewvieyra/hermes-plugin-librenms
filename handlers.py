@@ -125,16 +125,20 @@ _SECRET_WORDS = ("TOKEN", "SECRET", "PASS", "KEY")
 _NAME_RE = re.compile(r"\w+", re.ASCII)
 # A variable read by name: a shell, PowerShell, cmd, Perl or PHP expansion ($N, ${N:-x}, $env:N, env:N, %N%,
 # $ENV{N}, $_ENV['N']), and a call or subscript of Python, Ruby, Node, Go, Java, C# or Rust (os.environ["N"],
-# os.environ.copy()["N"], os.environ.__getitem__("N"), os.getenv("N"), os.getenv(key="N"), ENV.fetch("N"),
-# ENV.values_at("N"), process.env.N, process.env?.N, process["env"].N, System.getenv("N"), System.getenv().get("N"),
-# env::var("N"), env::var_os("N")), with the name in any string form those languages write (r"N", f"N", b'N',
-# '''N''', `N`). Only a braced ${N:+x} or ${N+x} expands to x, not the value: $N+ and process.env.N+"" read it.
+# os.environ.copy()["N"], os.environ.__getitem__("N"), os.getenv("N"), os.getenvb(b"N"), os.getenv(key="N"),
+# ENV.fetch("N"), ENV.values_at("N"), process.env.N, process.env?.N, process["env"].N, System.getenv("N"),
+# System.getenv().get("N"), env::var("N"), env::var_os("N")), with the name in a string literal of the forms those
+# languages write: Python's prefixes and triple quotes (r"N", f"N", b'N', '''N'''), a backtick (`N`), a Java text
+# block ("""<newline>N"""), C#'s verbatim and interpolated strings (@"N", $"N", $@"N"), Rust's raw strings (r"N",
+# r#"N"#) and Ruby's percent literals (%q(N), %Q[N], %(N), %w[N]). Only a braced ${N:+x} or ${N+x} expands to x, not
+# the value: $N+ and process.env.N+"" read it.
 _VARIABLE_READ_RE = re.compile(
     r"""(?:\$(?P<brace>\{)?(?:env:)?|%|\benv:|\$ENV\{\s*['"]?|\$_(?:ENV|SERVER)\[\s*['"]"""
-    r"""|\b(?:getenv|environb?|env|GetEnvironmentVariable|LookupEnv|var(?:_os)?)(?:\s*['"`]\s*\])?\s*"""
+    r"""|\b(?:getenvb?|environb?|env|GetEnvironmentVariable|LookupEnv|var(?:_os)?)(?:\s*['"`]\s*\])?\s*"""
     r"""(?:\(\s*\)\s*)?(?:\.\s*(?:copy|to_h|to_hash)\s*(?:\(\s*\)\s*)?)?(?:\)\s*)?"""
     r"""(?:(?:\.\s*(?:get|fetch|pop|setdefault|getOrDefault|__getitem__|values_at|fetch_values)\s*)?"""
-    r"""(?:\?\.\s*)?[\[(]\s*(?:key\s*=\s*)?[rbuf]{0,2}(?:'{3}|"{3}|['"`])|\??\.\s*))"""
+    r"""(?:\?\.\s*)?[\[(]\s*(?:key\s*=\s*)?"""
+    r"""(?:(?:[rbuf]{0,2}|[@$]{1,2}|b?r#+)(?:'{3}|"{3}(?:[^\S\n]*\n[^\S\n]*)?|['"`])|%[qw]?[^\w\s])|\??\.\s*))"""
     r"""(?P<name>LIBRENMS_\w+)(?!\w)(?(brace)(?!:?\+))""",
     re.IGNORECASE | re.ASCII,
 )
@@ -238,7 +242,12 @@ _WRAPPER_LONG = {
 # Shells that run the command string their -c option gives (bash -c 'env', sh -lc env, pwsh -Command 'gci env:',
 # cmd /c set): _command_start reads that string's first word as the command. Without one the shell is the command.
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish"})
-_SHELL_VALUED = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})  # bash -o pipefail -c ...
+_SHELL_VALUED = frozenset({"--rcfile", "--init-file"})  # bash --rcfile FILE -c ...
+# How a shell reads the value of -o (set -o) or -O (shopt) in an option cluster (_shell_string): bash, dash and ash
+# take the next word for each o or O in it, in order (bash -euo pipefail -c, bash -oe pipefail -c, dash -ouo errexit
+# nounset -c), while these read it as getopt does, from the rest of the cluster, or from the next word when the o
+# ends it (zsh -euo pipefail -c, zsh -opipefail -c).
+_GETOPT_SHELLS = frozenset({"zsh", "ksh", "mksh", "fish"})
 _POWERSHELLS = frozenset({"pwsh", "powershell"})
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*=")
 _PATH_SPLIT_RE = re.compile(r"[\\/]")
@@ -2136,8 +2145,10 @@ def _command_start(words: List[str]) -> int:
 def _shell_string(words: List[str], at: int, name: str) -> int:
     """Where the command string starts that the shell *name* at *at* in *words* runs, or ``len(words)`` when it runs
     none (a script, its input). A Bourne-style shell or fish takes it after an option cluster holding ``c`` (``-c``,
-    ``-lc``, ``-ec``; ``-o``/``-O`` and their values skipped), PowerShell after ``-c``/``-Command``, cmd after
-    ``/c`` or ``/k``. Its quotes are gone from *words*, so its first word is the command it runs."""
+    ``-lc``, ``-ec``, ``+c``), past the values of ``-o`` and ``-O`` wherever they stand in a cluster, as that shell
+    reads them (``-o pipefail``, ``-euo pipefail``, ``-co pipefail``; :data:`_GETOPT_SHELLS`), PowerShell after
+    ``-c``/``-Command``, cmd after ``/c`` or ``/k``. Its quotes are gone from *words*, so its first word is the
+    command it runs."""
     at += 1
     if name in _SHELLS:
         given = False
@@ -2146,10 +2157,21 @@ def _shell_string(words: List[str], at: int, name: str) -> int:
             at += 1
             if option == "--":
                 break
-            if option in _SHELL_VALUED:
-                at += 1
-            elif option == "--command" or _flag(option, "c"):
-                given = True
+            if option.startswith("--"):
+                if option in _SHELL_VALUED:
+                    at += 1
+                given = given or option == "--command"
+                continue
+            letters = option[1:]
+            if name in _GETOPT_SHELLS:
+                valued = next((index for index, letter in enumerate(letters) if letter in "oO"), None)
+                if valued is not None:
+                    if valued == len(letters) - 1:
+                        at += 1  # the value is the next word: zsh -euo pipefail
+                    letters = letters[:valued]  # the rest of the cluster is the value: zsh -opipefail
+            else:
+                at += letters.count("o") + letters.count("O")  # a word for each: bash -ouo pipefail nounset
+            given = given or "c" in letters
         return at if given else len(words)
     marks = ("-c", "-command", "/c", "/command") if name in _POWERSHELLS else ("/c", "/k")
     for index in range(at, len(words)):
@@ -2216,9 +2238,10 @@ def _searches_home(words: List[str], home: str, xargs: bool, below: List[str] | 
     """The simple command *words* reads a Hermes home's ``.env`` without naming it: by a glob for dotfiles under the
     home (``~/.hermes/.e*``, ``~/.hermes/profiles/*/.*``; a plain ``*`` skips dotfiles), or by a recursive read
     (``grep -r``, ``grep -d recurse``, ``rg``, ``find -exec``, ``find`` piped to ``xargs`` when *xargs*) of the
-    home, its ``profiles`` directory or a profile's, where a ``.env`` is (:func:`_reaches`). *below*: the command
-    runs in a directory under a home (a ``cd`` before it), so a relative glob or path counts too, and so does a
-    recursive grep or searcher given no path, which reads the directory it runs in."""
+    home, its ``profiles`` directory or a profile's, where a ``.env`` is, or a glob that may expand to one
+    (``~/.hermes/*``; :func:`_reaches`). *below*: the command runs in a directory under a home (a ``cd`` before it),
+    so a relative glob or path counts too, and so does a recursive grep or searcher given no path, which reads the
+    directory it runs in."""
     paths = [word for word in words[1:] if _names_home(word, home)]
     relative = [word for word in words[1:] if below is not None and _relative(word)]
     if not paths and not relative:
@@ -2289,8 +2312,9 @@ def _walk(below: List[str], path: str) -> List[str] | None:
 def _reaches(below: List[str], path: str) -> bool:
     """A recursive read of the relative *path* from *below* (parts under a Hermes home) reaches a ``.env``: it ends at
     the home, its ``profiles`` directory or a profile's, or above the home, which holds it, never at a directory
-    beside them (``~/.hermes/skills``); ``..`` goes up a part (``~/.hermes/skills/..`` is the home). *below* is left
-    as it was, and only *path* is walked."""
+    beside them (``~/.hermes/skills``); ``..`` goes up a part (``~/.hermes/skills/..`` is the home), and a glob the
+    shell may expand to ``profiles`` counts as it (``~/.hermes/*``, ``~/.hermes/p*/*``; :func:`_may_match`). *below*
+    is left as it was, and only *path* is walked."""
     depth, added = len(below), []
     for part in _PATH_SPLIT_RE.split(path):
         if part == "..":
@@ -2305,7 +2329,29 @@ def _reaches(below: List[str], path: str) -> bool:
     if depth + len(added) == 0:
         return True
     first = below[0] if depth else added[0]
-    return first.lower() == "profiles" and depth + len(added) <= 2
+    return depth + len(added) <= 2 and _may_match(first, "profiles")
+
+
+def _may_match(part: str, name: str) -> bool:
+    """The path part *part* may stand for the directory *name*, letter case aside: it is *name*, or a shell glob that
+    can expand to it (``*``, ``p*``, ``?rofiles``). A bracket expression may stand for the rest of the name: the
+    words of a simple command end at a ``]`` (:data:`_COMMAND_SPLIT_RE`), so its end and what follows are never seen
+    (``[p]rofiles`` reads ``[p``), and the answer errs towards a match. The positions of *name* the glob can reach so
+    far are kept as a set, which costs linear time in *part*'s length."""
+    part, name = part.lower(), name.lower()
+    reach = {0}
+    for char in part:
+        if not reach:
+            return False
+        if char == "[":
+            return True
+        if char == "*":
+            reach = set(range(min(reach), len(name) + 1))
+        elif char == "?":
+            reach = {spot + 1 for spot in reach if spot < len(name)}
+        else:
+            reach = {spot + 1 for spot in reach if spot < len(name) and name[spot] == char}
+    return len(name) in reach
 
 
 def _active_home() -> str:

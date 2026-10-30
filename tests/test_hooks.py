@@ -992,6 +992,17 @@ class SecretGuard(HookCase):
             'console.log(process["env"].LIBRENMS_TOKEN)',
             'println!("{:?}", std::env::var_os("LIBRENMS_TOKEN"));',
             'p ENV.values_at("LIBRENMS_TOKEN")',
+            # what 0.14.2 let through: C#'s verbatim and interpolated strings, Rust's raw strings with hashes, Ruby's
+            # percent literals, a Java text block and Python's bytes getenv
+            'Console.WriteLine(Environment.GetEnvironmentVariable(@"LIBRENMS_TOKEN"));',
+            'Console.WriteLine(Environment.GetEnvironmentVariable($"LIBRENMS_TOKEN"));',
+            'Console.WriteLine(Environment.GetEnvironmentVariable($@"LIBRENMS_TOKEN"));',
+            'println!("{}", std::env::var(r#"LIBRENMS_TOKEN"#).unwrap());',
+            "puts ENV[%q(LIBRENMS_TOKEN)]",
+            "puts ENV.fetch(%Q{LIBRENMS_TOKEN})",
+            "puts ENV.fetch(%w[LIBRENMS_TOKEN][0])",
+            'System.out.println(System.getenv("""\n    LIBRENMS_TOKEN"""));',
+            'print(os.getenvb(b"LIBRENMS_TOKEN"))',
         )
         for command in reads:
             directive = self.hook("terminal", {"command": command})
@@ -1175,6 +1186,13 @@ class SecretGuard(HookCase):
             "grep --directories=recurse TOKEN ~/.hermes",
             "grep -d recurse TOKEN ~/.hermes",
             "bash -c 'grep -r TOKEN ~/.hermes'",
+            # what 0.14.2 let through: a shell whose option cluster ends in o, and a glob the shell expands to
+            # profiles, whose every profile's .env a recursive read then reaches
+            "bash -euo pipefail -c 'grep -r TOKEN ~/.hermes'",
+            "grep -r TOKEN ~/.hermes/*",
+            "cd ~/.hermes; grep -r TOKEN *",
+            "grep -rh TOKEN ~/.hermes/p*/netops",
+            "cd ~/.hermes/[p]rofiles && grep -r TOKEN .",
         )
         for command in searches:
             directive = self.hook("terminal", {"command": command})
@@ -1197,6 +1215,9 @@ class SecretGuard(HookCase):
             "cd ~/.hermes && cd /srv/app && grep -r TOKEN .",
             "grep -r TOKEN ~/.hermes/skills/../plugins",
             "grep -d skip TOKEN ~/.hermes/config.yaml",
+            "grep -r TOKEN ~/.hermes/s*",  # a glob that cannot expand to profiles
+            "cd ~/.hermes/skills && grep -r TOKEN *",
+            "cat ~/.hermes/*",  # not recursive, and * leaves out the dotfiles
         ):
             self.assertIsNone(self.hook("terminal", {"command": command}), command)
         # a read by name blocks, whatever file it comes from
@@ -1235,6 +1256,17 @@ class SecretGuard(HookCase):
             "cmd /c set",
             "sudo --user root env",
             "timeout --signal KILL 5 env",
+            # what 0.14.2 let through: the value of -o or -O inside an option cluster, as each shell reads it
+            "bash -euo pipefail -c 'env | sort'",
+            "sh -eo pipefail -c printenv",
+            "sudo -u root bash -eo pipefail -c env",
+            "bash -oe pipefail -c env",  # bash and dash take a word for every o, wherever it stands
+            "dash -ouo errexit nounset -c env",
+            "bash -co pipefail env",
+            "bash +c env",
+            "zsh -euo pipefail -c env",
+            "zsh -opipefail -c env",  # zsh and ksh take the rest of the cluster
+            "ksh -eo pipefail -c env",
         )
         code = (
             "print(dict(os.environ))",
@@ -1271,6 +1303,7 @@ class SecretGuard(HookCase):
             "python3 -m venv env",
             "command -v env",
             "bash deploy.sh env",  # a script, run with an argument
+            "bash -euo pipefail deploy.sh env",  # the same, after the value of the cluster's o
             "bash -c 'set -euo pipefail; make'",
             'sh -c "env FOO=1 make"',
             "sudo --preserve-env make",
@@ -1365,6 +1398,16 @@ class SecretGuard(HookCase):
             "LIBRENMS_x " + "set -x " * 60_000,
             "process.env?." * 60_000,
             'process["env"' * 60_000,
+            "bash -" + "o" * 300_000 + " -c env",
+            "zsh -" + "e" * 300_000 + "o pipefail -c env",
+            "grep -r x ~/.hermes/" + "*a" * 150_000,
+            "grep -r x ~/.hermes/" + "*" * 300_000,
+            "grep -r x ~/.hermes/" + "[" * 300_000,
+            "grep -r x ~/.hermes/" + "[!]" * 100_000,
+            "cd ~/.hermes/" + "?" * 300_000 + "; grep -r x .",
+            "env::var(r" + "#" * 300_000,
+            'getenv("""' + " " * 300_000,
+            "ENV[%" * 100_000,
         ):
             started = time.monotonic()
             self.hook("execute_code", {"code": text})
