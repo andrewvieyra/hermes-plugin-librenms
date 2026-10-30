@@ -3,6 +3,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from .base import PluginTestCase
 from .helpers import submodule
 
 base = submodule("resources.base")
@@ -848,6 +849,52 @@ class Registry(unittest.TestCase):
         self.assertIs(resources.Field, base.Field)
         self.assertIs(resources.Resource, base.Resource)
         self.assertEqual(resources.INVERSE_KINDS, ("exact", "lossy", "none", "not_needed"))
+
+
+class MaintenanceChecks(unittest.TestCase):
+    """The maintenance checks the device, device group and location resources share (one copy since 0.14.3: the
+    three had drifted, and two read a duration in any script's digits)."""
+
+    def test_a_duration_is_hours_and_minutes_in_ascii_digits(self):
+        for duration, minutes in (("2:00", 120), ("0:30", 30), ("9999:59", 599999), ("0:00", 0)):
+            self.assertEqual(base.maintenance_minutes(duration), minutes, duration)
+        # PHP reads (float)"\uff12" as 0: a fullwidth or Arabic-Indic hour is a window that ends as it starts
+        for duration in ("\uff12:00", "\u0662:00", "2:\uff10\uff10", "120", "2:60", " 2:00", 2, None, "10000:00"):
+            self.assertIsNone(base.maintenance_minutes(duration), duration)
+
+    def test_a_start_and_a_behavior(self):
+        self.assertTrue(base.valid_maintenance_start("2026-10-29 01:00:00"))
+        for start in ("2026-02-30 01:00:00", "2026-10-29T01:00:00", "\uff12026-10-29 01:00:00", None):
+            self.assertFalse(base.valid_maintenance_start(start), start)
+        for value, name in (("mute_alerts", "mute_alerts"), (2, "mute_alerts"), ("3", "run_alerts")):
+            self.assertEqual(base.maintenance_behavior(value), name, value)
+        for value in ("pause", 4, "\uff12", True, "-1", None):
+            self.assertIsNone(base.maintenance_behavior(value), value)
+
+
+class MaintenancePlans(PluginTestCase):
+    def test_every_resource_that_schedules_maintenance_checks_it_alike(self):
+        # what 0.14.1 planned and applied for a device or a device group: "\uff12:00", which LibreNMS saves as a
+        # window that ends as it starts, while a location refused it
+        planner = submodule("planner")
+        targets = (
+            ("device", {"hostname": "core-sw1.example.net"}),
+            ("device_group", {"name": "core-switches"}),
+            ("location", {"location": "SFO-1"}),
+        )
+        for resource, match in targets:
+            for data in ({"duration": "\uff12:00"}, {"duration": "2:00", "start": "\uff12026-10-29 01:00:00"}):
+                operation = {"op": "maintenance", "resource": resource, "match": match, "data": data}
+                with self.assertRaises(planner.PlanError, msg=(resource, data)) as caught:
+                    self.plan([operation])
+                [error] = caught.exception.errors
+                self.assertRegex(error["error"], "^(duration|start)", (resource, data))
+            # a behavior's number as digits is its name everywhere (only the device took "2" before)
+            operation = {"op": "maintenance", "resource": resource, "match": match,
+                         "data": {"duration": "2:00", "behavior": "2"}}  # fmt: skip
+            [step] = self.plan([operation])["steps"]
+            self.assertEqual(step["params"]["behavior"], "mute_alerts", resource)
+        self.assertEqual(self.fake.writes(), [])
 
 
 if __name__ == "__main__":

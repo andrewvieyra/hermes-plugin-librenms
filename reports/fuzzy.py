@@ -177,12 +177,17 @@ def level(term: str, value: str) -> int:
 
 
 def _whole(term: Term, fields: Iterable[Tuple[str, Any]]) -> Tuple[int, str]:
-    """The best whole-term match over *fields* (name, value) and its why."""
+    """The best whole-term match over *fields* (name, value) and its why, which quotes both the value and what the
+    person typed (``hostname 'core-sw1.example.net' starts with 'core'``), or the value alone when they are the same
+    (``sysName equals 'core-sw1'``), so the why shows what matched."""
     best: Tuple[int, str] = (0, "")
     for name, value in fields:
         found = level(term.whole, norm(value)) if value else 0
         if found > best[0]:
-            best = (found, f"{name} {_VERBS[found]} {shown(value)}")
+            if found == 100:
+                best = (found, f"{name} {_VERBS[found]} {shown(value)}")
+            else:
+                best = (found, f"{name} {shown(value)} {_VERBS[found]} {shown(term.text.strip())}")
     return best
 
 

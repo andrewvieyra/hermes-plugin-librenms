@@ -26,6 +26,9 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Tuple
 
 _PREFIXES = (("T", 1e12), ("G", 1e9), ("M", 1e6), ("k", 1e3))
+# Below 1, as LibreNMS's Number::formatSi shows a sensor's current, power or frequency: 6.53 mA, 450 µW
+_SMALL_PREFIXES = (("m", 1e-3), ("µ", 1e-6), ("n", 1e-9))
+SIGNIFICANT = 6  # digits a derived figure keeps (significant), so a small one keeps its precision and its sign
 _SPEED_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(?:bit/s|bps|b)?\s*$", re.IGNORECASE)
 _DURATION_RE = re.compile(r"^\s*(\d{1,6})\s*([smhdw])\s*$", re.IGNORECASE)
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -69,14 +72,15 @@ def number(value: Any) -> float | None:
     return found if math.isfinite(found) else None
 
 
-def _scaled(value: float, unit: str, *, compact: bool = False) -> str:
+def _scaled(value: float, unit: str, *, compact: bool = False, small: bool = False) -> str:
     """*value* to three significant digits with the largest decimal prefix that keeps it at 1 or more (999.6 is
-    rounded first, so it reads 1 k, not 1000)."""
+    rounded first, so it reads 1 k, not 1000); with *small*, a value below 1 takes ``m``, ``µ`` or ``n`` the same
+    way (0.00653 reads 6.53 m)."""
     rounded = float(f"{value:.3g}")
     prefix, shown = "", rounded
-    for name, size in _PREFIXES:
+    for name, size in (*_PREFIXES, *(_SMALL_PREFIXES if small and 0 < abs(rounded) < 1 else ())):
         if abs(rounded) >= size:
-            prefix, shown = name, rounded / size
+            prefix, shown = name, float(f"{rounded / size:.3g}")
             break
     text = f"{shown:.3g}"
     if "e" in text:  # past 999 T only
@@ -100,19 +104,27 @@ def speed(value: Any) -> str | None:
 
 
 def sensor_reading(value: Any, sensor_class: Any) -> str | None:
-    """A sensor's reading as LibreNMS shows it: ``41 °C``, ``-3.2 dBm``, ``2.4 kW`` (current, power, frequency and
-    bit rates with a prefix), ``1h 30m`` for a runtime (minutes); a state or a class without a unit as the bare
-    number. None when *value* is not a number."""
+    """A sensor's reading as LibreNMS shows it: ``41 °C``, ``-3.2 dBm``, ``2.4 kW`` and ``6.53 mA`` (current, power,
+    frequency and bit rates with a prefix, above 1000 or below 1), ``1h 30m`` for a runtime (minutes); a state or a
+    class without a unit as the bare number. None when *value* is not a number."""
     found = number(value)
     if found is None:
         return None
     unit = SENSOR_UNITS.get(sensor_class, "") if isinstance(sensor_class, str) else ""
     if sensor_class == "runtime":
         return duration(found * 60)
-    if sensor_class in _SI_CLASSES and abs(found) >= 1000:
-        return _scaled(found, unit)
+    if sensor_class in _SI_CLASSES and (abs(found) >= 1000 or 0 < abs(found) < 1):
+        return _scaled(found, unit, small=True)
     text = f"{round(found, 3):g}" if abs(found) < 1e6 else f"{found:.0f}"
     return f"{text} {unit}" if unit else text
+
+
+def significant(value: float | None, digits: int = SIGNIFICANT) -> float | None:
+    """*value* rounded to *digits* significant digits, not to a number of decimals: a margin of 0.00503 A keeps its
+    digits and one of -0.0003 its sign, where three decimals would read 0.005 and -0.0. None stays None."""
+    if value is None or value == 0 or not math.isfinite(value):
+        return value
+    return float(f"{value:.{digits}g}")
 
 
 def size(value: Any) -> str | None:

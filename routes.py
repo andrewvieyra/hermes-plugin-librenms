@@ -87,7 +87,7 @@ _IFNAME = (
     "columns=port_id,ifName) and query ports/{port_id}"
 )
 
-# Every GET route of routes/api.php, in registration order (specs/ln-route-index.md, section A).
+# Every GET route of LibreNMS's routes/api.php, in registration order.
 ROUTES: Tuple[Route, ...] = (
     Route("ping", "ping"),
     Route("server_info", "system", list_key="system"),

@@ -8,9 +8,11 @@ route) is refused, so :func:`facts` derives what the questions need from a port 
   ``lowerLayerDown``, ``notPresent``, ...). LibreNMS counts as down every port that is administratively up and
   not up, unless it is ignored or its polling is disabled (``Port::scopeIsDown``); ``summary.not_up`` counts
   those, and ``polling_disabled`` says which ports LibreNMS no longer polls.
-- ``speed_bps``: the circuit speed parsed from the description (``port_descr_speed``, ``egress/ingress``) when it
-  is set, as LibreNMS's web UI measures utilisation (``Port::getSpeeds``); else ``ifSpeed``; else
-  ``ifHighSpeed`` Mbit/s, which older releases kept beside an ``ifSpeed`` stuck at 4294967295. 0 is not known.
+- ``speed_bps``: what utilisation is measured against: the circuit speed parsed from the description
+  (``port_descr_speed``, ``egress/ingress``) when it is set, as LibreNMS's web UI measures it (``Port::getSpeeds``);
+  else the interface speed. ``interface_speed_bps``: the speed the interface itself runs at (``ifSpeed``; else
+  ``ifHighSpeed`` Mbit/s, which older releases kept beside an ``ifSpeed`` stuck at 4294967295), never a circuit
+  speed; ``speed_below_mbps``, sort ``speed`` and capacity's ``free_by_speed`` compare it. 0 is not known.
 - ``in_bps``/``out_bps``: the octet rates times 8; ``in_pct`` against the ingress speed, ``out_pct`` against the
   egress speed (null when the speed is not known), ``util_pct`` the larger.
 - errors in the last poll (``*_delta``) and per second over it.
@@ -78,7 +80,7 @@ class Port:
     row: Dict[str, Any]
     device: Dict[str, Any]
     state: str | None
-    speed: int | None
+    speed: int | None  # the interface's own speed (interface_speed_bps), never a circuit speed
     util: float | None  # the larger of in_pct and out_pct; None when not known or not current
     errors: int  # in and out errors in the last poll; 0 when not current
     fresh: bool
@@ -182,6 +184,7 @@ def facts(port: Dict[str, Any], device: Dict[str, Any], now: datetime) -> Port:
     """*port* (a ports row) on *device* (its devices row) as a report row, with what filters and orders compare."""
     state = port_state(port)
     egress, ingress, source = speeds(port)
+    interface, _from = interface_speed(port)
     period = units.number(port.get("poll_period")) or POLL_S
     polled = units.utc_time(port.get("poll_time"))
     fresh = polled is not None and (units.age(polled, now) or 0) <= STALE_POLLS * period
@@ -199,6 +202,7 @@ def facts(port: Dict[str, Any], device: Dict[str, Any], now: datetime) -> Port:
     row.update(speed_bps=fastest, speed=_speed_text(egress, ingress), speed_source=source)
     if egress != ingress:
         row.update(in_speed_bps=ingress, out_speed_bps=egress)
+    row.update(interface_speed_bps=interface, interface_speed=units.speed(interface))
     row.update(duplex=_duplex(port.get("ifDuplex")), mtu=_count(port.get("ifMtu")))
     row.update({"in_bps": in_bps, "in": units.bits_per_second(in_bps), "in_pct": in_pct})
     row.update(out_bps=out_bps, out=units.bits_per_second(out_bps), out_pct=out_pct, util_pct=util)
@@ -213,7 +217,7 @@ def facts(port: Dict[str, Any], device: Dict[str, Any], now: datetime) -> Port:
         row,
         device,
         state,
-        fastest,
+        interface,
         util if fresh else None,
         (errors_in or 0) + (errors_out or 0) if fresh else 0,
         fresh,
@@ -490,8 +494,8 @@ def build_capacity(ctx: ReportContext, req: Request) -> Dict[str, Any]:
 
 def _capacity_row(ports: List[Port], idle: float) -> Dict[str, Any]:
     """One device's ethernet ports: by state, free (not up, and unchanged for *idle* seconds or more), free_unknown
-    (not up, last change not known that far back), used_pct (up of all), free_by_speed, and stale when none of its
-    ports has a current poll."""
+    (not up, last change not known that far back), used_pct (up of all), free_by_speed (by the speed the interface
+    runs at), and stale when none of its ports has a current poll."""
     device = ports[0].device
     row: Dict[str, Any] = {**brief(device), "location": device.get("location") or None}
     up = sum(item.state == "up" for item in ports)

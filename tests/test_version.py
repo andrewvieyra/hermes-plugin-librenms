@@ -222,6 +222,15 @@ class Manifest(unittest.TestCase):
         self.assertEqual(schema["write_mode"]["choices"], list(submodule("settings").WRITE_MODES))
         self.assertEqual([name for name, entry in schema.items() if "choices" in entry], ["write_mode"])
 
+    def test_every_bounded_setting_states_its_limit(self):
+        # what 0.14.1 left out for plan_retention_days, whose value past 3650 is lowered with a settings error
+        settings = submodule("settings")
+        schema = manifest()["config_schema"]
+        for name, limit in settings.LIMITS.items():
+            least = settings.MINIMUMS.get(name)
+            said = f"{least} to {limit}" if least else f"at most {limit}"
+            self.assertIn(said, schema[name]["description"], name)
+
     def test_the_subset_reader_agrees_with_a_yaml_parser(self):
         try:
             import yaml
@@ -338,6 +347,61 @@ class Documentation(unittest.TestCase):
         for word in ("`librenms:ask`", "/librenms:ask", "examples/conversations/"):
             self.assertIn(word, text)
         self.assertGreaterEqual(text.count("you    >"), 4)  # dialogues, with follow-ups
+
+
+class ModuleTable(unittest.TestCase):
+    """docs/architecture.md's module table, which says each module imports only those listed above it."""
+
+    def test_each_module_is_listed_after_what_it_imports(self):
+        # what 0.14.1 said held and did not: client imported redact, listed below it, and planner, executor and
+        # audit imported modules listed after them
+        doc = (REPO_ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
+        table = doc.split("## Modules", 1)[1].split("\n\n", 2)[1]
+        rows = [line for line in table.splitlines() if line.startswith("| `")]
+        place: Dict[str, Any] = {}  # a module's row, and its place in a row that names several
+        for at, line in enumerate(rows):
+            for within, name in enumerate(re.findall(r"`([\w/*]+)`", line.split("|")[1])):
+                place[name] = (at, within)
+        self.assertIn("Each module imports only modules listed above it", doc)
+        for path in sorted(REPO_ROOT.rglob("*.py")):
+            relative = path.relative_to(REPO_ROOT)
+            if relative.parts[0] in ("tests", "examples") or any(part.startswith(".") for part in relative.parts):
+                continue
+            module = _table_name(relative.with_suffix("").parts)
+            self.assertIn(module, place, f"{relative} has no row")
+            for imported in _imports(path, relative):
+                name = _table_name(imported)
+                if name != module and name in place and module != "__init__":
+                    self.assertLess(place[name], place[module], f"{module} imports {name}, listed after it")
+
+
+def _table_name(parts: Any) -> str:
+    """A module as the table names it: resources/* for every resource module, reports for its registry."""
+    parts = [part for part in parts if part != "__init__"]
+    if parts and parts[0] == "resources":
+        return "resources/*"
+    return "/".join(parts) or "__init__"
+
+
+def _imports(path: Any, relative: Any) -> List[List[str]]:
+    """The plugin's modules *path* imports at run time (relative imports outside ``if TYPE_CHECKING``)."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    typing_only = {id(node) for block in ast.walk(tree) if isinstance(block, ast.If)
+                   and "TYPE_CHECKING" in ast.unparse(block.test) for node in ast.walk(block)}  # fmt: skip
+    package = list(relative.parent.parts)
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level and id(node) not in typing_only:
+            base = package[: len(package) - (node.level - 1)] if node.level > 1 else package
+            module = base + (node.module.split(".") if node.module else [])
+            if node.module:
+                out.append(module)
+            for alias in node.names:  # from . import audit, digest: modules, not names
+                if REPO_ROOT.joinpath(*module, alias.name + ".py").exists():
+                    out.append([*module, alias.name])
+    return out
 
 
 class AfterInstall(unittest.TestCase):

@@ -1041,15 +1041,6 @@ class LibreNMSClient:
         rows = self.result(self.get("system"), "system")
         return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
 
-    def route_names(self) -> List[str]:
-        """The route names this LibreNMS lists in its API index (capability detection); ``[]`` when it cannot be
-        read."""
-        try:
-            body = self.get("")
-        except LibreNMSError:
-            return []
-        return sorted(str(name) for name in body) if isinstance(body, dict) else []
-
     @staticmethod
     def result(body: Any, key: str | None = None) -> Any:
         """What an envelope carries: ``body[key]``, or without *key* the first entry that is not ``status``,

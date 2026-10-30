@@ -27,7 +27,7 @@ How the plugin maps onto the LibreNMS API v0, route by route: all 145 registrati
 - **report**: also read by `librenms_report`, which builds its paths from fixed words and resolved
   ids and checks each against this same table before sending it (see Reports below).
 - **refused**: `librenms_query` refuses it, with the reason given; no setting enables it.
-- **not in 0.1.0**: the plugin never sends it, for the reason given.
+- **never sent**: the plugin never sends it, for the reason given.
 
 "Planning reads" marks a route the resources also read while planning, checking preconditions,
 verifying a write or rolling back. Unknown paths are refused before anything is sent:
@@ -95,8 +95,8 @@ at most 30 requests each.
 |---|---|---|
 | 4 | `GET alert_templates/{id}` | query; `{id}` must be a positive number (`0` lists every template) |
 | 5 | `GET alert_templates` | query |
-| 6 | `POST alert_templates` | not in 0.1.0: LibreNMS renders the template with Blade on the server before validating it, so a template is code that runs inside LibreNMS; and the API cannot delete one, so a create would have no inverse |
-| 7 | `PUT alert_templates` | not in 0.1.0: as #6; an edit also wipes and replaces the template's rule mappings |
+| 6 | `POST alert_templates` | never sent: LibreNMS renders the template with Blade on the server before validating it, so a template is code that runs inside LibreNMS; and the API cannot delete one, so a create would have no inverse |
+| 7 | `PUT alert_templates` | never sent: as #6; an edit also wipes and replaces the template's rule mappings |
 | 8 | `GET pollers` | query |
 | 9 | `GET pollers/log` | query |
 | 56 | `GET poller_group/{poller_group_id_or_name?}` | query; planning reads (a device's `poller_group` must exist). `poller_group/0` is refused: LibreNMS reads `"0"` as no group and lists every group, while 0 is the General group, which has no row |
@@ -107,7 +107,7 @@ at most 30 requests each.
 |---|---|---|
 | 10 | `GET bgp` | query (`?hostname=` resolved); report: `routing` |
 | 11 | `GET bgp/{id}` | query |
-| 12 | `POST bgp/{id}` (`edit_bgp_descr`) | not in 0.1.0: the API cannot clear a description (so setting one where there was none has no inverse), longer values are silently truncated, and LibreNMS defines no permission for it, so by default only an admin may |
+| 12 | `POST bgp/{id}` (`edit_bgp_descr`) | never sent: the API cannot clear a description (so setting one where there was none has no inverse), longer values are silently truncated, and LibreNMS defines no permission for it, so by default only an admin may |
 | 13 | `GET ospf` | query (`?hostname=` resolved); report: `routing` |
 | 14 | `GET ospf_ports` | query |
 | 15 | `GET ospfv3` | query (`?hostname=` resolved). LibreNMS answers HTTP 500 `Error retrieving ospfv3_nbrs` when it holds no OSPFv3 neighbour (for the device asked for, or at all); `ospfv3NbrRtrId` is the neighbour's router id as a 32-bit number. Report: `routing`, which writes that router id dotted, reads that answer as none, and the 404 of a LibreNMS without this route as none with a note (also when OSPFv3 is the only protocol asked for) |
@@ -148,9 +148,9 @@ at most 30 requests each.
 | 29 | `GET port_groups/{name}` | query; report: `scope.port_group` (`ports`), by the group's id, never `full=1` (every column of every port) |
 | 30 | `GET portgroups/multiport/bits/{id}` | refused: graph image |
 | 31 | `GET portgroups/{group}` | refused: graph image |
-| 32 | `POST port_groups` | not in 0.1.0: the API cannot delete a port group, so a create would have no inverse |
-| 33 | `POST port_groups/{port_group_id}/assign` | not in 0.1.0: port groups are left to the web UI in this release |
-| 34 | `POST port_groups/{port_group_id}/remove` | not in 0.1.0: as #33 |
+| 32 | `POST port_groups` | never sent: the API cannot delete a port group, so a create would have no inverse |
+| 33 | `POST port_groups/{port_group_id}/assign` | never sent: port groups are left to the web UI |
+| 34 | `POST port_groups/{port_group_id}/remove` | never sent: as #33 |
 
 ## Alerts
 
@@ -187,7 +187,7 @@ on the poller.
 
 | # | Route | Coverage |
 |---|---|---|
-| 55 | `POST syslogsink` | not in 0.1.0: it appends syslog lines that can raise alerts and cannot be removed, and would let the model forge the log it reads |
+| 55 | `POST syslogsink` | never sent: it appends syslog lines that can raise alerts and cannot be removed, and would let the model forge the log it reads |
 
 ## Devices
 
@@ -217,7 +217,7 @@ on the poller.
 | 78 | `GET devices/{hostname}/ports/{ifname}` | refused: LibreNMS misreads interface names that contain `/`; find the `port_id` with #71 (`params: {"columns": "port_id,ifName"}`) and query `ports/{port_id}` |
 | 79 | `GET devices/{hostname}/ports/{ifname}/{type}` | refused: graph image |
 | 80 | `GET devices/{hostname}/services/{id}/graphs/{datasource}` | refused: graph image |
-| 81 | `POST devices/{hostname}/eventlog` | not in 0.1.0: it appends an eventlog row that cannot be removed (LibreNMS accepts it even from a global-read token), and the eventlog is the record plans are linked to |
+| 81 | `POST devices/{hostname}/eventlog` | never sent: it appends an eventlog row that cannot be removed (LibreNMS accepts it even from a global-read token), and the eventlog is the record plans are linked to |
 | 82 | `GET devices/{hostname}/{type}` | refused: LibreNMS serves every device sub-path it has no other route for as a graph image, so a mistyped sub-path lands here too |
 | 83 | `GET devices` | query (SNMP credentials masked); planning reads (`type=location_id`: the devices at a location); report: every view (one listing a report, named fields only), `find` (`type=ipv4`, `ipv6` or `mac` for an address). `type` with `query`: `hostname`, `display`, `location`, `serial`, `version`, `hardware`, `features` match part of the value, `sysName`, `os`, `type`, `location_id`, `device_id` the whole, `ipv4`, `ipv6` an address on a port and `mac` an ARP entry on one; `up`, `down`, `disabled`, `ignored`, `active` need no `query`; any other `type` is no filter at all |
 | 84 | `POST devices` | plan: `device` `create` (`allow_device_add`; SNMP credentials only as `{"env": "LIBRENMS_SNMP_…"}` references, resolved at apply time; rollback deletes the device) |
@@ -225,12 +225,12 @@ on the poller.
 | 86 | `PATCH devices/{hostname}` | plan: `device` `update` (`notes`, `purpose`, `location`, `poller_group`, `display_template`, the `disabled`/`ignore`/`disable_notify`/`ignore_status`/`override_sysLocation` flags, `type`, `icon`, and `overwrite_ip` with `allow_device_add`; never SNMP settings, which v0 cannot change); also its rollback |
 | 87 | `PATCH devices/{hostname}/rename/{new_hostname}` | plan: `device` `update` with `hostname` (`allow_device_add`, since it changes which host LibreNMS polls with the device's credentials); also its rollback |
 | 88 | `POST devices/{hostname}/maintenance` | plan: `device` `maintenance` (title tagged `[hermes:<plan id>]`; irreversible: the API cannot end maintenance) |
-| 89 | `POST devices/{id}/parents` | not in 0.1.0: it replaces the device's whole parent set |
-| 90 | `DELETE devices/{id}/parents` | not in 0.1.0: without `parent_ids` it removes every parent |
-| 91 | `PATCH devices/{hostname}/port/{portid}` | not in 0.1.0: port notes cannot be read back through the API, so the write could not be verified, and a body without `notes` erases the existing notes |
-| 92 | `POST devices/{hostname}/components/{type}` | not in 0.1.0: components are discovery data |
-| 93 | `PUT devices/{hostname}/components` | not in 0.1.0: it replaces each component's preferences whole, and a list body edits components by position |
-| 94 | `DELETE devices/{hostname}/components/{component}` | not in 0.1.0: as #92 |
+| 89 | `POST devices/{id}/parents` | never sent: it replaces the device's whole parent set |
+| 90 | `DELETE devices/{id}/parents` | never sent: without `parent_ids` it removes every parent |
+| 91 | `PATCH devices/{hostname}/port/{portid}` | never sent: port notes cannot be read back through the API, so the write could not be verified, and a body without `notes` erases the existing notes |
+| 92 | `POST devices/{hostname}/components/{type}` | never sent: components are discovery data |
+| 93 | `PUT devices/{hostname}/components` | never sent: it replaces each component's preferences whole, and a list body edits components by position |
+| 94 | `DELETE devices/{hostname}/components/{component}` | never sent: as #92 |
 
 ## Logs
 
@@ -266,8 +266,8 @@ on the poller.
 | 112 | `GET bills/{bill_id}/history` | query |
 | 113 | `GET bills/{bill_id}/history/{bill_hist_id}/graphs/{graph_type}` | refused: graph image |
 | 114 | `GET bills/{bill_id}/history/{bill_hist_id}/graphdata/{graph_type}` | query |
-| 115 | `POST bills` | not in 0.1.0: billing is left to the web UI in this release; create and edit share the route, and an edit replaces the bill's port list |
-| 116 | `DELETE bills/{bill_id}` | not in 0.1.0: as #115 |
+| 115 | `POST bills` | never sent: billing is left to the web UI; create and edit share the route, and an edit replaces the bill's port list |
+| 116 | `DELETE bills/{bill_id}` | never sent: as #115 |
 
 ## Resources
 
@@ -316,5 +316,5 @@ on the poller.
 | refused | 13 GET routes: 9 graph images (#30, #31, #61, #62, #79, #80, #82, #110, #113), Oxidized configuration and search (#18, #19), the rediscovery GET (#58, a plan operation instead) and the ifName route (#78) |
 | plan | 22 write routes and the rediscovery GET, across 7 resources |
 | not used (another route does the same) | 4 (#25, #26, #41, #42) |
-| not in 0.1.0 | 16 (#6, #7, #12, #32, #33, #34, #55, #81, #89, #90, #91, #92, #93, #94, #115, #116) |
+| never sent | 16 (#6, #7, #12, #32, #33, #34, #55, #81, #89, #90, #91, #92, #93, #94, #115, #116) |
 | catch-all | 1 (#145) |

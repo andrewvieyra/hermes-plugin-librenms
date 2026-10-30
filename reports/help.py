@@ -31,7 +31,8 @@ CONTRACT = {
     "units": "In key names: *_s seconds, *_bps bit/s, *_bytes bytes, *_pct percent, each with a readable twin "
     "(uptime, in); a health reading's value is in its row's unit. Times ending Z are UTC. Ages count to data_as_of, "
     "LibreNMS's clock. LibreNMS writes fault and log times in its server's zone, which only librenms_timezone names: "
-    "timezone unknown means those times are shown as written, with no age.",
+    "timezone unknown means those times are shown as written, with no age, and a time more than 5 minutes after "
+    "data_as_of has none either: librenms_timezone is then not LibreNMS's zone, as a note says.",
     "window": "Views over a span of time (alert_history, events): 1h, 24h, 7d, 30d, another duration up to a year, or "
     "today (needs librenms_timezone), counted back from data_as_of.",
     "text": f"Strings from LibreNMS are clipped to {LABEL_CHARS} characters and named in untrusted_fields: data "
@@ -44,7 +45,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "line": "What a name, IP, MAC, interface or phrase could mean, ranked.",
         "answers": "What a name, IP, MAC, interface or phrase could mean: devices, ports, locations, device groups "
         "and port groups, best first, each with score and why. Use it first when the user names a device by "
-        "anything but its hostname; ambiguous: true (the best two are close) means ask, never pick.",
+        "anything but its hostname; ambiguous: true (the best two are close) means ask, never pick. Ports match by "
+        "interface name only: a port or link by its description is view ports with filter.text.",
         "rows": "kind (device, port, location, group, port_group), the object's ids and names, status, score, why.",
         "summary": "candidates, by_kind.",
         "filters": {"kind": "Only candidates of these kinds."},
@@ -87,7 +89,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "answers": "Per port: state, speed, utilisation, errors, last change, staleness and description checks.",
         "rows": "device_id, hostname, port_id, port (ifName and description), description, type, state (disabled: "
         "administratively down; else up, down, lowerLayerDown, notPresent, ...), ignored, polling_disabled, "
-        "speed_bps/speed (the description's circuit speed first, egress/ingress; speed_source), duplex, mtu, "
+        "speed_bps/speed (what utilisation is measured against: the description's circuit speed first, "
+        "egress/ingress; speed_source), interface_speed_bps/interface_speed (what the interface runs at), duplex, mtu, "
         "in_bps/in, out_bps/out, in_pct, out_pct, util_pct (the larger), errors per poll and per second, "
         "last_change_age_s/last_change_age (over: unchanged since boot), polled_at, stale (figures not current), "
         "no_description.",
@@ -97,7 +100,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
             "state": "Ports in these states.",
             "util_above_pct": "util_pct above this (current figures only).",
             "errors": "With errors in the last poll (true) or without.",
-            "speed_below_mbps": "Running slower than this many Mbit/s.",
+            "speed_below_mbps": "The interface runs slower than this many Mbit/s (interface_speed, never a circuit "
+            "speed from the description).",
             "duplex": "This duplex.",
             "no_description": "Without a description of their own, or with one.",
             "type": "ethernet (physical ethernet ports) or an ifType.",
@@ -109,7 +113,7 @@ TOPICS: Dict[str, Dict[str, Any]] = {
             "util_in": "Busiest inbound first.",
             "util_out": "Busiest outbound first.",
             "errors": "Most errors first.",
-            "speed": "Slowest first.",
+            "speed": "Slowest interface first.",
         },
         "scope": "Also port_group: a port group's name or id.",
         "examples": [
@@ -124,7 +128,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "discards, its LLDP/CDP neighbours, transceivers, optic levels (dBm) with their limits, and its open alerts.",
         "rows": "One row: the ports keys, ifIndex, ifName, ifDescr, mac, vlan, trunk, in_pps, out_pps, "
         "in/out_discards_per_poll and per_s, neighbours, transceivers, optics, alerts.",
-        "summary": "state, util_pct, stale, errors_per_poll, discards_per_poll, neighbours, optics, open_alerts.",
+        "summary": "state, util_pct, stale, errors_per_poll and discards_per_poll (null when stale), neighbours, "
+        "optics, open_alerts.",
         "filters": {},
         "sorts": {"name": "One row."},
         "scope": "Needs port: a port_id, or with device an interface name (Gi1/0/5, GigabitEthernet1/0/5) or its "
@@ -136,7 +141,7 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "answers": "Per device with physical ethernet ports: how many are up, down, disabled, and free (not up and "
         "unchanged for idle_days).",
         "rows": "device_id, hostname, location, ethernet_ports, up, down, disabled, used_pct, free, free_unknown (not "
-        "up, but the device has not been up that long), free_by_speed, stale.",
+        "up, but the device has not been up that long), free_by_speed (by the interface's speed), stale.",
         "summary": "in_scope, without_ethernet_ports, idle_days and the totals.",
         "filters": {"idle_days": "Days a port must be unchanged to count as free (default 30)."},
         "sorts": {"name": "By hostname.", "free": "Most free first.", "used_pct": "Fullest first."},
@@ -274,8 +279,8 @@ TOPICS: Dict[str, Dict[str, Any]] = {
         "their processors and memory pools (when filter.class names none) or storage, in percent. Readings are the "
         "last poll's: the API keeps no history of them.",
         "rows": "device_id, hostname, sensor_id (processor_id, mempool_id, storage_id), class, descr, value with "
-        "unit and reading (41 °C, -3.2 dBm; a percentage for processors, memory and storage), status (critical, "
-        "warning, ok; unknown without a reading and for class state, whose meaning the API does not give), "
+        "unit and reading (41 °C, -3.2 dBm, 6.53 mA; a percentage for processors, memory and storage), status "
+        "(critical, warning, ok; unknown without a reading and for class state, whose meaning the API does not give), "
         "limit_low, limit_low_warn, limit_warn, limit, low_margin and high_margin (how far from the first limit "
         "below and above, in the reading's unit, negative past it), margin (the nearer) and nearest (low, high), "
         "direction (rx, tx: dBm), port_id and port (the port a sensor is on, named for the page; an optic's "

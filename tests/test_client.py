@@ -754,7 +754,7 @@ class Requests(unittest.TestCase):
     def test_the_base_url_is_normalised_and_the_index_has_no_trailing_slash(self):
         client, session, _ = make(Resp(200, {"ping": f"{BASE}/api/v0/ping"}), url=f"{BASE}/api/v0/")
         self.assertEqual(client.base_url, BASE)
-        self.assertEqual(client.route_names(), ["ping"])
+        self.assertEqual(client.get(""), {"ping": f"{BASE}/api/v0/ping"})
         self.assertEqual(session.sent[0]["url"], f"{BASE}/api/v0")
 
     def test_json_bodies_are_serialised_and_method_overrides_dropped(self):
@@ -1243,17 +1243,13 @@ class Convenience(unittest.TestCase):
         self.assertIsNone(client_mod.LibreNMSClient.result({"status": "ok"}))
         self.assertEqual(client_mod.LibreNMSClient.result([1]), [1])
 
-    def test_system_and_route_names(self):
+    def test_system(self):
         info = {"local_ver": "26.10.0", "local_sha": "91b9a40", "db_schema": "x (412)"}
         client, session, _ = make(Resp(200, {"status": "ok", "system": [info], "count": 1}))
         self.assertEqual(client.system(), info)
         self.assertEqual(session.sent[0]["url"], f"{BASE}/api/v0/system")
         client, _, _ = make(Resp(200, {"status": "ok", "system": []}))
         self.assertEqual(client.system(), {})
-        client, _, _ = make(Resp(200, {"ping": "u", "get_device": "u", "add_device": "u"}))
-        self.assertEqual(client.route_names(), ["add_device", "get_device", "ping"])
-        client, _, _ = make(Resp(401, {"message": "Unauthenticated."}))
-        self.assertEqual(client.route_names(), [])
 
     def test_posture_names_no_host_path_or_proxy(self):
         saved = {name: os.environ.pop(name, None) for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")}

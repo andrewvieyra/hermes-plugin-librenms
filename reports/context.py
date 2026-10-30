@@ -55,6 +55,9 @@ LOG_MIN_PAGE = 25  # the fewest a request asks for while LibreNMS's answer is to
 # LibreNMS's time is read this much earlier, so it holds the whole window whatever the server's zone.
 EARLIEST_OFFSET_S = 12 * 3600
 LATEST_OFFSET_S = 14 * 3600
+# How far after data_as_of a server-local time may read (clocks a little apart) before librenms_timezone is taken to be
+# wrong: a zone east of the server's puts every recent time in the future.
+FUTURE_SLACK_S = 300
 # The keys of a candidate row that hold text from LibreNMS.
 CANDIDATE_TEXT = (
     "hostname", "display", "sysName", "location", "purpose", "hardware", "type", "name", "desc", "port", "why"
@@ -473,6 +476,7 @@ class ReportContext:
         self.zone = zone_of(settings)
         self._now: datetime | None = None
         self._memo: Dict[str, Any] = {}
+        self._zone_doubted = False
 
     # -- reads ------------------------------------------------------------------------------------------------------
     def get(self, *segments: Any, params: Dict[str, Any] | None = None) -> Any:
@@ -578,11 +582,31 @@ class ReportContext:
 
     def when(self, value: Any, prefix: str) -> Dict[str, Any]:
         """``<prefix>``: a fault, log or bill time, ISO-8601 in ``librenms_timezone`` (without it as LibreNMS wrote
-        it), and its age in seconds (``<prefix>_age_s``) and in words (``<prefix>_age``), none without a zone."""
+        it), and its age in seconds (``<prefix>_age_s``) and in words (``<prefix>_age``), none without a zone. A time
+        more than :data:`FUTURE_SLACK_S` after ``data_as_of`` has no age either: ``librenms_timezone`` is then not
+        the zone LibreNMS's server writes in, and a note says so once (:meth:`_doubt_zone`), where an age of 0 would
+        read as just now."""
         moment = units.server_time(value, self.zone)
         age = units.age(moment, self.now)
+        if moment is not None and (moment - self.now).total_seconds() > FUTURE_SLACK_S:
+            age = None
+            self._doubt_zone(moment)
         shown = units.iso(moment) if moment is not None else (value or None)
         return {prefix: shown, f"{prefix}_age_s": age, f"{prefix}_age": units.duration(age)}
+
+    def _doubt_zone(self, moment: datetime) -> None:
+        """Note, once a report, that a time LibreNMS gave reads after ``data_as_of``."""
+        if self._zone_doubted:
+            return
+        self._zone_doubted = True
+        ahead = units.duration(int((moment - self.now).total_seconds()))
+        name = getattr(self.settings, "librenms_timezone", "") or ""
+        self.notes.append(
+            f"a time LibreNMS gave reads {ahead} after data_as_of in librenms_timezone {name}: LibreNMS's server "
+            "writes its times in another zone (often UTC), so those times are off and their ages are null, and a "
+            "window may start that much off too; tell the user, and ask the operator to set librenms_timezone to the "
+            "zone LibreNMS's server uses"
+        )
 
     def read_log(
         self,

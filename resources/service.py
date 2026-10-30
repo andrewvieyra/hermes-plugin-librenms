@@ -1,4 +1,5 @@
-"""LibreNMS services: the Nagios checks a poller runs against a device (specs/ln-groups.md §2.3, SV-1..SV-5).
+"""LibreNMS services: the Nagios checks a poller runs against a device (``list_services``, ``add_service_for_host``,
+``edit_service_for_host`` and ``del_service_from_host`` in ``includes/html/api_functions.inc.php``).
 
 Every operation sits behind ``allow_services``: ``param`` becomes command-line arguments of ``check_<type>`` on the
 poller, and the parameters already stored often carry passwords, so LibreNMS's value of ``param`` is only ever shown

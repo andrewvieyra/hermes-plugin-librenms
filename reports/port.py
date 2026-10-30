@@ -91,7 +91,9 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
         "util_pct": row["util_pct"],
         "stale": row["stale"],
         "errors_per_poll": described.errors if described.fresh else None,
-        "discards_per_poll": _sum(row.get("in_discards_per_poll"), row.get("out_discards_per_poll")),
+        "discards_per_poll": _sum(row.get("in_discards_per_poll"), row.get("out_discards_per_poll"))
+        if described.fresh
+        else None,
         "neighbours": None if links is None else len(links),
         "optics": next((status for status in ("critical", "warning", "ok") if status in statuses), None),
         "open_alerts": None if alerts is None else len(alerts),

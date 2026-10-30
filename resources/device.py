@@ -6,22 +6,33 @@ credentials, so both need ``allow_device_add``. Everything else is a user-owned 
 ``update_device_field``, which accepts any field name and silently ignores the ones it does not know: every key
 outside the allowed set is refused here, and every write is verified by re-reading.
 
-LibreNMS facts this module leans on (specs/ln-devices.md): the device object carries SNMP secrets in clear for an
-admin token, so every read is masked; an all-digit path segment is always a device id; the poller rewrites ``type``
-and ``icon``, and ``location_id`` unless ``override_sysLocation`` is set; SNMP settings and credentials of an
+LibreNMS facts this module leans on (``get_device``, ``add_device``, ``update_device``, ``rename_device`` and
+``maintenance_device`` in ``includes/html/api_functions.inc.php``): the device object carries SNMP secrets in clear
+for an admin token, so every read is masked; an all-digit path segment is always a device id; the poller rewrites
+``type`` and ``icon``, and ``location_id`` unless ``override_sysLocation`` is set; SNMP settings and credentials of an
 existing device cannot be changed through API v0; a maintenance window cannot be ended, nor even read back.
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from typing import Any, Dict, List, Set, Tuple
 
 from .. import diff, redact
 from ..client import LibreNMSError, is_digits, path, secret
 from . import get_resource
-from .base import Field, PartialWrite, Resource, StepError, _as_int, _maybe_committed
+from .base import (
+    MAINTENANCE_BEHAVIORS,
+    Field,
+    PartialWrite,
+    Resource,
+    StepError,
+    _as_int,
+    _maybe_committed,
+    maintenance_behavior,
+    maintenance_minutes,
+    valid_maintenance_start,
+)
 
 # The SNMP settings of an existing device live in device_polling_methods and secrets, which update_device_field
 # cannot reach: it would answer 200 and change nothing.
@@ -75,13 +86,10 @@ STATE_FIELDS = (
 )
 
 MAINTENANCE_KEYS = ("behavior", "duration", "notes", "start", "title")
-BEHAVIORS = {"skip_alerts": 1, "mute_alerts": 2, "run_alerts": 3}
+BEHAVIORS = MAINTENANCE_BEHAVIORS
 # alert_schedule.title is varchar(255), and the "[hermes:<plan id>] " prefix takes 35 of it
 TITLE_COLUMN = 255
 MAX_TITLE = 200
-_DURATION = re.compile(r"(\d{1,4}):([0-5]\d)")
-_START = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
-_START_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 _LITERAL_CREDENTIAL = (
     "SNMP credentials are never written into a plan; set an environment variable such as "
@@ -116,25 +124,6 @@ _DEFAULT_GROUP = (
 # -- maintenance -------------------------------------------------------------------------------------------------------
 
 
-def _behavior(value: Any) -> str | None:
-    """The behaviour's name from a name or its number 1-3 (LibreNMS's MaintenanceBehavior)."""
-    if isinstance(value, str) and value in BEHAVIORS:
-        return value
-    number = int(value) if is_digits(value) else None
-    return next((name for name, code in BEHAVIORS.items() if code == number), None)
-
-
-def _valid_start(value: Any) -> bool:
-    """``Y-m-d H:i:s`` and a real date: anything else makes LibreNMS's Carbon parse fail with a 500."""
-    if not isinstance(value, str) or not _START.fullmatch(value):
-        return False
-    try:
-        datetime.strptime(value, _START_FORMAT)
-    except ValueError:
-        return False
-    return True
-
-
 def _maintenance_errors(data: Dict[str, Any], max_hours: int) -> List[str]:
     """Static checks of a maintenance operation's data. A duration without a colon is the trap: LibreNMS answers
     201 and saves a window that ended before it began."""
@@ -143,23 +132,22 @@ def _maintenance_errors(data: Dict[str, Any], max_hours: int) -> List[str]:
     if unknown:
         errors.append(f"maintenance does not take {', '.join(unknown)}; allowed: {', '.join(MAINTENANCE_KEYS)}")
     duration = data.get("duration")
-    found = _DURATION.fullmatch(duration) if isinstance(duration, str) else None
-    if found is None:
+    minutes = maintenance_minutes(duration)
+    if minutes is None:
         errors.append('duration is required as "H:MM" (for example "2:00")')
     else:
-        minutes = int(found.group(1)) * 60 + int(found.group(2))
         if minutes == 0:
             errors.append("duration must be longer than 0:00")
         elif minutes > max_hours * 60:
             errors.append(f"duration {duration} is longer than max_maintenance_hours allows ({max_hours} hours)")
-    if data.get("start") is not None and not _valid_start(data["start"]):
+    if data.get("start") is not None and not valid_maintenance_start(data["start"]):
         errors.append('start must be "YYYY-MM-DD HH:MM:SS" in LibreNMS server time, or null for now')
     title = data.get("title")
     if title is not None and not (isinstance(title, str) and len(title) <= MAX_TITLE):
         errors.append(f"title: expected a string of at most {MAX_TITLE} characters")
     if data.get("notes") is not None and not isinstance(data["notes"], str):
         errors.append("notes: expected a string")
-    if data.get("behavior") is not None and _behavior(data["behavior"]) is None:
+    if data.get("behavior") is not None and maintenance_behavior(data["behavior"]) is None:
         errors.append(f"behavior must be one of {', '.join(BEHAVIORS)} (or 1, 2, 3)")
     return errors
 
@@ -171,7 +159,7 @@ def _maintenance_params(data: Dict[str, Any]) -> Dict[str, Any]:
         "start": data.get("start"),
         "title": data.get("title") or None,
         "notes": data.get("notes") or "",
-        "behavior": _behavior(data.get("behavior")) or "skip_alerts",
+        "behavior": maintenance_behavior(data.get("behavior")) or "skip_alerts",
     }
 
 

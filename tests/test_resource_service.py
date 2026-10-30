@@ -1,5 +1,5 @@
 """The service resource against the fake LibreNMS: validation, planning, preconditions, verified writes, partial
-writes and rollback (design §8.3 service, §16.5-16.7; specs/ln-groups.md SV-1..SV-5).
+writes and rollback.
 
 Seeded services: #1 http "core-web" and #3 icmp "ping" (from template #2) on core-sw1 (device 1, no overwrite_ip),
 #2 http "intranet" on access-sw2 (device 3), whose param carries a password."""

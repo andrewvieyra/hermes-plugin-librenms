@@ -34,14 +34,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Tuple
 
-from ..client import is_digits
+from ..client import LibreNMSError, is_digits
 from ..listing import natural_key
 from .context import (
     LOGS,
     ArgumentError,
+    CallBudget,
     Log,
     One,
     ReportContext,
+    ReportError,
     Request,
     Scope,
     View,
@@ -51,6 +53,7 @@ from .context import (
     names_port,
     port_label,
     row_device,
+    rows_of,
 )
 from .ports import DEVICE_READS
 
@@ -192,7 +195,7 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
     summary.update(exact=since.exact, **({} if logged is None else {"logged": logged}))
     summary.update(_summary(ctx, log, entries, ports))
     _name_ports(ctx, [*page, *summary.get("top_ports", ())])
-    _notes(ctx, log, by, req, entries)
+    _notes(ctx, log, by, req, entries, scope)
     return ctx.envelope(
         "events",
         scope=scope,
@@ -533,7 +536,7 @@ def _users(ctx: ReportContext, entries: List[_Entry]) -> Dict[str, Any]:
     return {"users_logged_in": sum(user["logins"] > 0 for user in users.values()), "users": out}
 
 
-def _notes(ctx: ReportContext, log: Log, by: str, req: Request, entries: List[_Entry]) -> None:
+def _notes(ctx: ReportContext, log: Log, by: str, req: Request, entries: List[_Entry], scope: Scope) -> None:
     if log.name == "authlog":
         ctx.notes.append(
             "the authlog records logins to and logouts from LibreNMS's web interface (result Logged In, Logged "
@@ -547,10 +550,7 @@ def _notes(ctx: ReportContext, log: Log, by: str, req: Request, entries: List[_E
         )
     port_id = req.filters.get("port_id")
     if port_id is not None and not entries:
-        ctx.notes.append(
-            f"no entry about port_id {port_id} passed the filter in the window on the devices in scope: the port's "
-            "device must be in scope"
-        )
+        ctx.notes.append(_no_port_entries(ctx, port_id, scope))
     on_port = by == "port" or "port" in req.filters or port_id is not None
     if on_port or str(req.filters.get("type")).casefold() == "interface":
         ctx.notes.append(
@@ -562,6 +562,25 @@ def _notes(ctx: ReportContext, log: Log, by: str, req: Request, entries: List[_E
             "LibreNMS holds syslog only from devices set to send it to its collector, and only what its syslog "
             "filters keep"
         )
+
+
+def _no_port_entries(ctx: ReportContext, port_id: int, scope: Scope) -> str:
+    """What a ``filter.port_id`` that kept no entry says: that nothing about the port was logged in the window, or,
+    when the scope names devices and the port is on none of them (one ``ports/{id}`` read, which no answer depends
+    on), whose port it is, so the model widens the scope instead of telling the user nothing happened."""
+    nothing = f"no entry about port_id {port_id} passed the filter in the window"
+    if scope.ids is None:
+        return f"{nothing}: no change of it was logged then"
+    try:
+        port = next(iter(rows_of(ctx.get("ports", port_id))), None)
+    except (LibreNMSError, CallBudget, ReportError):
+        return f"{nothing} on the devices in scope: if the port is on another device, put that device in scope"
+    if port is None:
+        return f"{nothing}: LibreNMS holds no port with that id"
+    device_id = int(port["device_id"]) if is_digits(port.get("device_id")) else None
+    if device_id is not None and device_id not in scope.ids:
+        return f"{nothing} on the devices in scope: the port is on device {device_id}, which is not in scope"
+    return f"{nothing}: no change of it was logged then"
 
 
 VIEW = View(

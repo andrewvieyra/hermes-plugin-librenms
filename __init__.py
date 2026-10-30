@@ -1,10 +1,13 @@
 """hermes-plugin-librenms — LibreNMS change management plugin for Hermes Agent.
 
-Registers six tools (query / report / plan / apply / rollback / plans), four hook callbacks (the approval prompt for
-apply and rollback and the one handing their handler what it showed, the user's request for the audit trail and the
-digest's runs, the approval decision), a ``/librenms`` slash command, a ``hermes librenms`` CLI subcommand, two bundled
-skills, ``librenms:workflow`` (changes: plan, review, apply, roll back) and ``librenms:ask`` (questions, over several
-turns), and the Automation Blueprint ``librenms:network-digest`` (a scheduled read-only digest, :mod:`digest`).
+Registers six tools (query / report / plan / apply / rollback / plans), four hook callbacks (``pre_tool_call``: the
+approval prompt for apply and rollback, the shell tools' guards against the CLI's writes and the plugin's secrets, and
+in a digest run the block on writes and on handing work to another agent; a second ``pre_tool_call`` handing the write
+tools' handler what the prompt showed; ``pre_llm_call``: the user's request for the audit trail and the digest's runs;
+``post_approval_response``: the approval decision), a ``/librenms`` slash command, a ``hermes librenms`` CLI
+subcommand, two bundled skills, ``librenms:workflow`` (changes: plan, review, apply, roll back) and ``librenms:ask``
+(questions, over several turns), and the Automation Blueprint ``librenms:network-digest`` (a scheduled read-only
+digest, :mod:`digest`).
 Registration performs no network I/O; the LibreNMS client is created lazily inside each tool call.
 """
 

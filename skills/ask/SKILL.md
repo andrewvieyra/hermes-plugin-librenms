@@ -1,7 +1,7 @@
 ---
 name: librenms-ask
 description: Answer questions about the network as LibreNMS sees it, over several turns, with the read-only librenms_report and librenms_query tools. Load when the user asks what is down, alerting or flapping, how busy a port or link is, link speeds and duplex, port descriptions and device names, LLDP/CDP neighbours, where a MAC or IP address is, VLANs, sensors and optics, BGP or OSPF sessions, the eventlog, syslog, logins or bills in LibreNMS.
-version: 0.14.2
+version: 0.14.3
 metadata:
   hermes:
     tags: [librenms, monitoring, snmp, nms, network, questions]
@@ -35,7 +35,9 @@ so they can fix the one that applies and start a new session, and stop: do not r
 1. **Know what the user means.** A device's hostname, id, short name, sysName or IP can go straight into
    `scope.device`: a report resolves it when exactly one device fits, and otherwise answers
    `ambiguous: true` with `candidates` and no rows. A role, a site or a description ("the core switch in
-   SFO", "the firewall", "the switch") goes to view `find` first, with that `term`. When either says
+   SFO", "the firewall", "the switch") goes to view `find` first, with that `term`; a port or link by its
+   description ("the transit link", "the uplink to the DC") goes to view `ports` with `filter.text`, since
+   `find` matches ports by interface name only. When either says
    `ambiguous: true`, or the best candidate's `why` does not fit what the user said, ask which one they
    mean, naming the candidates by hostname and location; never pick one, and call again with the
    `device_id` they choose. `count` counts every candidate; past 10 the one they mean may not be shown:
@@ -91,11 +93,11 @@ the API** says what to tell the user instead.
 
 | # | Question | Call | Answer from |
 |---|---|---|---|
-| 16 | Which ports are at 100M or half duplex? | `{"view": "ports", "filter": {"state": "up", "speed_below_mbps": 1000}}`, `{"view": "ports", "filter": {"state": "up", "duplex": "half"}}` | rows `speed`, `duplex`; two calls, one per condition |
+| 16 | Which ports are at 100M or half duplex? | `{"view": "ports", "filter": {"state": "up", "speed_below_mbps": 1000}}`, `{"view": "ports", "filter": {"state": "up", "duplex": "half"}}` | rows `interface_speed`, `duplex`; two calls, one per condition |
 | 17 | Speed or duplex mismatches between LLDP/CDP neighbours? | `{"view": "neighbours", "filter": {"mismatch": ["speed", "duplex"]}}` | `summary.mismatches`; rows `speed` and `remote_speed`, `duplex` and `remote_duplex`. `summary.remote_port_unknown` links could not be checked: say how many |
-| 18 | What speed is the link between core-sw1 and edge-rtr1? | `{"view": "neighbours", "scope": {"device": "core-sw1"}, "filter": {"remote": "edge-rtr1"}}` | rows `speed` and `remote_speed`: what the interfaces run at. A circuit slower than the interface shows in view `ports` `speed` (from the description) |
+| 18 | What speed is the link between core-sw1 and edge-rtr1? | `{"view": "neighbours", "scope": {"device": "core-sw1"}, "filter": {"remote": "edge-rtr1"}}` | rows `speed` and `remote_speed`: what the interfaces run at. A circuit slower than the interface shows in view `ports` `speed` (from the description) beside `interface_speed` |
 | 19 | MTU mismatches with neighbours? | `{"view": "neighbours", "filter": {"mismatch": "mtu"}}` | rows `mtu`, `remote_mtu`. A difference of 14, 18 or 22 bytes may be one system counting the ethernet header (a note says so): say that rather than call it a fault |
-| 20 | Which 10G-capable ports negotiated 1G? | `{"view": "ports", "filter": {"state": "up", "type": "ethernet", "speed_below_mbps": 10000}}` | **Not in the API.** LibreNMS keeps the speed a port runs at, not what it or its optic could do. Offer the ports running below 10G, and for one of them the optic's type in view `port` (`transceivers`: `10GBASE-LR` is a 10G optic) |
+| 20 | Which 10G-capable ports negotiated 1G? | `{"view": "ports", "filter": {"state": "up", "type": "ethernet", "speed_below_mbps": 10000}}` | **Not in the API.** LibreNMS keeps the speed a port runs at, not what it or its optic could do. Offer the ports running below 10G (rows `interface_speed`), and for one of them the optic's type in view `port` (`transceivers`: `10GBASE-LR` is a 10G optic) |
 
 ### Naming and descriptions
 
@@ -231,16 +233,17 @@ filter), `returned`, `offset`, `truncated` and `next_offset`, `partial` and `par
 | Key or value | Means |
 |---|---|
 | `*_s` | seconds, beside a readable twin: `uptime_s` and `uptime` "100d 0h", `last_change_age_s` and `last_change_age` |
-| `*_bps` | bit/s, beside a twin: `in_bps` and `in` "812 Mbit/s"; `speed` "1G", or a circuit speed "100M/20M" (egress/ingress) |
+| `*_bps` | bit/s, beside a twin: `in_bps` and `in` "812 Mbit/s"; `speed` "1G", or a circuit speed "100M/20M" (egress/ingress); `interface_speed` "10G" |
 | `*_pct` | percent; `util_pct` is the larger of `in_pct` and `out_pct`; null when the speed is not known |
 | `*_bytes` | bytes, beside a twin (`used`, `quota`, `transferred`) |
-| `value` with `unit` | a sensor reading in its own unit (°C, dBm, V, %), as `reading` "41 °C"; margins are in that unit |
+| `value` with `unit` | a sensor reading in its own unit (°C, dBm, V, A, %), as `reading` "41 °C" or "6.53 mA" (0.00653 A); margins are in that unit |
 | a time ending `Z` | UTC; with an offset (`+01:00`), in `librenms_timezone`; with neither, LibreNMS's server time, zone unknown |
 | `*_age` | how long before `data_as_of` |
 
-Rates are LibreNMS's average over its last poll (about five minutes), not peaks. Port speeds come from the
-description's circuit speed when it has one (`speed_source` `circuit`; `100M/20M` is 100 Mbit/s out, 20 in),
-else from the interface.
+Rates are LibreNMS's average over its last poll (about five minutes), not peaks. A port's `speed`, which
+utilisation is measured against, comes from the description's circuit speed when it has one (`speed_source`
+`circuit`; `100M/20M` is 100 Mbit/s out, 20 in), else from the interface. How fast a port runs is
+`interface_speed`, which `speed_below_mbps` and sort `speed` compare: a `[1G]` circuit on a 10G port runs at 10G.
 
 | What | States |
 |---|---|
@@ -264,7 +267,9 @@ else from the interface.
   device could not be read, a log held more than the report reads). Never present it as complete: say what
   is missing and narrow the scope, the window or the filter.
 - `timezone` "unknown" means `librenms_timezone` is not set: LibreNMS's fault and log times are shown as
-  it wrote them, with no age; do not turn them into ages yourself. `exact: false` on `alert_history` and
+  it wrote them, with no age; do not turn them into ages yourself. A note that a time reads after
+  `data_as_of` means `librenms_timezone` is not LibreNMS's zone: those ages are null; tell the user the
+  times are off rather than call anything new. `exact: false` on `alert_history` and
   `events` means the window was read from an earlier bound and may include up to 26h (1d 2h) more, as its
   note says: say so.
 - No rows means nothing matched what you asked: say what you looked at (the devices, filter and window),
@@ -290,8 +295,9 @@ else from the interface.
   called differently on different devices.
 - `alerts`: `alert_id` is the fault's id, which an `ack` plan takes; recovered faults appear only when
   `filter.state` names `recovered`. `procedure` is the rule's runbook link.
-- `alert_history` and `events`: `flaps` counts an alert raised again after it had cleared, or a port back
-  up after going down, within the window. A `partial` answer read only the newest entries: narrow the
+- `alert_history` and `events`: `flaps` counts an alert raised again for the same port, sensor or device
+  after it had cleared (LibreNMS logs each raise as a new fault), or a port back up after going down,
+  within the window. A `partial` answer read only the newest entries: narrow the
   window or the scope.
 - `health`: `status` is LibreNMS's own; a sensor without limits is never `warning` or `critical`
   (`summary.without_limits`), and a `state` sensor (a PSU or fan state) is `unknown`. "Is anything

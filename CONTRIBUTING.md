@@ -102,11 +102,15 @@ ends of links, passes those devices as `joined`, read after the scope's) and der
 mean with `reports.ports.facts`, so every view gives a port the same speed, utilisation, state and
 age; one about LLDP/CDP links reads them with `reports.neighbours.read_links`. Text a neighbour
 advertises (`remote_hostname`, `remote_port`) goes in `untrusted_fields` like every other string
-from LibreNMS. Add its name, filters and sorts to the schema (within the budget), and tests in
+from LibreNMS. Add its topic to `reports/help.py` (`TOPICS`: its line, what it answers, its rows
+and summary keys, each filter and sort it takes, which the tests require to be the view's own, and
+examples, which the tests run), and only its name and a few words to the `librenms_report` schema's
+`view` enum and description: per-view filters and sorts stay out of the schema, which is sent on
+every turn and kept with the other five under 16 KiB. Then tests in
 `tests/test_reports.py` or a module of their own (`tests/test_report_ports.py`,
 `tests/test_report_neighbours.py`): the happy path, units and edge cases, filters, sorts and
 paging, the call budget, the output budget, and the GET-only, allow-list and no-credential
-assertions. Then the README's Reports table, the question skill (`skills/ask/SKILL.md`: the questions
+assertions. Last, the README's Reports table, the question skill (`skills/ask/SKILL.md`: the questions
 the view answers in its table, each call one `tests/test_conversation.py` runs, and what to watch for),
 and the routes it reads in `docs/api-coverage.md`.
 
@@ -119,7 +123,7 @@ make test
 make coverage                     # pip install 'coverage[toml]'
 make lint
 make doctor                       # needs the hermes CLI on PATH
-make validate                     # hermes plugins validate . --install-deps
+make validate                     # hermes plugins validate . (the catalog's admission checks)
 HERMES_AGENT_ROOT=~/.hermes/hermes-agent make test-hermes
 ```
 

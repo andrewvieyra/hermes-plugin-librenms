@@ -529,6 +529,14 @@ class Find(ReportCase):
         self.assertEqual((out["rows"], out["count"], out["ambiguous"]), ([], 0, False))
         self.assertIn("try part of the hostname", out["notes"][0])
         self.assertNotIn("untrusted_fields", out)
+        # what 0.14.1 left out: "the transit link" names port descriptions, which find does not search; the note
+        # says which call does, and that call finds them
+        out = self.report(view="find", term="transit")
+        self.assertEqual(out["count"], 0)
+        self.assertIn('use view ports with filter.text, e.g. {"view": "ports", "filter": {"text": "transit"}}',
+                      out["notes"][0])  # fmt: skip
+        ports = self.report(view="ports", filter={"text": "transit"})
+        self.assertEqual([row["description"] for row in ports["rows"]], ["WAN: transit-a", "WAN: transit-b"])
 
     def test_a_listing_that_fails_leaves_its_kind_out_and_says_so(self):
         self.fake.fail_on("GET", "port_groups", 503)

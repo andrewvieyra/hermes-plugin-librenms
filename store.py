@@ -179,11 +179,6 @@ class PlanStore:
         # run-lock file path -> [fd, depth, owning thread]; see run_lock
         self._held: Dict[str, List[int]] = {}
 
-    @property
-    def lock(self) -> threading.RLock:
-        """In-process lock; see :meth:`exclusive` for the cross-process one."""
-        return self._lock
-
     @contextlib.contextmanager
     def exclusive(self, timeout: float = 30.0) -> Iterator[None]:
         """Serialise plan claims across processes (gateway and ``hermes librenms`` run separately) with an
@@ -385,13 +380,6 @@ class PlanStore:
                 if self._remove(path, dry_run=dry_run):
                     removed.append({"id": path.stem, "status": plan.get("status"), "age_days": round(age_days, 1)})
         return removed
-
-    def delete(self, plan_id: str) -> bool:
-        """Remove a plan and its run-lock file, under :meth:`exclusive` like :meth:`prune`; ``False`` when there is
-        no such plan or a run holds it."""
-        path = self._path(plan_id)
-        with self.exclusive(self.claim_timeout):
-            return path.exists() and self._remove(path, dry_run=False)
 
     def _remove(self, path: Path, *, dry_run: bool) -> bool:
         """Unlink a plan file and its ``.run`` file while holding the run lock, so no run can hold a lock on a file

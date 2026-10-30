@@ -632,6 +632,24 @@ class Ports(_FakeCase):
 class ReportRoutes(_FakeCase):
     """The read-only routes the report views use, with the quirks of their LibreNMS handlers."""
 
+    def test_the_seed_keeps_one_clock(self):
+        # what 0.14.1 seeded a year early (2025): every port read stale against devices polled on the fake's day
+        from datetime import datetime, timezone
+
+        now = self.fake.now.replace(tzinfo=timezone.utc)
+        polls = {port["poll_time"] for port in self.fake.tables["ports"].values()}
+        self.assertEqual(polls, {1793188500})  # 2026-10-28T11:55:00Z, as the devices' last poll
+        self.assertLess(now.timestamp() - 1793188500, 2 * 300)  # within two polls of the clock: current
+        for table, key in (("outages", "going_down"), ("services", "service_changed")):
+            for row in [row for row in self.fake.tables[table].values() if row.get(key)]:  # 0: never
+                moment = datetime.fromtimestamp(row[key], timezone.utc)
+                self.assertTrue(now.replace(day=1) <= moment <= now, (table, moment))
+        # a port's change logged as includes/polling/ports.inc.php writes it
+        [change] = [row for row in self.fake.tables["eventlog"].values() if row.get("reference") == 5]
+        self.assertEqual(
+            (change["message"], change["type"], change["severity"]), ("ifOperStatus: up -> down", "interface", 3)
+        )
+
     def test_bgp_and_ospf(self):
         body = self.call("GET", "bgp")[1]
         self.assertEqual(([b["bgpPeer_id"] for b in body["bgp_sessions"]], body["count"]), ([1, 2], 2))  # stateless
@@ -670,7 +688,7 @@ class ReportRoutes(_FakeCase):
         self.assertNotIn("count", body)  # an Eloquent collection
         self.assertEqual(
             self.call("GET", "devices/4/outages")[1],
-            {"status": "ok", "outages": [{"going_down": 1761600000, "up_again": None}]},
+            {"status": "ok", "outages": [{"going_down": 1793136000, "up_again": None}]},
         )
         self.assertEqual(self.call("GET", "devices/99/outages")[1], {"status": "ok", "outages": []})
         body = self.call("GET", "devices/core-sw1.example.net/vlans")[1]

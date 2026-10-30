@@ -195,7 +195,7 @@ class ReportRoutes(HandlerCase):
         out = self.query("resources/vlans", params={"hostname": "access-sw2.example.net"})
         self.assertEqual([(row["device_id"], row["vlan_vlan"]) for row in out["results"]], [(3, 10)])
         out = self.query("devices/lab-fw1.example.net/outages")
-        self.assertEqual(out["results"], [{"going_down": 1761600000, "up_again": None}])
+        self.assertEqual(out["results"], [{"going_down": 1793136000, "up_again": None}])
         out = self.query("devices/edge-rtr1.example.net/availability")
         self.assertEqual(out["results"][1], {"duration": 604800, "availability_perc": 99.4})
         out = self.query("bills", fields=["bill_name", "percent", "overuse", "ports"])

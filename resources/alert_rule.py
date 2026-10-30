@@ -1,14 +1,15 @@
 """LibreNMS alert rules: create, update and delete through ``POST``/``PUT rules`` and ``DELETE rules/{id}``.
 
-LibreNMS has one handler for both writes (``add_edit_rule``, specs/ln-alerts.md §4.2) and it rebuilds the rule from
-each request: a key the body leaves out is reset (the device, group and location mappings are emptied, which makes
-a scoped rule apply to every device; ``disabled`` becomes 0; ``notes`` are cleared; the ``extra`` flags are dropped).
-So every write here sends the whole rule, read back just before, with the requested values on top. It never sends
-``operations`` or the legacy timing keys (they make LibreNMS create alert operations no API call can delete) nor
-hand-written SQL (LibreNMS pastes builder values into the rule's query unescaped, so the builder is checked for that
-too), and always sends ``alert_operation_id`` so neither branch can run. A create answers without an id; rule names
-are unique, so the new rule is found again by its name. The UI's "Mute alerts" flag (``extra.mute``) is one of the
-keys every API write drops, and the alert engine reads it live: update and delete of a muted rule are refused.
+LibreNMS has one handler for both writes (``add_edit_rule`` in ``includes/html/api_functions.inc.php``) and it
+rebuilds the rule from each request: a key the body leaves out is reset (the device, group and location mappings are
+emptied, which makes a scoped rule apply to every device; ``disabled`` becomes 0; ``notes`` are cleared; the ``extra``
+flags are dropped). So every write here sends the whole rule, read back just before, with the requested values on top.
+It never sends ``operations`` or the legacy timing keys (they make LibreNMS create alert operations no API call can
+delete) nor hand-written SQL (LibreNMS pastes builder values into the rule's query unescaped, so the builder is
+checked for that too), and always sends ``alert_operation_id`` so neither branch can run. A create answers without an
+id; rule names are unique, so the new rule is found again by its name. The UI's "Mute alerts" flag (``extra.mute``) is
+one of the keys every API write drops, and the alert engine reads it live: update and delete of a muted rule are
+refused.
 """
 
 from __future__ import annotations

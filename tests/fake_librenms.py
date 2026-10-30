@@ -1,6 +1,6 @@
 """In-memory stand-in for a LibreNMS 26.10 instance, speaking the subset of API v0 the plugin uses.
 
-It is a ``requests``-compatible session and behaves like LibreNMS where the plugin depends on it (specs/ln-*.md):
+It is a ``requests``-compatible session and behaves like LibreNMS where the plugin depends on it (its API handlers):
 ``X-Auth-Token`` auth answered with Laravel's bare 401; the catch-all 404 ``This API route doesn't exist.`` for an
 unknown path and for a known path with the wrong method; a web server's 301 for a trailing slash; the ``{status,
 <key>, message, count}`` envelope, with ``count`` only where PHP returns an array, and the web server's ``Date``
@@ -2169,14 +2169,19 @@ def _php_int(value: Any) -> int:
     """PHP ``(int)``: the leading number of a string, 0 for anything without one."""
     if isinstance(value, (bool, int, float)):
         return int(value)
-    match = re.match(r"\s*[+-]?\d+", value) if isinstance(value, str) else None
+    match = re.match(r"\s*[+-]?\d+", value, re.ASCII) if isinstance(value, str) else None
     return int(match.group(0)) if match else 0
 
 
 def _php_float(value: Any) -> float:
     if isinstance(value, (bool, int, float)):
         return float(value)
-    match = re.match(r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value) if isinstance(value, str) else None
+    # PHP reads a numeric string in ASCII digits alone: (float)"２" is 0
+    match = (
+        re.match(r"\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value, re.ASCII)
+        if isinstance(value, str)
+        else None
+    )
     return float(match.group(0)) if match else 0.0
 
 
@@ -2308,7 +2313,7 @@ def seeded() -> FakeLibreNMS:
     )
     for row in (
         {"service_id": 1, "device_id": 1, "service_ip": "192.0.2.1", "service_type": "http", "service_desc": "Web UI",
-         "service_param": "-u /health -t 10", "service_status": 0, "service_changed": 1761600000,
+         "service_param": "-u /health -t 10", "service_status": 0, "service_changed": 1793136000,
          "service_message": "HTTP OK: HTTP/1.1 200 OK", "service_ds": '{"time":"s","size":"B"}',
          "service_name": "core-web"},
         {"service_id": 2, "device_id": 3, "service_ip": "access-sw2.example.net", "service_type": "http",
@@ -2368,7 +2373,8 @@ def seeded() -> FakeLibreNMS:
         {"port_id": 9, "device_id": 3, "ifIndex": 48, "ifName": "Gi1/0/48", "ifDescr": "GigabitEthernet1/0/48",
          "ifAlias": "to core-sw1", "ifOperStatus": "up", "ifAdminStatus": "up"},
     ):  # fmt: skip
-        fake.seed("ports", {**row, "ifType": "ethernetCsmacd", "ifSpeed": 1000000000, "poll_time": 1761652500})
+        # polled at 2026-10-28T11:55:00Z, five minutes before the fake's clock, with their devices
+        fake.seed("ports", {**row, "ifType": "ethernetCsmacd", "ifSpeed": 1000000000, "poll_time": 1793188500})
     fake.attribs = {1: {"ifName:Gi1/0/1": 1}, 2: {"ifName:Gi0/0/0": 1, "ifName:Gi0/0/1": 1}}
     for row in (
         {"device_id": 1, "datetime": "2026-10-01 09:00:00", "message": "Device core-sw1.example.net has been created"},
@@ -2377,8 +2383,9 @@ def seeded() -> FakeLibreNMS:
         {"device_id": 2, "datetime": "2026-10-03 08:00:00", "message": "Device edge-rtr1.example.net has been created"},
         {"device_id": 3, "datetime": "2026-10-04 08:00:00",
          "message": "Device access-sw2.example.net has been created"},
-        {"device_id": 2, "datetime": "2026-10-20 14:05:00", "message": "Interface went down: Gi0/0/0",
-         "type": "interface", "reference": 5, "severity": 4},
+        # as includes/polling/ports.inc.php logs a port's change: at notice, the port as the reference
+        {"device_id": 2, "datetime": "2026-10-20 14:05:00", "message": "ifOperStatus: up -> down",
+         "type": "interface", "reference": 5, "severity": 3},
         {"device_id": 2, "datetime": "2026-10-27 23:59:59", "message": "version: 17.9.3 -> 17.9.4a", "severity": 3},
     ):  # fmt: skip
         fake.seed("eventlog", row)
@@ -2559,8 +2566,8 @@ def _seed_reports(fake: FakeLibreNMS) -> None:
     ):
         seed("ipv4_mac", row)
     fake.oui = {"001122": "CIMSYS Inc", "00000c": "Cisco Systems, Inc"}
-    seed("outages", {"id": 1, "device_id": 2, "going_down": 1761000000, "up_again": 1761003600})
-    seed("outages", {"id": 2, "device_id": 4, "going_down": 1761600000})
+    seed("outages", {"id": 1, "device_id": 2, "going_down": 1792536000, "up_again": 1792539600})  # 2026-10-20
+    seed("outages", {"id": 2, "device_id": 4, "going_down": 1793136000})  # 2026-10-27T21:20:00Z
     for device_id, percentages in ((1, (100.0, 99.98, 99.95, 99.9)), (2, (100.0, 99.4, 99.86, 99.98))):
         for duration, percent in zip((86400, 604800, 2592000, 31536000), percentages):
             seed("availability", {"device_id": device_id, "duration": duration, "availability_perc": percent})

@@ -168,6 +168,14 @@ class Health(HealthCase):
         self.assertEqual({key: named[key] for key in (1, 3, 4, 13, 14)}, dict.fromkeys((1, 3, 4, 13, 14), (None, None)))
         self.assertEqual(self.paths()[2:], ["devices/3/transceivers", "devices/1/transceivers", "devices/1/ports"])
         self.assertFalse(out["partial"])
+        # the bias reads as LibreNMS shows it, and its margins keep their digits
+        self.fake.touch("sensors", 11, sensor_current=0.00653, sensor_limit_low=0.0015, sensor_limit=0.0115,
+                        sensor_limit_low_warn=None, sensor_limit_warn=None)  # fmt: skip
+        [bias] = self.report(view="health", filter={"class": "current"})["rows"]
+        self.assertEqual(
+            (bias["value"], bias["reading"], bias["low_margin"], bias["high_margin"], bias["margin"]),
+            (0.00653, "6.53 mA", 0.00503, 0.00497, 0.00497),
+        )
         # past a scope of DEVICE_READS devices nothing is read for them (most are a chassis's) ...
         classes = ["temperature", "current", "voltage"]
         with mock.patch.object(health_mod, "DEVICE_READS", 2):

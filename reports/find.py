@@ -2,7 +2,8 @@
 
 A term is matched against every device (one ``devices`` listing; :mod:`.fuzzy`), and unless it is an address against
 the locations, device groups and port groups; an interface name in it (``Gi1/0/48``) is searched among the ports
-(``ports/search/ifName,ifDescr/...``), and the rest of its words then match the port's device. An IP address is
+(``ports/search/ifName,ifDescr/...``), and the rest of its words then match the port's device. Port descriptions are
+not searched (view ``ports`` with ``filter.text`` is), and an answer with no candidate says so. An IP address is
 matched exactly, against each device's address and the addresses on its interfaces (``devices?type=ipv4|ipv6``); a
 MAC address finds the devices with an ARP entry for it (``devices?type=mac``), which see it but need not own it.
 Every candidate scoring :data:`~.context.MIN_SCORE` or more is counted (``count``, ``summary``); an answer shows at
@@ -69,7 +70,9 @@ def build(ctx: ReportContext, req: Request) -> Dict[str, Any]:
         )
     elif not rows:
         ctx.notes.append(
-            "nothing matched: try part of the hostname or sysName, the IP address, the site, or fewer words"
+            "nothing matched: try part of the hostname or sysName, the IP address, the site, or fewer words; find "
+            "matches ports by interface name only, so for a port or link by its description (the transit link, the "
+            'uplink) use view ports with filter.text, e.g. {"view": "ports", "filter": {"text": "transit"}}'
         )
     if len(rows) > MAX_CANDIDATES:
         ctx.notes.append(

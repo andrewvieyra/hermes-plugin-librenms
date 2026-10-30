@@ -2,7 +2,8 @@
 
 LibreNMS keeps no change stamp on a group, so what planning records and apply re-checks is the row itself plus, for a
 static group, its sorted member ids (a dynamic group's members move with polling and are left out). The API's traps
-shape every request (specs/ln-groups.md DG-1..DG-9):
+shape every request (``add_device_group``, ``update_device_group`` and its ``devices`` routes, ``delete_device_group``
+and ``maintenance_devicegroup`` in ``includes/html/api_functions.inc.php``):
 
 - ``rules`` travel as a JSON *string* and come back with a ``joins`` key LibreNMS generates; joins are dropped
   before comparing and never sent.
@@ -17,25 +18,31 @@ shape every request (specs/ln-groups.md DG-1..DG-9):
 from __future__ import annotations
 
 import json
-import re
-from datetime import datetime
 from typing import Any, Dict, Iterable, List, Tuple
 
 from .. import diff, redact
 from ..client import LibreNMSError, is_digits, path
-from .base import Field, PartialWrite, Resource, StepError, _as_int, _maybe_committed
+from .base import (
+    MAINTENANCE_BEHAVIORS,
+    Field,
+    PartialWrite,
+    Resource,
+    StepError,
+    _as_int,
+    _maybe_committed,
+    maintenance_behavior,
+    maintenance_minutes,
+    valid_maintenance_start,
+)
 
 MEMBER_KEYS = ("devices", "devices_add", "devices_remove")
 MAINTENANCE_KEYS = ("duration", "start", "title", "notes", "behavior")
-BEHAVIORS = {"skip_alerts": 1, "mute_alerts": 2, "run_alerts": 3}
+BEHAVIORS = MAINTENANCE_BEHAVIORS
 TEXT_LIMIT = 255  # name and desc are varchar(255); LibreNMS runs with sql_mode='' and would truncate silently
 # alert_schedule.title is varchar(255), and the "[hermes:<plan id>] " prefix takes 35 of it
 MAX_TITLE = 200
 RULES_SHOWN = 2000  # rules decide which devices a group holds, so a plan shows the new ones whole
 RULES_FIELD = Field("rules", "json")
-_DURATION_RE = re.compile(r"(\d{1,4}):([0-5]\d)")
-_START_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
-_START_FORMAT = "%Y-%m-%d %H:%M:%S"
 _FORBIDDEN_HOSTNAME = (
     "LibreNMS answered 403 for hostname {}: it does not exist or this token cannot see it (LibreNMS returns 403 for "
     "unknown hostnames to tokens without global read); use the device id or a token with global read"
@@ -132,25 +139,6 @@ def _create_body(values: Dict[str, Any]) -> Dict[str, Any]:
     return body
 
 
-def _behavior(value: Any) -> str | None:
-    """A maintenance behavior's name from its name or its LibreNMS number (1-3)."""
-    if isinstance(value, str) and value in BEHAVIORS:
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        return next((name for name, number in BEHAVIORS.items() if number == value), None)
-    return None
-
-
-def _valid_start(value: Any) -> bool:
-    if not isinstance(value, str) or not _START_RE.fullmatch(value):
-        return False
-    try:
-        datetime.strptime(value, _START_FORMAT)
-    except ValueError:
-        return False
-    return True
-
-
 def _maintenance_note(duration: str | None) -> str:
     expiry = f"it expires after {duration}" if duration else "it expires on its own"
     return (
@@ -167,17 +155,16 @@ def _maintenance_errors(data: Dict[str, Any], settings: Any) -> List[str]:
     if unknown:
         errors.append(f"maintenance does not take {', '.join(unknown)}; allowed: {', '.join(MAINTENANCE_KEYS)}")
     duration = data.get("duration")
-    match = _DURATION_RE.fullmatch(duration) if isinstance(duration, str) else None
-    if match is None:
+    minutes = maintenance_minutes(duration)
+    if minutes is None:
         errors.append('duration is required as hours:minutes, such as "2:00" or "0:30"')
     else:
-        minutes = int(match.group(1)) * 60 + int(match.group(2))
         limit = settings.max_maintenance_hours
         if minutes == 0:
             errors.append("duration must be longer than 0:00")
         elif minutes > limit * 60:
             errors.append(f"duration {duration} exceeds max_maintenance_hours ({limit})")
-    if data.get("start") is not None and not _valid_start(data["start"]):
+    if data.get("start") is not None and not valid_maintenance_start(data["start"]):
         errors.append(
             'start: expected "YYYY-MM-DD HH:MM:SS" in the LibreNMS server\'s time zone, or null to start on apply'
         )
@@ -186,7 +173,7 @@ def _maintenance_errors(data: Dict[str, Any], settings: Any) -> List[str]:
         errors.append(f"title: expected a string of at most {MAX_TITLE} characters")
     if data.get("notes") is not None and not isinstance(data["notes"], str):
         errors.append("notes: expected a string")
-    if data.get("behavior") is not None and _behavior(data["behavior"]) is None:
+    if data.get("behavior") is not None and maintenance_behavior(data["behavior"]) is None:
         errors.append(
             f"behavior: expected one of {', '.join(BEHAVIORS)} (or 1-3), got {diff.format_value(data['behavior'])}"
         )
@@ -200,7 +187,7 @@ def _maintenance_params(data: Dict[str, Any]) -> Dict[str, Any]:
         "start": data.get("start"),
         "title": data.get("title") or None,
         "notes": data.get("notes") or "",
-        "behavior": "skip_alerts" if behavior is None else _behavior(behavior),
+        "behavior": "skip_alerts" if behavior is None else maintenance_behavior(behavior),
     }
 
 

@@ -21,34 +21,36 @@ v0 route to what the plugin does with it.
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`), LibreNMS's clock (`last_date`, the `Date` of its last answer) | `requests` (lazy), `redact` |
+| `version` | The plugin's version, which the manifest, `pyproject.toml` and the skills repeat and the `User-Agent` carries | none |
 | `redact` | Credential masking by key, error-text scrubbing, clipping that counts escapes, `printable()` for terminals and approval prompts, `one_line()` for free text in plans and journals, `visible()` and `for_model()` for what the model reads, the untrusted-data marker (`untrusted()`, `mark_untrusted()`) | none |
+| `client` | HTTP: `X-Auth-Token`, envelope unwrapping, typed errors, transport hardening (no redirects, no `.netrc`, byte caps, GET-only retries), path encoding (no segment that decodes to `/`), LibreNMS's clock (`last_date`, the `Date` of its last answer) | `redact`, `version`, `requests` (lazy), Hermes `agent.secret_scope`, `hermes_constants` (optional) |
 | `routes` | The read-route table for `librenms_query`, in LibreNMS's registration order; path normalisation; hostname-to-id resolution and id checks (naming candidates for an unknown hostname); refusal of a `hostname` or `start` parameter a route ignores, a parameter name PHP reads as another, and an object id LibreNMS reads as no filter; `offset` sent as `start` on the logs routes, which refuse `where` and `sort`; MAC and column-list normalisation; how to narrow an answer too large to read | `client`, `redact` |
 | `listing` | `librenms_query`'s typed `where` filter and stable `sort` over the rows a route returned: numbers by value (also written as text), text in natural order ignoring case (`gt`/`lt` compare a number with a text as text when both start with a digit), empty values last, a credential key as masked; a key no row has is refused. Its natural order also orders reports | `redact` |
-| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings and of the port names a view names ports from, partial reasons; a log read over a window, newest first, a page at a time, up to a view's cap; LibreNMS's clock and its server-local times), scope resolution with ambiguity, argument checks, the result envelope, and how LibreNMS decides a sensor's status and ties it to a port | `client`, `routes`, `listing`, `redact`, `settings` |
-| `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
-| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; sensor units and readings per class, sizes in bytes, bytes transferred; zone-safe times, server-local times read in `librenms_timezone`, and their order | none |
-| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts`, `reports/health`, `reports/routing`, `reports/events`, `reports/bills` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness; whether a device's figures are current) for every view about ports; `reports/__init__` holds their registry and `run` | `reports/context`, `redact` (`alert_entities`) |
-| `reports/help` | View `help`: what each view answers, its filters (with what they take, read from the view), sorts, row and summary keys and examples, answered without a LibreNMS call | `reports/context` |
-| `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | none |
-| `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact` |
-| `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only) |
-| `executor` | Preflight, claims and run locks, per-step precondition, execute, journal, automatic and manual rollback, crash recovery, eventlog linking | `resources`, `store`, `audit` |
-| `store` | Atomic `0600` JSON persistence of plans in `0700` directories, the cross-process claim lock, per-plan run locks, retention, the active profile's key | Hermes `plugin_storage`, `hermes_constants` (optional) |
-| `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl`, its rotation (under a `flock` every writer holds from its open to its write) and retention | Hermes `gateway.session_context` (optional) |
-| `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread per Hermes profile; the warning about a credential written into `config.yaml` | `settings`, `store`, Hermes `hermes_cli.config` (optional) |
-| `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
 | `settings` | Operator settings with fail-closed coercion (a time zone the host's zone database does not hold is refused) | Hermes `ctx.get_config` (optional) |
+| `timefmt` | UTC stamps rendered in the Hermes-configured zone for reports only (`HERMES_TIMEZONE`, else the profile's `timezone`, as Hermes resolves it) | Hermes `agent.secret_scope`, `hermes_cli.config` (optional) |
+| `store` | Atomic `0600` JSON persistence of plans in `0700` directories, the cross-process claim lock, per-plan run locks, retention, the active profile's key | Hermes `plugin_storage`, `hermes_constants` (optional) |
+| `reports/units` | Rates, speeds (and circuit speeds as LibreNMS parses them), percentages and durations with their readable forms; sensor units and readings per class, sizes in bytes, bytes transferred; zone-safe times, server-local times read in `librenms_timezone`, and their order | none |
+| `reports/fuzzy` | Ranking what a person calls a device, a site, a group or a port against what LibreNMS holds: whole-term and per-word matches, role abbreviations, exact addresses, a score and a why | `routes`, `redact` |
+| `reports/context` | `librenms_report`'s shared machinery: `ReportContext` (every GET through the route allow-list, the request budget, 404-as-empty, a memo of listings and of the port names a view names ports from, partial reasons; a log read over a window, newest first, a page at a time, up to a view's cap; LibreNMS's clock and its server-local times), scope resolution with ambiguity, argument checks, the result envelope, and how LibreNMS decides a sensor's status and ties it to a port | `client`, `routes`, `listing`, `redact`, `settings`, `reports/fuzzy`, `reports/units` |
+| `reports/find`, `reports/devices`, `reports/ports`, `reports/port`, `reports/neighbours`, `reports/locate`, `reports/vlans`, `reports/alerts`, `reports/health`, `reports/routing`, `reports/events`, `reports/bills` | The views; `reports/ports` also reads port rows and derives what they mean (`facts`: state, speed, utilisation, errors, last change, staleness; whether a device's figures are current) for every view about ports | `reports/context`, `reports/units`, `reports/fuzzy`, `client`, `listing`, `routes`, `redact` (`alert_entities`); `reports/ports` for the views about ports and `reports/neighbours` for `reports/locate`, each named in this row before the views that import it |
+| `reports/help` | View `help`: what each view answers, its filters (with what they take, read from the view), sorts, row and summary keys and examples, answered without a LibreNMS call | `reports/context` |
+| `reports` | The views' registry and `run`: one `librenms_report` call checked, built by its view and kept within the budgets | `reports/context`, the views, `reports/help` |
+| `diff` | Value normalisation per field kind, equality, change computation, rendering (sensitive values as digests) | `redact` |
+| `resources/*` | One module per resource: reads, `state()`, validation, planning, the write requests, verification, rollback; `base` holds the shared create/update/delete logic | `client`, `diff`, `redact`, `timefmt` |
+| `sinks` | Optional syslog / HTTP forwarding of audit records on a background thread per Hermes profile; the warning about a credential written into `config.yaml` | `client`, `redact`, `settings`, `store`, `version`, Hermes `hermes_cli.config` (optional) |
+| `audit` | Actor capture from Hermes' session context and the plugin context; the request cache; append-only `audit.jsonl`, its rotation (under a `flock` every writer holds from its open to its write) and retention | `client`, `redact`, `settings`, `sinks`, `store`, `version`, Hermes `gateway.session_context`, `hermes_cli`, `hermes_constants` (optional) |
+| `planner` | Validate operations, apply the gates, hand each operation to its resource, refuse duplicate targets, build the plan document | `resources`, `audit` (environment only), `client`, `diff`, `redact`, `settings`, `store`, `timefmt` |
+| `executor` | Preflight, claims and run locks, per-step precondition, execute, journal, automatic and manual rollback, crash recovery, eventlog linking | `planner`, `resources`, `store`, `audit`, `client`, `redact`, `settings`, `timefmt` |
 | `schemas` | Tool schemas | none |
 | `digest` | The scheduled digest: its Automation Blueprint (slots, schedule, the prompt and the six report calls it makes) and the run guard the handlers and hooks ask (`refusal` for the write tools, `delegation_refusal` for the tools that start another agent) | `audit` (the cron run) |
-| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks (the shell tools' guards against the CLI's writes and the plugin's secrets among them), the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | everything above |
-| `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers` |
+| `handlers` | Tool handlers, the `write_mode` gate, the hook callbacks (the shell tools' guards against the CLI's writes and the plugin's secrets among them), the client factory seam; result shaping (alert rows, envelope extras, keyed objects, a listing's `offset` and `next_offset`) and the result budget, with plans shown a range of steps at a time | `client`, `redact`, `routes`, `listing`, `settings`, `store`, `reports` (the views and `help`), `resources`, `sinks`, `audit`, `planner`, `executor`, `digest`, `version`, Hermes `hermes_constants`, `tools.registry` (optional) |
+| `commands` | `/librenms` and `hermes librenms` built on the handlers; the CLI's exit status | `handlers`, `audit`, `client`, `redact`, `settings`, `store`, `timefmt` |
 | `__init__` | `register(ctx)` | all |
 
-Dependencies point downward only. The engine (`client`, `redact`, `routes`, `listing`, `reports`, `diff`,
-`resources`, `planner`, `executor`, `store`) imports nothing from Hermes at module load; Hermes imports are lazy
-and guarded, which is why the whole engine is testable with plain `unittest` against
-`tests/fake_librenms.py`.
+Each module imports only modules listed above it, so the import graph has no cycle. The engine (`client`,
+`redact`, `routes`, `listing`, `reports`, `diff`, `resources`, `planner`, `executor`, `store`) imports nothing
+from Hermes at module load; Hermes imports are lazy and guarded, which is why the whole engine is testable
+with plain `unittest` against `tests/fake_librenms.py`.
 
 ## Reports
 
@@ -136,7 +138,8 @@ hundred rows. A report reads what it needs, joins and counts in the plugin, and 
   uses for `entities`, and a port fault without a label from its device's ports. `alert_history`
   reads the rules once and the alert log from the window's start, newest first, in pages (halved
   while an answer is too large to read) up to 2,000 entries, per device for a scope of up to 10;
-  it counts alerts raised, cleared and raised again (`flaps`, per fault) per rule, device or
+  it counts alerts raised, cleared and raised again (`flaps`, per rule, device and what alerted,
+  never per fault: LibreNMS opens a new fault for each raise after a recovery) per rule, device or
   event. Neither view puts any other part of a fault's or entry's `details` (every column of
   every table the rule joins, and the alert's contacts) in a row or a summary. `health` reads
   `resources/sensors` once (it takes no filter) and keeps the scope's sensors that LibreNMS has not
@@ -832,7 +835,7 @@ audit write failure is logged and never fails the operation.
 - Ending or deleting maintenance: API v0 cannot. Maintenance steps are irreversible by design and
   say so in the plan.
 - Alert transports, operations and templates, bills, components, device dependencies, port
-  groups, BGP descriptions, eventlog and syslog injection: not in 0.1.0
+  groups, BGP descriptions, eventlog and syslog injection: never sent
   ([api-coverage.md](api-coverage.md) has the reason for each).
 - Reading stored device configurations (Oxidized). They hold every secret a device has.
 - Bulk routes, async apply or parallel steps.

@@ -943,10 +943,10 @@ class DryRun(ExecutorCase):
 
         def probe(_step):
             def other_thread():
-                taken = self.store.lock.acquire(blocking=False)
+                taken = self.store._lock.acquire(blocking=False)
                 free.append(taken)
                 if taken:
-                    self.store.lock.release()
+                    self.store._lock.release()
 
             thread = threading.Thread(target=other_thread)
             thread.start()

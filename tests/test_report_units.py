@@ -187,7 +187,9 @@ class DeviceMatches(unittest.TestCase):
             "CORE-SW1.example.net": (100, "hostname equals 'core-sw1.example.net'"),
             "core sw1": (100, "sysName equals 'core-sw1'"),  # punctuation aside
             "192.0.2.1": (100, "IP equals '192.0.2.1'"),
-            "core": (92, "hostname starts with 'core-sw1.example.net'"),
+            # what 0.14.1 said as "hostname starts with 'core-sw1.example.net'": the value, never what was typed
+            "core": (92, "hostname 'core-sw1.example.net' starts with 'core'"),
+            "sw1": (85, "hostname 'core-sw1.example.net' contains 'sw1'"),
         }
         for text, (score, why) in cases.items():
             found = self.match(text)
@@ -388,6 +390,22 @@ class SensorReadings(unittest.TestCase):
         ):  # fmt: skip
             self.assertEqual(units.sensor_reading(value, kind), shown, (value, kind))
         self.assertEqual(set(units.SENSOR_UNITS) & {"processor", "mempool", "storage"}, set())
+
+    def test_a_small_current_or_power_takes_a_prefix_as_librenms_shows_it(self):
+        # what 0.14.1 rounded to three decimals: an optic's 6.53 mA bias read 0.007 A and 0.45 mW read 0 W
+        for value, kind, shown in (
+            (0.00653, "current", "6.53 mA"), (0.00045, "power", "450 µW"), (0.5, "power", "500 mW"),
+            (-0.0003, "current", "-300 µA"), (1.23e-7, "current", "123 nA"), (0.0009996, "current", "1 mA"),
+            (0.9996, "power", "1 W"), (0, "current", "0 A"), (0.25, "frequency", "250 mHz"),
+            (0.25, "voltage", "0.25 V"),  # LibreNMS shows a voltage as it is
+        ):  # fmt: skip
+            self.assertEqual(units.sensor_reading(value, kind), shown, (value, kind))
+        self.assertEqual(units.bits_per_second(0.5), "0.5 bit/s")  # rates and speeds take no prefix below 1
+
+    def test_derived_figures_keep_significant_digits(self):
+        for value, kept in ((0.00653 - 0.0015, 0.00503), (-0.0003, -0.0003), (1234.5678, 1234.57), (0.1 + 0.2, 0.3),
+                            (0, 0), (None, None), (-28.75, -28.75)):  # fmt: skip
+            self.assertEqual(units.significant(value), kept, value)
 
     def test_sizes_with_binary_prefixes(self):
         for value, shown in ((4294967296, "4 GiB"), (1761607680, "1.64 GiB"), (1073636966, "1024 MiB"), (512, "512 B"),

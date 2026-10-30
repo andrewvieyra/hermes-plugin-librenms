@@ -202,10 +202,27 @@ class Events(EventCase):
         out = self.report(view="events", window="30m", scope=sw2, filter={"port": 9})
         self.assertEqual(self.ids(out, "port_id"), [31])
         self.assertFalse(any("filter.port_id" in note for note in out["notes"]))
-        # another device's port_id logged nothing in this scope
+        # another device's port_id logged nothing in this scope: the note names the port's device
         out = self.report(view="events", window="24h", scope=sw2, filter={"port_id": 2})
         self.assertEqual(out["count"], 0)
-        self.assertTrue(any(note.startswith("no entry about port_id 2 passed the filter") for note in out["notes"]))
+        self.assertIn(
+            "no entry about port_id 2 passed the filter in the window on the devices in scope: the port is on device "
+            "1, which is not in scope",
+            out["notes"],
+        )
+        # what 0.14.1 said whatever the scope: with the port's own device in scope, nothing was logged, and that is
+        # the answer; for the fleet too, and for an id LibreNMS does not hold
+        for scope, port_id, said in (
+            ({"device": 1}, 2, "no entry about port_id 2 passed the filter in the window: no change of it was logged "
+                               "then"),
+            (None, 2, "no entry about port_id 2 passed the filter in the window: no change of it was logged then"),
+            ({"device": 1}, 999, "no entry about port_id 999 passed the filter in the window: LibreNMS holds no port "
+                                 "with that id"),
+        ):  # fmt: skip
+            out = self.report(view="events", window="7d", scope=scope, filter={"port_id": port_id, "by": "event"})
+            self.assertEqual(out["count"], 0)
+            self.assertIn(said, out["notes"], scope)
+            self.assertFalse(out["partial"])
         for bad in (0, -9, "Gi1/0/48", 9.5, True, None, [9]):
             out = self.report(view="events", window="24h", filter={"port_id": bad})
             self.assertIn("filter.port_id takes a row's port_id, a whole number", out["error"], bad)

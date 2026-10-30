@@ -1,5 +1,5 @@
 name: librenms
-version: 0.14.2
+version: 0.14.3
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.3"
@@ -87,7 +87,7 @@ config_schema:
   plan_retention_days:
     type: int
     default: 90
-    description: "Delete plan files older than this many days (plans being applied or rolled back are kept). 0 keeps plans forever. Checked at most hourly per profile, when a plan is made or listed, on status and on every /librenms or hermes librenms command; for a strict policy run `hermes librenms prune` from cron."
+    description: "Delete plan files older than this many days (plans being applied or rolled back are kept; at most 3650). 0 keeps plans forever. Checked at most hourly per profile, when a plan is made or listed, on status and on every /librenms or hermes librenms command; for a strict policy run `hermes librenms prune` from cron."
   audit_log:
     type: bool
     default: true

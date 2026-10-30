@@ -1,6 +1,7 @@
 """LibreNMS locations: create, update (name and coordinates), delete, and maintenance of every device at one.
 
-What LibreNMS does here (specs/ln-groups.md §2.2, LO-1..LO-6) and how this module copes:
+What LibreNMS does here (``add_location``, ``edit_location``, ``del_location`` and ``maintenance_location`` in
+``includes/html/api_functions.inc.php``) and how this module copes:
 
 - ``GET location/{id}`` (singular) is the read: float coordinates, a bool ``fixed_coordinates`` and a ``timestamp``
   that every save bumps, the geocoder's included, so the timestamp is kept in the state but never compared.
@@ -23,21 +24,29 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import datetime
 from typing import Any, Dict, List, Set, Tuple
 
 from .. import diff, redact
 from ..client import LibreNMSError, is_digits, path
-from .base import Field, PartialWrite, Resource, StepError, _outcome_unknown, settles_at
+from .base import (
+    MAINTENANCE_BEHAVIORS,
+    Field,
+    PartialWrite,
+    Resource,
+    StepError,
+    _outcome_unknown,
+    maintenance_behavior,
+    maintenance_minutes,
+    settles_at,
+    valid_maintenance_start,
+)
 
-BEHAVIORS = {"skip_alerts": 1, "mute_alerts": 2, "run_alerts": 3}
+BEHAVIORS = MAINTENANCE_BEHAVIORS
 MAINTENANCE_KEYS = ("behavior", "duration", "notes", "start", "title")
 MAX_NAME = 255  # locations.location is varchar(255); LibreNMS truncates longer names without a word
 # alert_schedule.title is varchar(255), and the "[hermes:<plan id>] " prefix takes 35 of it
 MAX_TITLE = 200
 _SHOWN_IDS = 10
-_DURATION_RE = re.compile(r"([0-9]{1,4}):([0-5][0-9])")
-_START_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 _ADDED_RE = re.compile(r"#([0-9]+)$")
 
 FIELDS = {
@@ -553,16 +562,15 @@ def _maintenance_errors(data: Dict[str, Any], settings: Any) -> List[str]:
             f"cannot schedule maintenance with field(s) {', '.join(unknown)}; allowed: {', '.join(MAINTENANCE_KEYS)}"
         )
     duration = data.get("duration")
-    parts = _DURATION_RE.fullmatch(duration) if isinstance(duration, str) else None
+    minutes = maintenance_minutes(duration)
     if duration is None:
         errors.append('duration is required: hours:minutes, such as "2:00"')
-    elif parts is None:
+    elif minutes is None:
         errors.append(
             f'duration: expected hours:minutes such as "2:00", got {diff.format_value(duration, 40)}; LibreNMS turns '
             "a value without a colon into a schedule that has already ended"
         )
     else:
-        minutes = int(parts.group(1)) * 60 + int(parts.group(2))
         limit = settings.max_maintenance_hours
         if minutes == 0:
             errors.append("duration must be longer than 0:00")
@@ -572,7 +580,7 @@ def _maintenance_errors(data: Dict[str, Any], settings: Any) -> List[str]:
                 "plugins.entries.librenms.settings.max_maintenance_hours to allow it"
             )
     start = data.get("start")
-    if start is not None and not _valid_start(start):
+    if start is not None and not valid_maintenance_start(start):
         errors.append(
             f'start: expected "YYYY-MM-DD HH:MM:SS" in the LibreNMS server\'s time zone, got '
             f"{diff.format_value(start, 40)}"
@@ -590,26 +598,9 @@ def _maintenance_errors(data: Dict[str, Any], settings: Any) -> List[str]:
     return errors
 
 
-def _valid_start(value: Any) -> bool:
-    """LibreNMS parses ``start`` with ``Y-m-d H:i:s`` exactly and answers 500 for anything else."""
-    if not isinstance(value, str) or not _START_RE.fullmatch(value):
-        return False
-    try:
-        datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return False
-    return True
-
-
 def _behavior_name(value: Any) -> str | None:
     """The behavior's name (``skip_alerts`` when not given); None for a value LibreNMS would silently replace."""
-    if value is None:
-        return "skip_alerts"
-    if isinstance(value, str):
-        return value if value in BEHAVIORS else None
-    if isinstance(value, int) and not isinstance(value, bool):
-        return next((name for name, number in BEHAVIORS.items() if number == value), None)
-    return None
+    return "skip_alerts" if value is None else maintenance_behavior(value)
 
 
 RESOURCE = Location()

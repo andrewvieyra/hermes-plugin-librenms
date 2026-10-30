@@ -1,8 +1,10 @@
-"""Human-facing time rendering. Storage is always UTC; reports show the operator's zone.
+"""Human-facing time rendering, and reading stored stamps back. Storage is always UTC; reports show the operator's
+zone.
 
 The zone is the one Hermes uses, found as Hermes finds it but through its public modules only: ``HERMES_TIMEZONE``,
-then the profile's ``timezone`` setting, else the host's local zone. Nothing here is used for comparisons or
-persistence.
+then the profile's ``timezone`` setting, else the host's local zone. The zone only renders (:func:`local`):
+:func:`parse_utc` reads a stored stamp as UTC whatever it is, and what it returns decides things (the plan-age refusal
+in :mod:`executor`, a write's ``settles_at`` in :mod:`resources.base`), so it must stay zone-free.
 """
 
 from __future__ import annotations

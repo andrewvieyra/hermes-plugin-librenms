@@ -205,7 +205,7 @@ class Ports(PortCase):
         self.assertEqual(ties, sorted(ties, key=lambda row: (row["hostname"], natural_key(row["port"]))))
         errors = self.report(view="ports", sort="errors", limit=500)["rows"]
         self.assertEqual([r["in_errors_per_poll"] for r in errors[:3]], [3, 3, 3])
-        speeds = [row["speed_bps"] for row in self.report(view="ports", sort="speed", limit=500)["rows"]]
+        speeds = [row["interface_speed_bps"] for row in self.report(view="ports", sort="speed", limit=500)["rows"]]
         self.assertEqual(speeds, sorted(speeds))
         for sort, key in (("util_in", "in_pct"), ("util_out", "out_pct")):
             rows = self.report(view="ports", sort=sort, limit=500)["rows"]
@@ -554,6 +554,14 @@ class OperatorQuestions(PortCase):
     def test_discards_on_a_port(self):  # 4, for one port
         summary = self.report(view="port", scope={"device": "core-sw1", "port": "Gi1/0/1"})["summary"]
         self.assertEqual(summary["discards_per_poll"], 42)
+        # what 0.14.1 gave of a port not polled lately: its last discards as current, beside errors it nulled
+        self.fake.touch("ports", 1, poll_time=POLLED - 3300)
+        out = self.report(view="port", scope={"device": "core-sw1", "port": "Gi1/0/1"})
+        summary, [row] = out["summary"], out["rows"]
+        self.assertEqual(
+            (summary["stale"], summary["errors_per_poll"], summary["discards_per_poll"]), (True, None, None)
+        )
+        self.assertEqual(row["out_discards_per_poll"], 42)  # the row keeps the last figure, beside stale
 
     def test_when_did_a_port_last_change_state(self):  # 5
         [row] = self.report(view="ports", scope={"device": "edge-rtr1"}, filter={"text": "Gi0/0/0"})["rows"]
@@ -620,6 +628,34 @@ class OperatorQuestions(PortCase):
         self.fake.touch("ports", 9, port_descr_speed="100M/20M", ifInOctets_rate=2_400_000, ifOutOctets_rate=0)
         [row] = self.report(view="ports", scope={"device": 3}, filter={"util_above_pct": 90})["rows"]
         self.assertEqual((row["speed"], row["in"], row["in_pct"]), ("100M/20M", "19.2 Mbit/s", 96.0))
+        # but the port runs at 1G: it is not one of the ports at 100M (16)
+        self.assertEqual((row["interface_speed"], row["interface_speed_bps"]), ("1G", 10**9))
+        slow = self.report(view="ports", filter={"state": "up", "speed_below_mbps": 1000})
+        self.assertNotIn(9, self.ids(slow))
+
+    def test_the_speed_a_port_runs_at_is_its_interface_s(self):
+        # what 0.14.1 answered from the description: "[1G]" on a 10G uplink read as a port running at 1G. The
+        # circuit stays what utilisation is measured against; the speed filter, sort and free ports compare the
+        # interface, and both rows say it
+        self.fake.touch("ports", 9, ifAlias="Transit: acme [1G]", port_descr_speed="1G", ifSpeed=10**10,
+                        ifInOctets_rate=62_500_000)  # fmt: skip
+        row = self.port_row(self.report(view="ports", scope={"device": 3}), 9)
+        self.assertEqual(
+            (row["speed"], row["speed_bps"], row["speed_source"], row["in_pct"]), ("1G", 10**9, "circuit", 50.0)
+        )
+        self.assertEqual((row["interface_speed"], row["interface_speed_bps"]), ("10G", 10**10))
+        below = self.report(view="ports", filter={"state": "up", "type": "ethernet", "speed_below_mbps": 10000})
+        self.assertNotIn(9, self.ids(below))  # 20: not one of the ports running below 10G
+        self.assertIn(9, self.ids(self.report(view="ports", filter={"speed_below_mbps": 10001})))
+        self.assertEqual(self.ids(self.report(view="ports", sort="speed", limit=500))[-1], 9)  # the fastest
+        [port] = self.report(view="port", scope={"port": 9})["rows"]
+        self.assertEqual((port["speed"], port["interface_speed"]), ("1G", "10G"))
+        # a free port is counted at the speed its interface runs at
+        self.fake.touch("devices", 3, uptime=60 * DAY)
+        self.seed_port(device_id=3, ifIndex=60, ifName="Te1/1/1", ifSpeed=10**10, port_descr_speed="100M",
+                       ifOperStatus="down", ifLastChange=ticks(60 * DAY, 40 * DAY))  # fmt: skip
+        [cap] = self.report(view="capacity", scope={"device": 3})["rows"]
+        self.assertEqual(cap["free_by_speed"], {"10G": 1})
 
     def test_answers_stay_small(self):
         for number in range(400):

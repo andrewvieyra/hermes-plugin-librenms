@@ -55,17 +55,25 @@ write carries ``settles_at``: until then, a rollback that finds it not carried o
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Set, Tuple
 
 from .. import diff, redact, timefmt
-from ..client import LibreNMSError
+from ..client import LibreNMSError, is_digits
 
 INVERSE_KINDS = ("exact", "lossy", "none", "not_needed")
 CRUD = ("create", "update", "delete")
 GATEWAY_STATUSES = (502, 503, 504)
 SETTLE_AFTER = timedelta(minutes=10)
+# Maintenance, as the device, device group and location routes take it (maintenance_device, maintenance_devicegroup,
+# maintenance_location): LibreNMS's MaintenanceBehavior numbers, a duration it splits at ":" and reads with (float),
+# and a start Carbon parses as Y-m-d H:i:s. ASCII digits only: PHP reads a numeric string in ASCII alone, so a
+# fullwidth "２:00" is a window of 0 hours that ends as it starts.
+MAINTENANCE_BEHAVIORS = {"skip_alerts": 1, "mute_alerts": 2, "run_alerts": 3}
+_MAINTENANCE_DURATION = re.compile(r"([0-9]{1,4}):([0-5][0-9])")
+_MAINTENANCE_START = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
 class StepError(Exception):
@@ -114,6 +122,35 @@ def _maybe_committed(exc: BaseException) -> bool:
     or it answered 2xx with something the client could not use."""
     status = getattr(exc, "status", 0) or 0
     return getattr(exc, "kind", "") in ("transport", "server") or 200 <= status < 300
+
+
+def maintenance_minutes(duration: Any) -> int | None:
+    """The minutes of a maintenance ``duration`` written ``H:MM`` in ASCII digits ("2:00", "0:30"), or None for
+    anything else: LibreNMS answers 201 for a duration without a colon, or in other digits, and saves a window that
+    has already ended."""
+    found = _MAINTENANCE_DURATION.fullmatch(duration) if isinstance(duration, str) else None
+    return None if found is None else int(found.group(1)) * 60 + int(found.group(2))
+
+
+def valid_maintenance_start(value: Any) -> bool:
+    """``Y-m-d H:i:s`` in ASCII digits and a real date: anything else makes LibreNMS's Carbon parse fail with a
+    500."""
+    if not isinstance(value, str) or not _MAINTENANCE_START.fullmatch(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return True
+
+
+def maintenance_behavior(value: Any) -> str | None:
+    """A maintenance behaviour's name from its name or its number 1-3 (an int, or ASCII digits), or None for anything
+    else, which LibreNMS would replace silently."""
+    if isinstance(value, str) and value in MAINTENANCE_BEHAVIORS:
+        return value
+    number = int(value) if is_digits(value) else None
+    return next((name for name, code in MAINTENANCE_BEHAVIORS.items() if code == number), None)
 
 
 def settles_at(start: datetime | None = None) -> str:

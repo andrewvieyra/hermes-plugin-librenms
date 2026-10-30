@@ -1,5 +1,5 @@
 """Fixture shared by the suite: a fresh fake LibreNMS and a client on it, a temp HERMES_HOME holding the plan store,
-pinned settings and a temp audit log for every test, and every module-level seam reset afterwards (design §16.9).
+pinned settings and a temp audit log for every test, and every module-level seam reset afterwards.
 Modules are fetched per test (the loader test re-imports the package), and one not written yet is skipped, so the
 earlier test waves share this base."""
 
@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 from .fake_librenms import TOKEN, FakeLibreNMS, seeded
 from .helpers import submodule
 
-# What tearDown calls, in the order design §16.9 gives: (module, function, arguments).
+# What tearDown calls, in order: (module, function, arguments).
 _RESETS = (
     ("settings", "set_settings", (None,)),
     ("settings", "set_context", (None,)),

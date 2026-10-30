@@ -262,7 +262,7 @@ def _sensor(device: Dict[str, Any], sensor: Dict[str, Any], now: datetime) -> _R
     counter = sensor.get("rrd_type") in _COUNTERS
     if counter:  # LibreNMS shows a counter as its rate over the last poll
         previous = units.number(sensor.get("sensor_prev"))
-        value = None if value is None or previous is None else round(max(0.0, value - previous) / POLL_S, 3)
+        value = None if value is None or previous is None else units.significant(max(0.0, value - previous) / POLL_S)
     descr = sensor.get("sensor_descr")
     row: Dict[str, Any] = {**brief(device), "sensor_id": sensor.get("sensor_id"), "class": kind, "descr": descr}
     reading = units.sensor_reading(value, kind)
@@ -299,11 +299,12 @@ def _device_kind(device: Dict[str, Any], kind: str, item: Dict[str, Any], now: d
 
 def _margins(value: float | None, limits: Dict[str, float | None]) -> Dict[str, Any]:
     """How far *value* is from the first limit it would cross going down (the low warning limit, else the low one)
-    and going up (the warning limit, else the critical one), negative past it; the nearer, and which side it is."""
+    and going up (the warning limit, else the critical one), negative past it; the nearer, and which side it is. In
+    the reading's unit, to :data:`units.SIGNIFICANT` significant digits (an optic's bias current is a few mA)."""
     low = limits.get("limit_low_warn") if limits.get("limit_low_warn") is not None else limits.get("limit_low")
     high = limits.get("limit_warn") if limits.get("limit_warn") is not None else limits.get("limit")
-    to_low = None if value is None or low is None else round(value - low, 3)
-    to_high = None if value is None or high is None else round(high - value, 3)
+    to_low = None if value is None or low is None else units.significant(value - low)
+    to_high = None if value is None or high is None else units.significant(high - value)
     known = [(margin, side) for margin, side in ((to_low, "low"), (to_high, "high")) if margin is not None]
     margin, nearest = min(known) if known else (None, None)
     return {"low_margin": to_low, "high_margin": to_high, "margin": margin, "nearest": nearest}

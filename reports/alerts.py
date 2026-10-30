@@ -484,17 +484,35 @@ def _entry_passes(entry: _Entry, filters: Dict[str, Any]) -> bool:
 
 
 def _flaps(entries: List[_Entry]) -> Set[int]:
-    """The ids of the entries that are flaps: an alert raised again for an object (its fault; a rule on a device in
-    releases without faults) that had cleared since it was last raised, within the window."""
-    cleared: Set[Any] = set()
+    """The ids of the entries that are flaps: an alert raised again for what alerted (a rule, on a device, about the
+    entity its details name: a port, a sensor, ...) that had cleared since it was last raised, within the window.
+
+    Keyed by what alerted, not by the fault: LibreNMS reuses a fault only while it is open (``AlertRules``) and the
+    dispatcher closes a recovered one within a minute (``RunAlerts``), so a port that goes down, up and down again
+    over 5-minute polls is logged as two faults. Both an alert and its recovery carry the details; a recovery that
+    names no entity (a rule over a table without labels, an older release) clears every entity of its rule on its
+    device, and an alert that names none is its rule on its device, as in a release without faults."""
+    raised: Dict[Tuple[Any, ...], int] = {}  # what alerted, or a rule on a device -> when it was last raised
+    cleared: Dict[Tuple[Any, ...], int] = {}  # what alerted -> when it last recovered
+    whole: Dict[Tuple[Any, ...], int] = {}  # a rule on a device -> when a recovery naming no entity cleared all of it
+    latest: Dict[Tuple[Any, ...], int] = {}  # a rule on a device -> when anything of it last recovered
     out: Set[int] = set()
-    for entry in sorted(entries, key=lambda entry: (units.server_order(entry.logged), entry.id)):
-        key = ("fault", entry.fault_id) if entry.fault_id not in (None, "", 0) else (entry.rule_id, entry.device_id)
+    ordered = sorted(entries, key=lambda entry: (units.server_order(entry.logged), entry.id))
+    for at, entry in enumerate(ordered):  # *at*: the entry's place in that order, as a clock
+        pair = (entry.rule_id, entry.device_id)
+        key = (*pair, entry.entity) if entry.entity else pair
         if entry.state == "recovered":
-            cleared.add(key)
-        elif entry.state == "alerted" and key in cleared:
-            cleared.discard(key)
-            out.add(entry.id)
+            if entry.entity:
+                cleared[key] = at
+            else:
+                whole[pair] = at
+            latest[pair] = at
+        elif entry.state == "alerted":
+            since = max(cleared.get(key, -1), whole.get(pair, -1)) if entry.entity else latest.get(pair, -1)
+            if since > raised.get(key, -1):
+                out.add(entry.id)
+            raised[key] = at
+            raised[pair] = at  # whatever it named, the rule was raised on the device
     return out
 
 

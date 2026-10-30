@@ -1,5 +1,5 @@
 """The location resource against the fake LibreNMS: validation, planning, apply-time preconditions, verified writes,
-PartialWrite settlement and rollback (design §8.3 location and §16.7; specs/ln-groups.md LO-1..LO-6)."""
+PartialWrite settlement and rollback."""
 
 from __future__ import annotations
 

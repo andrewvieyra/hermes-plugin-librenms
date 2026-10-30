@@ -6,6 +6,73 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-10-30
+
+What the final review of 0.14.1 found in the answers the reports give and in what ships beside the code, each
+confirmed against the 0.14.2 code first (the report findings with the reviewers' probes).
+
+### Fixed
+- A port's speed is what its interface runs at. Rows of views `ports` and `port` add `interface_speed_bps` and
+  `interface_speed` (`ifSpeed`, never a circuit speed), and `filter.speed_below_mbps`, sort `speed` and capacity's
+  `free_by_speed` compare it. `speed` stays what utilisation is measured against, the description's circuit speed
+  first, as LibreNMS's web UI measures it. A 10G uplink described "Transit: acme [1G]" was listed among the ports
+  running below 10G and shown as `1G` with no `10G` anywhere, and a 1G access port on a "[100M/20M]" circuit among the
+  ports at 100M.
+- `alert_history` counts flaps on a real LibreNMS. A flap was an alert raised again under the same `fault_id` after a
+  recovery, but LibreNMS reuses a fault only while it is open (`AlertRules`) and the dispatcher closes a recovered one
+  within a minute (`RunAlerts`), so a port that went down, up and down again over 5-minute polls was logged as two
+  faults and `flaps` was always 0. A flap is now keyed by what alerted: the rule, the device and the entity its
+  details name (a port, a sensor), which both an alert and its recovery carry; a recovery that names none clears the
+  rule on the device, as in a release without faults. The test seeded one fault across re-raises, which LibreNMS never
+  logs.
+- A small sensor reading takes a prefix, as LibreNMS shows it: a 6.53 mA optic bias read `0.007 A` and 0.45 mW
+  read `0 W`; current, power and frequency below 1 now read `6.53 mA` and `450 µW`. Margins and a counter's rate keep
+  6 significant digits rather than 3 decimals, so margins of 0.00503 and 0.00547 A no longer both read 0.005 and one
+  of -0.0003 A past a limit no longer reads -0.0.
+- A fault, log or bill time that reads more than 5 minutes after `data_as_of` has no age (null) and a note says that
+  `librenms_timezone` is not the zone LibreNMS's server writes in. It read `0s`: with `America/New_York` on a server
+  that writes UTC, every alert of the last few hours looked as if it had just started.
+- `find` that matches nothing says that it matches ports by interface name only and that a port or link by its
+  description ("the transit link") is view `ports` with `filter.text`, with the call; the question skill's first step
+  and the find help say so too.
+- A candidate's `why` quotes what the person typed beside what matched: `hostname 'core-sw1.example.net' starts with
+  'core'`, where it said `hostname starts with 'core-sw1.example.net'`.
+- `events` with a `filter.port_id` that kept nothing says why: nothing about the port was logged in the window, the
+  port is on a device outside the scope (named, from one `ports/{id}` read), or LibreNMS holds no such port. It always
+  said the port's device must be in scope, also when it was.
+- View `port`'s `summary.discards_per_poll` is null for a stale port, like `errors_per_poll`; the row keeps the last
+  figure beside `stale`.
+- Maintenance of a device or a device group refuses a duration or start in other digits than ASCII. `"２:00"` passed
+  their `\d` and was applied, while LibreNMS's `(float)"２"` is 0 and the window ended as it began (a location refused
+  it). The three resources now share one duration, start and behaviour check (`resources.base`), and every one takes a
+  behaviour's number as digits ("2"), which only a device did. The fake reads PHP numbers in ASCII only, as PHP does.
+- `plan_retention_days` states its limit (3650) in the manifest, as every other bounded setting does.
+
+### Changed
+- docs/architecture.md: the module table lists every module after what it imports, with its whole Depends-on cell
+  (`version` and the `reports` registry have rows of their own), and says the import graph has no cycle. 0.14.1's
+  Fixed note that listing `digest` above `handlers` made "Dependencies point downward only" hold was wrong: `client`,
+  `planner`, `executor`, `audit`, `sinks`, `reports/context` and the resources imported modules listed below them.
+- CONTRIBUTING: a new report view's filters and sorts go in its `reports/help.py` topic, not the schema, which takes
+  only its name; `make validate` runs without `--install-deps`, as the Makefile does.
+- CHANGELOG: 0.11.1 to 0.14.1 are dated 2026-10-30, the day their commits were made.
+- Removed code nothing used: `LibreNMSClient.route_names`, `PlanStore.delete` and `PlanStore.lock`.
+- Docstrings cite LibreNMS's handlers instead of design notes that never shipped; `timefmt` says `parse_utc` decides
+  things (plan age, `settles_at`) and stays zone-free; the package docstring names every hook's duties.
+  docs/api-coverage.md's "not in 0.1.0" is "never sent".
+- The fake LibreNMS keeps one clock: its ports were polled at 11:55 on its day (they read a year stale), its outages
+  and service change fall in 2026, and a port's change is logged as LibreNMS logs it (`ifOperStatus: up -> down`, at
+  notice), which the events view counts. The `wan-port-down` example conversation quotes that row.
+- CI installs PyYAML in the test and coverage jobs, so the check of the manifest reader against a real YAML parser
+  runs there.
+- README (Configuration, the ports, capacity and health rows), the question skill (Q16, Q18, Q20, units, flaps, time
+  zones, step 1), view help (ports, port, capacity, health, find, units) and docs/architecture.md say so.
+- Tests: the interface speed in rows, filters, sorts and free ports; flaps across faults, beside another port's
+  recovery and without details; prefixed readings and significant margins; null ages and the note under a zone east of
+  the server's, and none for a clock a few minutes apart; the find note and the call it names; the why; each events
+  note; stale discards; the shared maintenance checks, and a fullwidth duration and start refused by all three
+  resources; every module listed after what it imports; every bounded setting stating its limit; the fake's one clock.
+
 ## [0.14.2] - 2026-10-30
 
 What the final review of 0.14.1 found in the secret guard, the digest's delegation block and the report's untrusted
@@ -69,7 +136,7 @@ marker, each confirmed against the 0.14.1 code first (the guard's cost and bypas
   (the A2A plugin's tools, every tool of the kanban toolset) and the agent loop's `pre_tool_call` dispatch blocks
   `kanban_create` and `a2a_call` in a digest run.
 
-## [0.14.1] - 2026-10-29
+## [0.14.1] - 2026-10-30
 
 What the review of 0.14.0 found in the scheduled digest, each confirmed against the 0.14.0 code first.
 
@@ -108,7 +175,7 @@ What the review of 0.14.0 found in the scheduled digest, each confirmed against 
   `pre_tool_call` dispatch the agent loop runs blocks both inside a run bound with `enter_cron_execution` and not
   after it, and a delegated child inside that run reads no cron run.
 
-## [0.14.0] - 2026-10-29
+## [0.14.0] - 2026-10-30
 
 Scheduled network digest (finding hi-automation-blueprint).
 
@@ -158,7 +225,7 @@ Scheduled network digest (finding hi-automation-blueprint).
   Hermes' own `enter_cron_execution` in which the apply is blocked before the approval prompt, the plan refused and
   a report answered.
 
-## [0.13.1] - 2026-10-29
+## [0.13.1] - 2026-10-30
 
 What the review of 0.13.0 found in the terminal secret guard, each confirmed against the 0.13.0 code with
 its reproduction first.
@@ -225,7 +292,7 @@ its reproduction first.
   through wrappers, presence tests in command position passing, the prompt within 300 characters with a long
   command, the sink severities and CEF fields, and linear time on the inputs above.
 
-## [0.13.0] - 2026-10-29
+## [0.13.0] - 2026-10-30
 
 Terminal secret guard and install notes (findings feat-terminal-secret-guard, hi-after-install).
 
@@ -296,7 +363,7 @@ Terminal secret guard and install notes (findings feat-terminal-secret-guard, hi
   request through Hermes' real `PluginManager` (`make test-hermes`); after-install.md's steps, the settings it names
   and nothing the install scan or a model would act on.
 
-## [0.12.1] - 2026-10-29
+## [0.12.1] - 2026-10-30
 
 What the review of 0.12.0 found in its own changes, each confirmed against the 0.12.0 code first.
 
@@ -347,7 +414,7 @@ What the review of 0.12.0 found in its own changes, each confirmed against the 0
   sweep and a partial sweep still records what it removed; `prune` exiting 1 with the reason, and its dry run
   naming the live log, through the CLI.
 
-## [0.12.0] - 2026-10-29
+## [0.12.0] - 2026-10-30
 
 Audit log retention and rotation (finding feat-audit-retention).
 
@@ -413,7 +480,7 @@ Audit log retention and rotation (finding feat-audit-retention).
   and in order, the sweep of a quiet log, dry runs, no files made without a log, retention with the log off and
   with every limit 0; the hourly sweep and `prune` applying it, and the status warning.
 
-## [0.11.1] - 2026-10-29
+## [0.11.1] - 2026-10-30
 
 What the review of 0.11.0 found in its own changes, each confirmed against the 0.11.0 code first.
 

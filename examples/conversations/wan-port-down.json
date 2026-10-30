@@ -34,7 +34,7 @@
       "calls": [
         {"tool": "librenms_report", "arguments": {"view": "events", "scope": {"device": 2}, "window": "30d", "filter": {"port_id": 5, "by": "event"}}}
       ],
-      "answer": "Once more in the last 30 days: `Interface went down: Gi0/0/0` at `2026-10-20T14:05:00Z`."
+      "answer": "Once more in the last 30 days: `ifOperStatus: up -> down` at `2026-10-20T14:05:00Z`."
     },
     {
       "user": "How close is that circuit to its commit?",

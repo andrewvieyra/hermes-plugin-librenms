@@ -603,7 +603,7 @@ class Prune(StoreTestCase):
         child.finish()
         self.assertEqual([r["id"] for r in self.store.prune(90)], [plan_id])
 
-    def test_prune_and_delete_wait_for_the_store_lock(self):
+    def test_prune_waits_for_the_store_lock(self):
         plan_id = self.old("lckd", "applied")
         held, release = threading.Event(), threading.Event()
 
@@ -619,22 +619,10 @@ class Prune(StoreTestCase):
         try:
             with self.assertRaises(TimeoutError):
                 self.store.prune(90)
-            with self.assertRaises(TimeoutError):
-                self.store.delete(plan_id)
         finally:
             release.set()
             thread.join(10)
         self.assertEqual([r["id"] for r in self.store.prune(90)], [plan_id])
-
-    def test_delete_removes_the_plan_and_its_run_file_unless_a_run_holds_it(self):
-        plan_id = self.old("del0", "applied")
-        with self.store.run_lock(plan_id):
-            self.assertFalse(self.store.delete(plan_id))
-        self.assertTrue(self.store.delete(plan_id))
-        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [".lock"])
-        self.assertFalse(self.store.delete(plan_id))
-        self.store.create(_plan("lnp-20261028T190000Z-del1"))
-        self.assertTrue(self.store.delete("lnp-20261028T190000Z-del1"))
 
 
 class RunLock(StoreTestCase):
@@ -744,7 +732,7 @@ class Exclusive(StoreTestCase):
     def test_it_holds_the_in_process_lock_too(self):
         free = []
         with self.store.exclusive(1.0):
-            thread = threading.Thread(target=lambda: free.append(self.store.lock.acquire(blocking=False)))
+            thread = threading.Thread(target=lambda: free.append(self.store._lock.acquire(blocking=False)))
             thread.start()
             thread.join(10)
         self.assertEqual(free, [False])

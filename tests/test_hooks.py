@@ -1,4 +1,4 @@
-"""The hook callbacks (design §16.8, §16.9): the approval directive for librenms_apply / librenms_rollback (dry_run
+"""The hook callbacks: the approval directive for librenms_apply / librenms_rollback (dry_run
 parsing, rule keys per plan, variant and content, the message laid out for what each Hermes surface shows, escaping
 and clipping, exact plan ids, blocking what does not resolve and failing closed), what bind_approval hands the
 handler and the handler's refusal of a call or plan other than the prompt showed, the terminal guard against ``hermes
