@@ -485,6 +485,25 @@ _NEW_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) 
 _warned: set[Tuple[str, ...]] = set()
 
 
+class RetentionError(Exception):
+    """The audit log's retention could not run (its rotation lock could not be had) or ran only in part (the live
+    file could not be rotated, a rotated file could not be removed): :meth:`AuditLog.prune`'s message says why, in
+    words that name no directory, and ``removed`` names the rotated files it removed all the same."""
+
+    def __init__(self, reason: str, removed: List[str] | None = None):
+        super().__init__(reason)
+        self.removed = list(removed or [])
+
+
+class _NoLock(Exception):
+    """Why the rotation lock cannot be used at all (:func:`_open_lock`), in words that name no directory; *key* says
+    it once per process in Hermes' log."""
+
+    def __init__(self, reason: str, key: Tuple[str, ...]):
+        super().__init__(reason)
+        self.key = key
+
+
 @dataclass(frozen=True)
 class Retention:
     """How the event stream is rotated and how long rotated files stay: ``audit_max_mb`` (as bytes),
@@ -536,6 +555,11 @@ def _warn_once(key: Tuple[str, ...], message: str, *args: Any) -> None:
         logger.warning(message, *args)
 
 
+def _why(exc: OSError) -> str:
+    """An ``OSError``'s reason without the path it names (``Permission denied``)."""
+    return exc.strerror or str(exc)
+
+
 def _own_file(path: Path) -> os.stat_result | None:
     """*path*'s ``lstat`` when it names a regular file this account owns and that has no other name, else ``None``
     (also when it is gone). Rotation renames and retention removes only such a file, as :func:`_check_owned` writes
@@ -559,6 +583,11 @@ def rotated_files(path: Path) -> List[Tuple[datetime, str]]:
     """``(time of its newest event, name)`` of each rotated file of the log at *path*, newest first: the names
     ``<name>.<UTC stamp>`` and ``<name>.<UTC stamp>-<n>`` that are regular files this account owns with no other
     name (:func:`_own_file`). Anything else, logrotate's ``audit.jsonl.1`` say, is neither counted nor removed."""
+    return _newest_first(_rotated(path))
+
+
+def _rotated(path: Path) -> List[Tuple[datetime, int, str]]:
+    """:func:`rotated_files` as ``(time of its newest event, n, name)``, in no order."""
     pattern = _rotated_name(path)
     try:
         names = os.listdir(path.parent)
@@ -574,53 +603,71 @@ def rotated_files(path: Path) -> List[Tuple[datetime, str]]:
         except ValueError:  # 20261399T…: not a time, so not one of the plugin's
             continue
         found.append((newest, int(match.group(2) or 1), name))
-    found.sort(reverse=True)
-    return [(newest, name) for newest, _n, name in found]
+    return found
+
+
+def _newest_first(found: List[Tuple[datetime, int, str]]) -> List[Tuple[datetime, str]]:
+    return [(newest, name) for newest, _n, name in sorted(found, reverse=True)]
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _open_lock(lock_path: Path) -> Tuple[Any, int]:
+    """The ``fcntl`` module and a descriptor of the rotation lock file at *lock_path*, created ``0600`` when it is
+    missing and never through a symlink. Raises :class:`_NoLock` when it cannot be used: the platform has no
+    ``flock`` (Windows), the file cannot be opened there (a directory this account cannot create files in), or it
+    is not a regular file this account owns (it is never written to)."""
+    try:
+        import fcntl
+    except ImportError:
+        raise _NoLock("this platform has no flock", ("flock",)) from None
+    try:
+        fd = os.open(lock_path, _LOCK_FLAGS, 0o600)
+    except OSError as exc:
+        raise _NoLock(f"cannot open the lock file ({_why(exc)})", ("open", str(lock_path))) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or (hasattr(os, "geteuid") and info.st_uid != os.geteuid()):
+            raise _NoLock("the lock file is not a regular file this account owns", ("owner", str(lock_path)))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fcntl, fd
 
 
 @contextlib.contextmanager
-def _rotation_lock(path: Path) -> Iterator[bool]:
+def _rotation_lock(path: Path) -> Iterator[str | None]:
     """Hold an exclusive ``flock`` on ``<log>.lock`` for a write or a retention sweep. Every writer of this plugin,
     in every process (the gateway, ``hermes librenms``, a cron run), takes it before it opens the log and keeps it
     until it has written, and a rotation happens only under it, so no rotation falls between a writer's open and
     its write: no event is written to a file after it was rotated, where retention could remove it with the event.
-    Yields ``False`` when it cannot be had: the platform has no ``flock`` (Windows), the lock file cannot be opened
-    there or is not a regular file this account owns (it is never written to), or another process held it past
-    :data:`LOCK_WAIT`. The event is then written without the lock and nothing is rotated."""
-    lock_path = path.with_name(path.name + ".lock")
+    Yields ``None`` once it holds the lock, else why it cannot be had, in words that name no directory: the lock
+    file cannot be used (:func:`_open_lock`) or locked (a file system without locks), or another process held it
+    past :data:`LOCK_WAIT`. The event is then written without the lock and nothing is rotated or removed; Hermes'
+    log says why, with the lock file's path (once per process for a cause that lasts)."""
+    lock_path = _lock_path(path)
     try:
-        import fcntl
-    except ImportError:
-        _warn_once(("flock",), "librenms audit log not rotated: this platform has no flock")
-        yield False
+        fcntl, fd = _open_lock(lock_path)
+    except _NoLock as exc:
+        _warn_once(exc.key, "librenms audit log not rotated or pruned: %s (%s)", exc, lock_path)
+        unusable = str(exc)
+    else:
+        try:
+            yield _lock(fcntl, fd, lock_path)
+        finally:
+            os.close(fd)  # and with it the lock
         return
-    try:
-        fd = os.open(lock_path, _LOCK_FLAGS, 0o600)
-    except OSError as exc:
-        _warn_once(("open", str(lock_path)), "librenms audit log not rotated: cannot open %s (%s)", lock_path, exc)
-        yield False
-        return
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or (hasattr(os, "geteuid") and info.st_uid != os.geteuid()):
-            _warn_once(
-                ("owner", str(lock_path)),
-                "librenms audit log not rotated: %s is not a regular file this account owns",
-                lock_path,
-            )
-            yield False
-            return
-        yield _lock(fcntl, fd, lock_path)
-    finally:
-        os.close(fd)  # and with it the lock
+    yield unusable  # outside the handler, so an error raised under the with is not chained to this one
 
 
-def _lock(fcntl: Any, fd: int, lock_path: Path) -> bool:
+def _lock(fcntl: Any, fd: int, lock_path: Path) -> str | None:
     deadline = time.monotonic() + LOCK_WAIT
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
+            return None
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 logger.warning(
@@ -628,26 +675,70 @@ def _lock(fcntl: Any, fd: int, lock_path: Path) -> bool:
                     "it and the log is not rotated now",
                     LOCK_WAIT,
                 )
-                return False
+                return f"another process held the rotation lock for {LOCK_WAIT:g}s"
             time.sleep(0.01)
         except OSError as exc:  # a file system without locks
-            _warn_once(("flock", str(lock_path)), "librenms audit log not rotated: cannot lock %s (%s)", lock_path, exc)
-            return False
+            reason = f"the lock file cannot be locked ({_why(exc)})"
+            _warn_once(
+                ("flock", str(lock_path)), "librenms audit log not rotated or pruned: %s (%s)", reason, lock_path
+            )
+            return reason
 
 
-def _rotate(path: Path, info: os.stat_result) -> str:
-    """Rename the live log (its *info*) to ``<name>.<UTC time of its newest event>`` and create its successor with
-    the same mode and group, as logrotate's ``create`` does: ``0600`` for a file the plugin made, and a shipper that
-    reads a file the operator made by group keeps reading. Returns the rotated file's name. Called under the
-    rotation lock, so no writer of this plugin has the file open."""
+def retention_problem(path: Path, retention: Retention) -> str | None:
+    """Why the audit log at *path* can be neither rotated nor pruned, in words that name no directory, for status:
+    its rotation lock file cannot be used (:func:`_open_lock`) or locked, or its directory is not one this account
+    can write to (a rotation renames the log there). ``None`` when it can be, when every limit is 0, and before
+    there is a log; a lock another process holds right now is no problem. Opens the lock file as the next event
+    would. Never raises."""
+    try:
+        if not (retention.rotates or retention.keep_files):
+            return None
+        if not os.path.lexists(path) and not rotated_files(path):
+            return None
+        try:
+            fcntl, fd = _open_lock(_lock_path(path))
+        except _NoLock as exc:
+            return str(exc)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:  # a writer or a sweep at work
+            pass
+        except OSError as exc:
+            return f"the lock file cannot be locked ({_why(exc)})"
+        finally:
+            os.close(fd)
+        if not os.access(path.parent, os.W_OK | os.X_OK):
+            return "this account cannot write to the log's directory"
+        return None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _rotation_target(path: Path, info: os.stat_result) -> Tuple[datetime, int, str]:
+    """``(time of its newest event, n, name)`` the live log (its *info*) is rotated to: ``<name>.<UTC time of its
+    newest event>``, with ``-<n>`` past every file of that second, so names keep the order of rotations even after
+    retention removed one."""
     stamp = datetime.fromtimestamp(info.st_mtime, timezone.utc).strftime(_STAMP)
-    # past every file of that second, so names keep the order of rotations even after retention removed one
     pattern, taken = _rotated_name(path), 0
     for name in os.listdir(path.parent):
         match = pattern.fullmatch(name)
         if match is not None and match.group(1) == stamp:
             taken = max(taken, int(match.group(2) or 1))
-    target = path.with_name(f"{path.name}.{stamp}" + (f"-{taken + 1}" if taken else ""))
+    newest = datetime.strptime(stamp, _STAMP).replace(tzinfo=timezone.utc)
+    return newest, taken + 1, f"{path.name}.{stamp}" + (f"-{taken + 1}" if taken else "")
+
+
+def _rotate(path: Path, info: os.stat_result) -> str:
+    """Rename the live log (its *info*) to its :func:`_rotation_target` and create its successor with the same
+    mode and group, as logrotate's ``create`` does: ``0600`` for a file the plugin made, and a shipper that reads a
+    file the operator made by group keeps reading. A group this account is not in cannot be given (only root
+    can), so the successor then gives its own group, the directory's or this account's, no more access than
+    others: what the old file let only its group read is not passed to another group, and Hermes' log says the
+    group lost it (once per process).
+    Returns the rotated file's name. Called under the rotation lock, so no writer of this plugin has the file
+    open."""
+    target = path.with_name(_rotation_target(path, info)[2])
     os.rename(path, target)
     try:
         fd = os.open(path, _NEW_FLAGS, 0o600)
@@ -655,20 +746,35 @@ def _rotate(path: Path, info: os.stat_result) -> str:
         return target.name
     try:
         if hasattr(os, "fchown"):
-            with contextlib.suppress(OSError):  # a group this account is not in
+            with contextlib.suppress(OSError):  # a group this account is not in: checked below
                 os.fchown(fd, -1, info.st_gid)
+        mode = stat.S_IMODE(info.st_mode) & 0o666 | 0o600
+        if os.fstat(fd).st_gid != info.st_gid:  # the directory's group or this account's, which was never granted
+            kept = mode & (0o707 | ((mode & 0o007) << 3))
+            if kept != mode:
+                _warn_once(
+                    ("group", str(path)),
+                    "librenms audit log %s rotated, but this account could not give the new file group %s, so it is "
+                    "%o rather than %o and that group (a log shipper's, say) can no longer read it: make this account "
+                    "a member of the group, or give the directory that group (and on Linux the setgid bit)",
+                    path,
+                    info.st_gid,
+                    kept,
+                    mode,
+                )
+            mode = kept
         if hasattr(os, "fchmod"):
             with contextlib.suppress(OSError):  # it stays 0600 or narrower
-                os.fchmod(fd, stat.S_IMODE(info.st_mode) & 0o666 | 0o600)
+                os.fchmod(fd, mode)
     finally:
         os.close(fd)
     return target.name
 
 
-def _remove(path: Path, names: List[str]) -> List[str]:
+def _remove(path: Path, names: List[str]) -> Tuple[List[str], List[str]]:
     """Unlink the rotated files *names* (in the log's directory) that are still regular files this account owns with
-    one name; returns those removed."""
-    removed = []
+    one name; returns those removed, and why each that could not be was kept (logged; the next sweep tries again)."""
+    removed, kept = [], []
     for name in names:
         rotated = path.with_name(name)
         if _own_file(rotated) is None:
@@ -677,11 +783,12 @@ def _remove(path: Path, names: List[str]) -> List[str]:
             rotated.unlink()
         except FileNotFoundError:  # another process's sweep was first
             continue
-        except OSError as exc:  # a directory with the sticky bit, say: the next sweep tries again
+        except OSError as exc:  # a directory this account cannot write to, say
             logger.warning("librenms audit log retention could not remove %s: %s", rotated, exc)
+            kept.append(f"{name} could not be removed ({_why(exc)})")
             continue
         removed.append(name)
-    return removed
+    return removed, kept
 
 
 def _append(path: Path, data: bytes, retention: Retention, *, rotate: bool = True) -> List[str]:
@@ -692,9 +799,9 @@ def _append(path: Path, data: bytes, retention: Retention, *, rotate: bool = Tru
     if not retention.rotates or (_own_file(path) is None and os.path.lexists(path)):
         _write(path, data)  # nothing to rotate, or nothing this account may write to: _write refuses it and says why
         return []
-    with _rotation_lock(path) as locked:
+    with _rotation_lock(path) as unavailable:
         now, rotated = time.time(), False
-        info = _own_file(path) if locked and rotate else None
+        info = _own_file(path) if rotate and not unavailable else None
         if info is not None and retention.due(info, len(data), now):
             try:
                 _rotate(path, info)
@@ -702,7 +809,7 @@ def _append(path: Path, data: bytes, retention: Retention, *, rotate: bool = Tru
             except OSError as exc:  # a directory this account cannot write to: the file grows on
                 logger.warning("librenms audit log rotation failed (%s): %s", path, exc)
         _write(path, data)
-        return _remove(path, retention.expired(rotated_files(path), now)) if rotated else []
+        return _remove(path, retention.expired(rotated_files(path), now))[0] if rotated else []
 
 
 def _encodable(value: Any) -> Any:
@@ -735,9 +842,10 @@ def _forward(record: Dict[str, Any]) -> None:
 class AuditLog:
     """Append-only JSON Lines writer. Each event is one ``open`` with ``O_APPEND`` and one ``write`` of the whole
     line, so several processes (gateway, ``hermes librenms``) can append to the same file: POSIX places each write
-    whole at the end of the file, and the file is safe to rotate with ``copytruncate``. The file is never opened
-    through a symlink and must be a regular file this account owns, with no other hard link; otherwise the event is
-    not written there (the sinks still get it) and Hermes' log says why.
+    whole at the end of the file. Every event opens the file by name, so rotating it by renaming loses no line;
+    ``copytruncate`` can lose the lines written between its copy and its truncate. The file is never opened through
+    a symlink and must be a regular file this account owns, with no other hard link; otherwise the event is not
+    written there (the sinks still get it) and Hermes' log says why.
 
     *retention* (else ``audit_max_mb``, ``audit_keep_files`` and ``audit_retention_days`` as they are at each event)
     rotates the file by renaming it, under a ``flock`` every writer holds from its open to its write (see
@@ -811,10 +919,17 @@ class AuditLog:
     def prune(self, *, actor: Dict[str, Any] | None = None, dry_run: bool = False) -> List[str]:
         """Retention sweep, for a log nobody writes to for a while: rotate the live file when it is due (it holds an
         earlier UTC day's events, or is past ``audit_max_mb``), then remove the rotated files retention no longer
-        keeps; audited as ``audit_pruned``. Returns their names, or with *dry_run* the rotated files it would remove
-        now (the live file is not rotated). Runs whether or not ``audit_log`` is on: files already written still age
-        out. Creates nothing when there is no log. Never raises."""
+        keeps; audited as ``audit_pruned``. Returns their names. With *dry_run* nothing changes, and it returns what
+        the sweep would remove now: the rotated files, and a live file that is due and would go as soon as it is
+        rotated, as ``<name> (would be rotated to <rotated name> and removed)``; the rotation it would do counts
+        toward ``audit_keep_files`` as well. Runs whether or not ``audit_log`` is on: files already written still
+        age out. Creates nothing when there is no log.
+
+        Raises :class:`RetentionError` when it could not run (the rotation lock could not be had) or ran only in
+        part (the live file could not be rotated, a rotated file could not be removed, the sweep failed), once what
+        it did remove is recorded; Hermes' log has the details. Nothing else raises."""
         removed: List[str] = []
+        problems: List[str] = []
         retention = Retention()
         try:
             retention, path = self.retention, self.path
@@ -823,22 +938,41 @@ class AuditLog:
             with _write_lock:
                 if not os.path.lexists(path) and not rotated_files(path):
                     return []
-                with _rotation_lock(path) as locked:
-                    if not locked:
-                        return []
-                    now = time.time()
-                    info = None if dry_run else _own_file(path)
+                with _rotation_lock(path) as unavailable:
+                    if unavailable:
+                        raise RetentionError(f"retention could not run: {unavailable}")
+                    now, live = time.time(), None
+                    info = _own_file(path)
                     if info is not None and retention.due(info, 0, now):
-                        try:
-                            _rotate(path, info)
-                        except OSError as exc:  # the rotated files still age out
-                            logger.warning("librenms audit log rotation failed (%s): %s", path, exc)
-                    expired = retention.expired(rotated_files(path), now)
-                    removed = expired if dry_run else _remove(path, expired)
+                        if dry_run:  # what the real sweep would rotate counts and ages like any rotated file
+                            live = _rotation_target(path, info)
+                        else:
+                            try:
+                                _rotate(path, info)
+                            except OSError as exc:  # the rotated files still age out
+                                logger.warning("librenms audit log rotation failed (%s): %s", path, exc)
+                                problems.append(f"{path.name} could not be rotated ({_why(exc)})")
+                    found = _rotated(path) + ([live] if live else [])
+                    expired = retention.expired(_newest_first(found), now)
+                    if dry_run:
+                        removed = [
+                            f"{path.name} (would be rotated to {name} and removed)"
+                            if live and name == live[2]
+                            else name
+                            for name in expired
+                        ]
+                    else:
+                        removed, kept = _remove(path, expired)
+                        problems += kept
+        except RetentionError:
+            raise
         except Exception as exc:  # retention is housekeeping and must not affect the call that ran it
             logger.warning("librenms audit log retention sweep failed: %s", exc)
+            problems.append(f"the sweep failed ({type(exc).__name__})")
         if removed and not dry_run:
             self._pruned(removed, retention, actor)
+        if problems:
+            raise RetentionError("retention ran only in part: " + "; ".join(problems), removed)
         return removed
 
     def _pruned(self, removed: List[str], retention: Retention, actor: Dict[str, Any] | None) -> None:

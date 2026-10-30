@@ -62,10 +62,17 @@ lowered to it. The settings are read for every event, like the others.
 (`audit.jsonl.20261029T235959Z`; `-2`, `-3` and so on for more rotations within that second, so
 the names sort in the order the files were rotated) and starts a new file at the log's name with
 the old file's mode and group, as logrotate's `create` does: `0600` for a file the plugin made, and
-a shipper that reads a file you made `0640` for its group keeps reading. The new file is created
-with `O_EXCL` and never through a symlink. Only a log that passes the writer's own checks (a
-regular file this account owns, with no other hard link) is rotated. Log shippers that follow a
-file across a rename (Filebeat, Fluent Bit, Vector, the Splunk forwarder) read every line once.
+a shipper that reads a file you made `0640` for its group keeps reading, as long as the new file can
+have that group. Only root can give a file a group its owner is not in, so either make the account
+Hermes runs as a member of the group, or give the directory that group (`chgrp splunkfwd
+/var/log/hermes`, and on Linux `chmod g+s` so new files take the directory's group, as they always
+do on BSD and macOS). Otherwise the new file has the directory's or the account's group, and what
+the old file let only its group read is not passed on to that group: a `0640` file is followed by a
+`0600` one, the shipper can no longer read it, and Hermes' log says so (once per process). ACLs on
+the old file are not copied. The new file is created with `O_EXCL` and never through a symlink. Only
+a log that passes the writer's own checks (a regular file this account owns, with no other hard
+link) is rotated. Log shippers that follow a file across a rename (Filebeat, Fluent Bit, Vector, the
+Splunk forwarder) read every line once.
 
 **Retention** deletes the rotated files past the newest `audit_keep_files` and those whose newest
 event is older than `audit_retention_days`. It counts and deletes only names of the form above
@@ -73,13 +80,21 @@ that are regular files this account owns with no other hard link; anything else 
 (logrotate's `audit.jsonl.1`, a compressed copy, a symbolic or hard link or another account's file
 planted at such a name) is neither counted nor touched. It runs after each rotation, at most hourly
 per profile when the plugin is used (with the plans' retention: a plan made or listed, status, any
-`/librenms` or `hermes librenms` command), and on `hermes librenms prune` (`--dry-run` lists the
-rotated files it would delete; `--days` concerns plans only). The hourly sweep also rotates a file
-whose events are of an earlier day, so a log nobody writes to ages out too; a profile nobody uses at
-all is swept when someone next does, so for a strict policy run `hermes librenms prune` from cron.
-Each deletion is recorded as an `audit_pruned` event naming the files, in the new file and at the
-sinks. Retention applies whether or not `audit_log` is on: turning the log off writes no new event,
-and what was written still ages out (with no `audit_pruned` record, since the log is off).
+`/librenms` or `hermes librenms` command), and on `hermes librenms prune` (`--days` concerns plans
+only). The hourly sweep also rotates a file whose events are of an earlier day, so a log nobody
+writes to ages out too; a profile nobody uses at all is swept when someone next does, so for a
+strict policy run `hermes librenms prune` from cron. Each deletion is recorded as an
+`audit_pruned` event naming the files, in the new file and at the sinks. Retention applies whether
+or not `audit_log` is on: turning the log off writes no new event, and what was written still ages
+out (with no `audit_pruned` record, since the log is off).
+
+`prune --dry-run` changes nothing and lists what the sweep would delete now: the rotated files, and
+the live file itself when it is due and would be deleted as soon as it is rotated (`audit.jsonl
+(would be rotated to audit.jsonl.20260702T000542Z and removed)`, a log last written more than
+`audit_retention_days` ago); the rotation it would do counts toward `audit_keep_files` as well. When
+retention cannot run, or runs only in part (a file it cannot rotate or delete), `prune` says so
+(`Audit log: retention could not run: cannot open the lock file (Permission denied); see Hermes'
+log.`), never "no rotated file to remove", and exits 1, so a cron job notices.
 
 **Several processes** write the same file. Each writer of the plugin, in every process, takes an
 exclusive `flock` on `<name>.lock` (next to the log; it stays empty) before it opens the log, and
@@ -90,9 +105,14 @@ name would replace the first rotated file): every event is written whole, once, 
 was the log when it was written. A writer waits up to two seconds for the lock; past that the event
 is written without it and the file is not rotated until a later event takes the lock (Hermes' log
 says so). Where the lock cannot be used, because the platform has no `flock` (Windows), the lock
-file cannot be created (a directory this account cannot write to) or is not a regular file this
-account owns, events are written as before and nothing is rotated or deleted; Hermes' log says
-why, once per process. With every limit at `0` no lock is taken.
+file cannot be created (a directory this account cannot write to, such as a root-owned
+`/var/log/hermes` holding a file made for the account) or is not a regular file this account owns,
+events are written as before and nothing is rotated or deleted: Hermes' log says why, once per
+process, `hermes librenms prune` says retention could not run and exits 1, and `/librenms status`
+warns that the audit log can be neither rotated nor pruned (also when the lock works but the
+directory does not let the account rename the log). Give the account a directory it can write to,
+or turn the plugin's rotation off and rotate the file another way (below). With every limit at `0`
+no lock is taken.
 
 On disk the log takes at most about (`audit_keep_files` + 1) × `audit_max_mb`, 1,010 MiB at the
 defaults; a day of ordinary use writes far less than 10 MiB, so it is usually one small file per day

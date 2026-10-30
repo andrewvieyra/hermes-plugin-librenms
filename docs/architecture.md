@@ -729,9 +729,9 @@ for the re-read to settle, not a second request.
   `hermes librenms` is unavailable there; `/librenms` and the tools still work.
 - Hermes exits with the int a CLI handler returns. `hermes librenms` returns 0 when the command did
   what it says, 1 when it failed, was refused, found its plan no longer applicable, could not reach
-  LibreNMS (`status`) or named no single plan, and 2 on a usage error, printing anything but 0 on
-  stderr. Apply and rollback take the handler's `success`, so an apply that failed and was rolled
-  back, or a rollback that left conflicts, is 1.
+  LibreNMS (`status`), named no single plan or could not apply the audit log's retention (`prune`),
+  and 2 on a usage error, printing anything but 0 on stderr. Apply and rollback take the handler's
+  `success`, so an apply that failed and was rolled back, or a rollback that left conflicts, is 1.
 - Status never fails as a whole: when LibreNMS cannot be configured or reached, `connection` says why
   (`ok: false`, the scrubbed error and its kind), `librenms` is null, and the plugin version, write
   mode, settings, settings errors and warnings are still there (the tool result keeps `success:

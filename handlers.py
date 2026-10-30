@@ -408,16 +408,32 @@ def prune_plans(
 
 def prune_audit(*, dry_run: bool = False, actor: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Apply the audit log's retention (``audit_keep_files``, ``audit_retention_days``): rotate the live file when
-    it is due and remove the rotated files past it; audited as ``audit_pruned``. *dry_run* lists the rotated files
-    that would go now."""
+    it is due and remove the rotated files past it; audited as ``audit_pruned``. *dry_run* lists what would go now,
+    the live file included when it would go as soon as it is rotated. ``error`` says why retention could not run or
+    ran only in part (:class:`audit.RetentionError`; ``removed`` still names what it removed), else it is None."""
     log = audit.get_audit_log()
     retention = log.retention
+    error = None
+    try:
+        removed = log.prune(actor=actor, dry_run=dry_run)
+    except audit.RetentionError as exc:
+        removed, error = exc.removed, str(exc)
     return {
         "keep_files": retention.keep_files,
         "max_age_days": retention.max_age_days,
         "dry_run": dry_run,
-        "removed": log.prune(actor=actor, dry_run=dry_run),
+        "removed": removed,
+        "error": error,
     }
+
+
+def _audit_retention_problem() -> str | None:
+    """Why the audit log can be neither rotated nor pruned (:func:`audit.retention_problem`), for status."""
+    try:
+        log = audit.get_audit_log()
+        return audit.retention_problem(log.path, log.retention)
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 def maybe_prune(actor: Dict[str, Any] | Callable[[], Dict[str, Any]]) -> None:
@@ -475,6 +491,13 @@ def status_report(settings: Settings | None = None) -> Dict[str, Any]:
             f"({settings.audit_retention_days}): the audit log is rotated daily while retention is on, so only its "
             f"newest {settings.audit_keep_files} rotated files (about as many days) are kept; raise audit_keep_files "
             "or set it to 0"
+        )
+    problem = _audit_retention_problem()
+    if problem:
+        warnings.append(
+            f"the audit log can be neither rotated nor pruned: {problem}. It grows and keeps every event, users' "
+            "messages included, whatever audit_max_mb, audit_keep_files and audit_retention_days say; Hermes' log "
+            "names the file, and docs/audit.md (Rotation and retention) says what to change"
         )
     warnings += sinks.literal_credential_warnings()
     return {

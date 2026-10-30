@@ -80,6 +80,30 @@ class Query(HandlerCase):
             (settings["audit_max_mb"], settings["audit_keep_files"], settings["audit_retention_days"]), (0, 0, 0)
         )
 
+    def test_status_warns_when_the_audit_log_can_be_neither_rotated_nor_pruned(self):
+        # the log keeps every event, users' messages included, however old: say so where the operator looks
+        self.audit.emit("plan_created", plan_id=None)
+        lock = self.audit_path.with_name("audit.jsonl.lock")
+        lock.unlink()
+        os.symlink(self.audit_path.with_name("elsewhere"), lock)
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
+            (warning,) = self.call("librenms_query", action="status")["warnings"]
+        self.assertTrue(
+            warning.startswith("the audit log can be neither rotated nor pruned: cannot open the lock file ("), warning
+        )
+        self.assertIn(
+            "). It grows and keeps every event, users' messages included, whatever audit_max_mb",
+            warning,
+        )
+        self.assertNotIn(str(self.audit_path.parent), warning)  # the model reads status: no directory
+        self.assertIn(str(lock), logs.output[0])  # Hermes' log has it
+        Settings = self.settings_mod.Settings
+        self.settings_mod.set_settings(Settings(audit_max_mb=0, audit_keep_files=0, audit_retention_days=0))
+        self.assertEqual(self.call("librenms_query", action="status")["warnings"], [])  # nothing to rotate or prune
+        self.settings_mod.set_settings(Settings())
+        lock.unlink()
+        self.assertEqual(self.call("librenms_query", action="status")["warnings"], [])
+
     def test_status_says_only_whether_a_custom_audit_log_path_is_set(self):
         self.settings_mod.set_settings(self.settings_mod.Settings(audit_log_path="/home/alice/logs/audit.jsonl"))
         out = self.call("librenms_query", action="status")
@@ -530,7 +554,23 @@ class Prune(HandlerCase):
         self.call("librenms_plans")
         self.assertFalse(again.exists())
         result = self.handlers.prune_audit(dry_run=True)
-        self.assertEqual(result, {"keep_files": 100, "max_age_days": 30, "dry_run": True, "removed": []})
+        self.assertEqual(result, {"keep_files": 100, "max_age_days": 30, "dry_run": True, "removed": [], "error": None})
+
+    def test_an_audit_log_retention_that_cannot_run_is_an_error_not_nothing_to_remove(self):
+        old = self.rotated_audit(100)
+        lock = self.audit_path.with_name("audit.jsonl.lock")
+        os.symlink(self.audit_path.with_name("elsewhere"), lock)
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"):
+            for dry_run in (True, False):
+                result = self.handlers.prune_audit(dry_run=dry_run)
+                self.assertEqual(result["removed"], [])
+                self.assertTrue(
+                    result["error"].startswith("retention could not run: cannot open the lock file ("), result
+                )
+            self.call("librenms_plans")  # the hourly sweep: housekeeping, it never fails the call
+        self.assertTrue(old.exists())
+        lock.unlink()
+        self.assertEqual(self.handlers.prune_audit()["removed"], [old.name])
 
     def test_a_failing_plan_sweep_still_lets_the_audit_logs_retention_run(self):
         self.settings_mod.set_settings(self.settings_mod.Settings(plan_retention_days=1))

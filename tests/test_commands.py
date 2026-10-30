@@ -7,9 +7,12 @@ import dataclasses
 import io
 import json
 import os
+import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 
@@ -564,6 +567,62 @@ class Prune(CommandCase):
             self.commands.slash_handler("prune").endswith(
                 "\nAudit log: retention is off (audit_keep_files and audit_retention_days are 0)."
             )
+        )
+
+    def test_prune_fails_when_the_audit_logs_retention_cannot_run(self):
+        # a cron job running `hermes librenms prune` must see a policy that is not applied, not "nothing to remove"
+        old = self.rotated_audit(100)
+        os.symlink(self.audit_path.with_name("elsewhere"), self.audit_path.with_name("audit.jsonl.lock"))
+        with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"):
+            for argv in (["prune"], ["prune", "--dry-run"]):
+                text = self.cli(*argv, status=1).strip()
+                self.assertTrue(
+                    text.startswith(
+                        "Nothing older than 90 days.\nAudit log: retention could not run: cannot open the lock file ("
+                    ),
+                    text,
+                )
+                self.assertTrue(text.endswith("); see Hermes' log."), text)
+                self.assertEqual(len(text.splitlines()), 2)  # never also "no rotated file to remove"
+        self.assertTrue(old.exists())
+
+    def test_prune_lists_what_it_removed_and_what_it_could_not(self):
+        stuck, gone = self.rotated_audit(100), self.rotated_audit(200)
+        real_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == stuck:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with (
+            unittest.mock.patch.object(Path, "unlink", unlink),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"),
+        ):
+            text = self.cli("prune", status=1)
+        self.assertEqual(
+            text.strip(),
+            "Nothing older than 90 days.\n"
+            "Audit log: removed 1 rotated file(s) (keeping the newest 100, none older than 90 days):\n"
+            f"  {gone.name}\n"
+            f"Audit log: retention ran only in part: {stuck.name} could not be removed (Permission denied); see "
+            "Hermes' log.",
+        )
+
+    def test_a_dry_run_names_the_live_log_the_sweep_would_rotate_and_remove(self):
+        self.audit.emit("plan_created", plan_id=None)
+        long_ago = time.time() - 120 * 86400
+        os.utime(self.audit_path, (long_ago, long_ago))
+        rotated = "audit.jsonl." + datetime.fromtimestamp(long_ago, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.assertEqual(
+            self.cli("prune", "--dry-run").strip(),
+            "Nothing older than 90 days.\n"
+            "Audit log: would remove 1 rotated file(s) (keeping the newest 100, none older than 90 days):\n"
+            f"  audit.jsonl (would be rotated to {rotated} and removed)",
+        )
+        self.assertIn(
+            f"Audit log: removed 1 rotated file(s) (keeping the newest 100, none older than 90 days):\n  {rotated}",
+            self.cli("prune"),
         )
 
     def test_every_other_command_sweeps_the_audit_log_too(self):

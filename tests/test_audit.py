@@ -91,13 +91,13 @@ if mode == "write":
     for index in range(count):
         log.emit("step_done", plan_id=name, index=index, label="x" * 200)
 elif mode == "hold":
-    with audit._rotation_lock(path) as locked:
-        print("locked" if locked else "not locked", flush=True)
+    with audit._rotation_lock(path) as unavailable:
+        print("not locked" if unavailable else "locked", flush=True)
         sys.stdin.read()
 elif mode == "try":
     audit.LOCK_WAIT = 0.2
-    with audit._rotation_lock(path) as locked:
-        print("locked" if locked else "busy", flush=True)
+    with audit._rotation_lock(path) as unavailable:
+        print("busy" if unavailable else "locked", flush=True)
 """
 
 
@@ -793,6 +793,7 @@ class Rotation(AuditCase):
     def setUp(self):
         super().setUp()
         sinks.set_worker(sinks.SinkWorker([]))
+        audit._warned.clear()  # what is said once per process, said again in each test
 
     def use(self, max_bytes=0, keep_files=0, max_age_days=0):
         retention = audit.Retention(max_bytes, keep_files, max_age_days)
@@ -850,6 +851,41 @@ class Rotation(AuditCase):
         steps = [e["index"] for e in self.lines(rotated) if e["event"] == "step_done"]
         self.assertEqual(steps, [4])  # the newest rotated file is the one kept
         self.assertEqual([e["index"] for e in self.events() if e["event"] == "step_done"], [5])
+
+    def test_a_group_this_account_cannot_give_is_not_passed_to_another(self):
+        # a non-root owner cannot give a file a group it is not in: the operator's chgrp'd log rotates to a file of
+        # the directory's (or this account's) group, which must not get the read bit the old group had
+        self.use(max_bytes=10)
+        audit.emit("plan_created", plan_id="lnp-1")
+        made = self.tmp / "probe"
+        made.touch()
+        groups = [gid for gid in os.getgroups() if gid != made.stat().st_gid]
+        if not groups or not hasattr(os, "fchown"):
+            self.skipTest("needs a second group to give the log")
+        os.chown(self.audit_path, -1, groups[0])
+        os.chmod(self.audit_path, 0o640)
+        refused = PermissionError(1, "Operation not permitted")
+        with (
+            mock.patch.object(audit.os, "fchown", side_effect=refused),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            audit.emit("plan_created", plan_id="lnp-2")
+            audit.emit("plan_created", plan_id="lnp-3")
+        info = self.audit_path.stat()
+        self.assertNotEqual(info.st_gid, groups[0])
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)  # the group read bit is dropped, not handed on
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-3"])
+        self.assertEqual(len(self.rotated()), 2)
+        (warning,) = logs.output  # once per process
+        self.assertIn(f"could not give the new file group {groups[0]}, so it is 600 rather than 640", warning)
+        self.assertIn("make this account a member of the group", warning)
+        # what others could read before, every group may still read: no one gains or loses that
+        audit._warned.clear()
+        os.chown(self.audit_path, -1, groups[0])
+        os.chmod(self.audit_path, 0o644)
+        with mock.patch.object(audit.os, "fchown", side_effect=refused):
+            audit.emit("plan_created", plan_id="lnp-4")
+        self.assertEqual(stat.S_IMODE(self.audit_path.stat().st_mode), 0o644)
 
     def test_the_successor_keeps_the_mode_and_group_of_the_file_it_replaces(self):
         # a log shipper that reads a file the operator made 0640 for its group keeps reading after a rotation
@@ -956,15 +992,90 @@ class Rotation(AuditCase):
         self.assertFalse((self.tmp / "audit.jsonl.lock").exists())  # not even a lock taken for it
 
     def test_a_lock_file_that_cannot_be_used_leaves_the_log_unrotated_but_written(self):
-        self.use(max_bytes=10)
+        retention = self.use(max_bytes=10, keep_files=1, max_age_days=30)
+        old = self.plant(100)
         os.symlink(self.tmp / "elsewhere", self.tmp / "audit.jsonl.lock")
         with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs:
             for index in range(3):
                 audit.emit("plan_created", plan_id=f"lnp-{index}")
+            # a sweep says it could not run, never that there is nothing to remove
+            for dry_run in (True, False):
+                with self.assertRaises(audit.RetentionError) as caught:
+                    audit.get_audit_log().prune(dry_run=dry_run)
+                self.assertTrue(str(caught.exception).startswith("retention could not run: cannot open the lock file"))
+                self.assertEqual(caught.exception.removed, [])
         self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-0", "lnp-1", "lnp-2"])
-        self.assertEqual(self.rotated(), [])
+        self.assertEqual(self.rotated(), [old.name])
         self.assertFalse((self.tmp / "elsewhere").exists())  # never created through the link
-        self.assertEqual(len([line for line in logs.output if "not rotated" in line]), 1)  # said once
+        self.assertEqual(len([line for line in logs.output if "not rotated or pruned" in line]), 1)  # said once
+        self.assertIn(str(self.tmp / "audit.jsonl.lock"), logs.output[0])  # Hermes' log names the file
+        problem = audit.retention_problem(self.audit_path, retention)
+        self.assertTrue(problem.startswith("cannot open the lock file ("), problem)
+        self.assertNotIn(str(self.tmp), problem)  # status reaches the model: no directory
+        (self.tmp / "audit.jsonl.lock").unlink()
+        self.assertIsNone(audit.retention_problem(self.audit_path, retention))
+        self.assertIsNone(audit.retention_problem(self.audit_path, audit.Retention()))  # every limit 0
+        self.assertIsNone(audit.retention_problem(self.tmp / "none" / "audit.jsonl", retention))  # no log yet
+        self.assertEqual(audit.get_audit_log().prune(), [old.name])
+
+    @unittest.skipIf(not hasattr(os, "geteuid"), "no owner to compare")
+    def test_another_accounts_lock_file_stops_the_sweep_and_says_so(self):
+        retention = self.use(keep_files=1, max_age_days=30)
+        old = self.plant(100)
+        audit.emit("plan_created", plan_id="lnp-1")  # the log and its lock file, then seen as another account's
+        with (
+            mock.patch.object(audit.os, "geteuid", return_value=os.geteuid() + 1),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            with self.assertRaises(audit.RetentionError) as caught:
+                audit.get_audit_log().prune()
+            problem = audit.retention_problem(self.audit_path, retention)
+        self.assertEqual(
+            str(caught.exception), "retention could not run: the lock file is not a regular file this account owns"
+        )
+        self.assertEqual(problem, "the lock file is not a regular file this account owns")
+        self.assertTrue(old.exists())
+        self.assertIn("not rotated or pruned: the lock file is not a regular file this account owns", logs.output[0])
+
+    @unittest.skipIf(not hasattr(os, "geteuid") or os.geteuid() == 0, "root writes to a read-only directory")
+    def test_a_directory_this_account_cannot_write_to_stops_retention_and_says_so(self):
+        # audit_log_path in a root-owned /var/log/hermes, the file made for the account: nothing can be rotated
+        retention = self.use(max_age_days=90)
+        self.audit_path.write_text('{"event":"plan_created","actor":{"request":"old message"}}\n', encoding="utf-8")
+        long_ago = time.time() - 200 * 86400
+        os.utime(self.audit_path, (long_ago, long_ago))
+        os.chmod(self.tmp, 0o555)
+        try:
+            with self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"):
+                audit.emit("plan_created", plan_id="lnp-1")
+                with self.assertRaises(audit.RetentionError) as caught:
+                    audit.get_audit_log().prune()
+            self.assertEqual(
+                str(caught.exception), "retention could not run: cannot open the lock file (Permission denied)"
+            )
+            self.assertEqual(
+                audit.retention_problem(self.audit_path, retention), "cannot open the lock file (Permission denied)"
+            )
+            self.assertIn("old message", self.audit_path.read_text(encoding="utf-8"))
+            os.chmod(self.tmp, 0o755)
+            (self.tmp / "audit.jsonl.lock").touch()  # made for it too: the lock is fine, the rename is not
+            os.chmod(self.tmp, 0o555)
+            os.utime(self.audit_path, (long_ago, long_ago))
+            self.assertEqual(
+                audit.retention_problem(self.audit_path, retention), "this account cannot write to the log's directory"
+            )
+            with (
+                self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+                self.assertRaises(audit.RetentionError) as caught,
+            ):
+                audit.get_audit_log().prune()
+            self.assertEqual(
+                str(caught.exception),
+                "retention ran only in part: audit.jsonl could not be rotated (Permission denied)",
+            )
+            self.assertIn("rotation failed", logs.output[0])
+        finally:
+            os.chmod(self.tmp, 0o755)
 
     def test_a_writer_holds_the_lock_from_its_open_to_its_write(self):
         # so a rotation and removal in another process cannot take the file from under an event about to be written
@@ -983,6 +1094,120 @@ class Rotation(AuditCase):
         child = Child(self.audit_path, "try", retention)
         self.assertEqual(child.line(), "locked")  # and let go once written
         child.finish()
+
+    def test_a_sweep_that_cannot_wait_for_the_lock_says_so(self):
+        retention = self.use(keep_files=1, max_age_days=30)
+        old = self.plant(100)
+        holder = Child(self.audit_path, "hold", retention)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.line(), "locked")
+        with (
+            mock.patch.object(audit, "LOCK_WAIT", 0.3),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"),
+            self.assertRaises(audit.RetentionError) as caught,
+        ):
+            audit.get_audit_log().prune()
+        self.assertEqual(
+            str(caught.exception), "retention could not run: another process held the rotation lock for 0.3s"
+        )
+        self.assertTrue(old.exists())
+        self.assertIsNone(audit.retention_problem(self.audit_path, retention))  # busy now is no lasting problem
+        holder.finish()
+        self.assertEqual(audit.get_audit_log().prune(), [old.name])
+
+    def test_without_flock_events_are_written_and_nothing_is_rotated(self):
+        # Windows: no fcntl, so no lock; the log is written as before and a sweep says it cannot run
+        retention = self.use(max_bytes=10, keep_files=1, max_age_days=1)
+        old = self.plant(100)
+        with (
+            mock.patch.dict(sys.modules, {"fcntl": None}),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            for index in range(3):
+                audit.emit("plan_created", plan_id=f"lnp-{index}")
+            with self.assertRaises(audit.RetentionError) as caught:
+                audit.get_audit_log().prune()
+            problem = audit.retention_problem(self.audit_path, retention)
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-0", "lnp-1", "lnp-2"])
+        self.assertEqual(self.rotated(), [old.name])
+        self.assertFalse((self.tmp / "audit.jsonl.lock").exists())
+        self.assertEqual(str(caught.exception), "retention could not run: this platform has no flock")
+        self.assertEqual(problem, "this platform has no flock")
+        self.assertEqual(len(logs.output), 1)  # said once per process
+        self.assertIn("not rotated or pruned: this platform has no flock", logs.output[0])
+
+    def test_a_failed_rotation_is_logged_and_the_event_written(self):
+        self.use(max_bytes=10, keep_files=1)
+        audit.emit("plan_created", plan_id="lnp-0")
+        with (
+            mock.patch.object(audit.os, "rename", side_effect=PermissionError(13, "Permission denied")),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            audit.emit("plan_created", plan_id="lnp-1")
+            audit.emit("plan_created", plan_id="lnp-2")
+            with self.assertRaises(audit.RetentionError) as caught:
+                audit.get_audit_log().prune()
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-0", "lnp-1", "lnp-2"])
+        self.assertEqual(self.rotated(), [])
+        self.assertIn("rotation failed", logs.output[0])
+        self.assertEqual(
+            str(caught.exception), "retention ran only in part: audit.jsonl could not be rotated (Permission denied)"
+        )
+        audit.emit("plan_created", plan_id="lnp-3")  # and once it can, it is
+        self.assertEqual(len(self.rotated()), 1)
+
+    def test_a_failed_removal_keeps_the_file_for_the_next_sweep(self):
+        self.use(keep_files=1, max_age_days=30)
+        old = self.plant(100)
+        audit.emit("plan_created", plan_id="lnp-0")
+        yesterday = time.time() - 86400
+        os.utime(self.audit_path, (yesterday, yesterday))
+        real_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == old:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(Path, "unlink", unlink),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING") as logs,
+        ):
+            audit.emit("plan_created", plan_id="lnp-1")  # rotates yesterday's file, then cannot remove the old one
+            with self.assertRaises(audit.RetentionError) as caught:
+                audit.get_audit_log().prune()
+        self.assertTrue(old.exists())
+        self.assertIn("could not remove", logs.output[0])
+        self.assertEqual(
+            str(caught.exception), f"retention ran only in part: {old.name} could not be removed (Permission denied)"
+        )
+        self.assertEqual([e["plan_id"] for e in self.events()], ["lnp-1"])
+        self.assertEqual(audit.get_audit_log().prune(), [old.name])  # the next sweep removes it
+        self.assertFalse(old.exists())
+        self.assertEqual([(e["event"], e.get("files")) for e in self.events()][1:], [("audit_pruned", [old.name])])
+
+    def test_a_partial_sweep_records_what_it_did_remove(self):
+        recorder = Recorder()
+        sinks.set_worker(sinks.SinkWorker([recorder]))
+        self.use(keep_files=1, max_age_days=30)
+        stuck, gone = self.plant(100), self.plant(200)
+        real_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == stuck:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(Path, "unlink", unlink),
+            self.assertLogs("hermes_plugins.librenms.audit", level="WARNING"),
+            self.assertRaises(audit.RetentionError) as caught,
+        ):
+            audit.get_audit_log().prune(actor={"kind": "operator", "via": "cli"})
+        self.assertEqual(caught.exception.removed, [gone.name])
+        self.assertEqual((stuck.exists(), gone.exists()), (True, False))
+        (pruned,) = self.events()
+        self.assertEqual((pruned["event"], pruned["files"]), ("audit_pruned", [gone.name]))
 
     def test_a_lock_held_too_long_delays_an_event_but_never_drops_it(self):
         retention = self.use(max_bytes=10)
@@ -1034,9 +1259,13 @@ class Rotation(AuditCase):
         quiet = time.time() - 40 * 86400
         os.utime(self.audit_path, (quiet, quiet))
         recent = self.plant(5)
-        self.assertEqual(audit.get_audit_log().prune(dry_run=True), [])  # the live file is not rotated in a dry run
         actor = {"kind": "operator", "via": "cli"}
         expected = f"audit.jsonl.{_stamp(datetime.fromtimestamp(quiet, timezone.utc))}"
+        # a dry run rotates nothing, but names the live file the real sweep rotates and removes at once
+        self.assertEqual(
+            audit.get_audit_log().prune(dry_run=True), [f"audit.jsonl (would be rotated to {expected} and removed)"]
+        )
+        self.assertEqual((self.rotated(), [e["plan_id"] for e in self.events()]), ([recent.name], ["lnp-1"]))
         self.assertEqual(audit.get_audit_log().prune(actor=actor), [expected])
         self.assertEqual(self.rotated(), [recent.name])
         (pruned,) = self.events()  # the log starts again with the record of what was removed
@@ -1049,6 +1278,28 @@ class Rotation(AuditCase):
         self.assertEqual(sorted(audit.get_audit_log().prune(dry_run=True)), sorted([old.name, recent.name]))
         self.assertTrue(old.exists() and recent.exists() and newest.exists())
         self.assertEqual(self.events(), [])
+
+    def test_a_dry_run_counts_the_rotation_the_sweep_would_do(self):
+        # the live file of an earlier day is rotated first, which takes one more rotated file past the count
+        self.use(keep_files=2, max_age_days=90)
+        older, old = self.plant(3), self.plant(2)
+        self.audit_path.write_text('{"event":"plan_created"}\n', encoding="utf-8")
+        yesterday = time.time() - 86400
+        os.utime(self.audit_path, (yesterday, yesterday))
+        self.assertEqual(audit.get_audit_log().prune(dry_run=True), [older.name])
+        self.assertEqual(self.rotated(), [older.name, old.name])  # nothing rotated or removed
+        self.assertEqual(audit.get_audit_log().prune(), [older.name])
+        self.assertEqual(len(self.rotated()), 2)
+        # the rotated name a dry run gives the live file is the one the rotation takes, -2 within a taken second
+        self.use(max_age_days=30)
+        audit.emit("plan_created", plan_id="lnp-1")
+        quiet = time.time() - 40 * 86400
+        os.utime(self.audit_path, (quiet, quiet))
+        taken = self.tmp / f"audit.jsonl.{_stamp(datetime.fromtimestamp(quiet, timezone.utc))}"
+        taken.write_text("{}\n", encoding="utf-8")
+        (listed,) = [entry for entry in audit.get_audit_log().prune(dry_run=True) if entry.startswith("audit.jsonl ")]
+        self.assertEqual(listed, f"audit.jsonl (would be rotated to {taken.name}-2 and removed)")
+        self.assertIn(f"{taken.name}-2", audit.get_audit_log().prune())
 
     def test_a_sweep_without_a_log_creates_nothing(self):
         nowhere = self.tmp / "none" / "audit.jsonl"

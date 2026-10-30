@@ -183,7 +183,9 @@ or whose newest event is older than `audit_retention_days`, are deleted after ea
 same hourly sweep and by `hermes librenms prune`. Every writer, in every process, holds a lock on
 `audit.jsonl.lock` from its open to its write, so no event is lost to a rotation. Keep
 `audit_keep_files` above `audit_retention_days` (status warns otherwise), and set all three to `0`
-when logrotate manages the file. See [docs/audit.md](docs/audit.md#rotation-and-retention).
+when logrotate manages the file. Where the log can be neither rotated nor pruned (an
+`audit_log_path` in a directory the account cannot create files in, say), status warns and `prune`
+fails. See [docs/audit.md](docs/audit.md#rotation-and-retention).
 
 Environment variables (connection only; nothing that relaxes a safeguard is read from the
 environment):
@@ -547,9 +549,10 @@ character do not look the same.
 
 `hermes librenms` exits 0 when the command did what it says, 1 when it failed, was refused or named
 no single plan (an apply that failed, even once rolled back; a rollback that left conflicts; a `check`
-whose plan is no longer applicable; `status` while LibreNMS cannot be reached), and 2 on a usage
-error; anything but 0 is printed on stderr. So `hermes librenms check 7dde && hermes librenms apply
-7dde` stops at a conflict, and a script can tell an apply that went through from one that did not.
+whose plan is no longer applicable; `status` while LibreNMS cannot be reached; a `prune` whose audit
+log retention could not run or ran only in part), and 2 on a usage error; anything but 0 is printed
+on stderr. So `hermes librenms check 7dde && hermes librenms apply 7dde` stops at a conflict, and a
+script can tell an apply that went through from one that did not.
 
 ## Safety model
 

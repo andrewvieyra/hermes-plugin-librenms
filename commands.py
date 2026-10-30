@@ -26,11 +26,12 @@ CLI = "hermes librenms"
 
 # What every subcommand reports beside its text, and `hermes librenms` exits with (Hermes makes an int returned by a
 # CLI handler the exit status): a script running `hermes librenms apply <id> && ...` must see a failed, refused or
-# rolled-back apply. OK also for an empty listing and for prune with nothing to remove.
+# rolled-back apply, and a cron job running `hermes librenms prune` must see an audit log retention that could not
+# run. OK also for an empty listing and for prune with nothing to remove.
 OK, FAILED, USAGE = 0, 1, 2
 EXIT_STATUS = (
-    "Exit status: 0 done; 1 failed, refused, not applicable, LibreNMS unreachable, or no single plan named; "
-    "2 usage error."
+    "Exit status: 0 done; 1 failed, refused, not applicable, LibreNMS unreachable, no single plan named, or the "
+    "audit log's retention could not run; 2 usage error."
 )
 
 _HELP = """\
@@ -161,21 +162,25 @@ def _prune(options: Dict[str, Any], prog: str, actor: Dict[str, Any]) -> Tuple[s
     else:
         lines = [f"{verb} {len(result['removed'])} plan(s) older than {result['max_age_days']} days:"]
         lines += [f"  {one_line(r['id'])}  {one_line(r['status']):<21} {r['age_days']}d" for r in result["removed"]]
-    return "\n".join(lines + _audit_retention(handlers.prune_audit(dry_run=dry, actor=actor), verb)), OK
+    audit_result = handlers.prune_audit(dry_run=dry, actor=actor)
+    return "\n".join(lines + _audit_retention(audit_result, verb)), FAILED if audit_result.get("error") else OK
 
 
 def _audit_retention(result: Dict[str, Any], verb: str) -> List[str]:
-    """What ``prune`` says about the audit log: its retention, and the rotated files it removed (by name; the
-    directory is the log's)."""
+    """What ``prune`` says about the audit log: its retention, the rotated files it removed (by name; the directory
+    is the log's), and why it could not run or ran only in part, which is never "nothing to remove"."""
     keep, days = result["keep_files"], result["max_age_days"]
-    if not keep and not days:
+    if not keep and not days and not result.get("error"):
         return ["Audit log: retention is off (audit_keep_files and audit_retention_days are 0)."]
     policy = [f"the newest {keep}"] if keep else []
     policy += [f"none older than {days} days"] if days else []
-    if not result["removed"]:
-        return [f"Audit log: no rotated file to remove (keeping {', '.join(policy)})."]
-    lines = [f"Audit log: {verb.lower()} {len(result['removed'])} rotated file(s) (keeping {', '.join(policy)}):"]
-    return lines + [f"  {one_line(name)}" for name in result["removed"]]
+    lines = []
+    if result["removed"]:
+        lines = [f"Audit log: {verb.lower()} {len(result['removed'])} rotated file(s) (keeping {', '.join(policy)}):"]
+        lines += [f"  {one_line(name)}" for name in result["removed"]]
+    if result.get("error"):
+        return lines + [f"Audit log: {one_line(result['error'])}; see Hermes' log."]
+    return lines or [f"Audit log: no rotated file to remove (keeping {', '.join(policy)})."]
 
 
 def _resolve(fragment: str, prog: str) -> Tuple[str | None, str]:
@@ -339,7 +344,7 @@ def setup_cli(parser: Any) -> None:
     p.add_argument("--force", action="store_true", help="Override post-apply modification checks")
     p = sub.add_parser("prune", help="Delete plans and rotated audit logs past their retention")
     p.add_argument("--days", type=int, default=None, help="Override plan_retention_days")
-    p.add_argument("--dry-run", action="store_true", help="List what would be removed")
+    p.add_argument("--dry-run", action="store_true", help="List what would be removed; change nothing")
 
 
 def cli_handler(args: Any) -> int:

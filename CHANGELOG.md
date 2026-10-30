@@ -6,6 +6,57 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-29
+
+What the review of 0.12.0 found in its own changes, each confirmed against the 0.12.0 code first.
+
+### Security
+- A group the account cannot give is no longer handed to another group. A rotation creates the new log with the
+  old file's mode and group, but only root can give a file a group its owner is not in: when the operator had made
+  the log `0640` for a shipper's group the Hermes account is not in, the new file got the directory's group (BSD,
+  macOS) or the account's (Linux) and still `0640`, so the read bit went to a group nobody granted it to, while the
+  shipper silently lost the log. The new file now gives whatever group it got no more access than others (a
+  `0640` log is followed by a `0600` one), and Hermes' log says, once per process, which group lost access and what
+  to do: make the account a member of that group, or give the directory that group (with the setgid bit on
+  Linux). docs/audit.md says so where it promised that such a shipper keeps reading; ACLs on the old file are not
+  copied.
+
+### Fixed
+- `prune` and status no longer say the audit log's retention is in force when it cannot run. `AuditLog.prune`
+  returned `[]` when the rotation lock could not be had (no `flock`, a lock file that cannot be created or used, a
+  lock held past two seconds), the same as "nothing to remove", so with `audit_log_path` in a directory the account
+  cannot create files in (a root-owned `/var/log/hermes` holding a file made for it), `hermes librenms prune`
+  printed `Audit log: no rotated file to remove (keeping the newest 100, none older than 90 days).` and exited 0
+  while the log kept 200-day-old events, and status warned of nothing. `AuditLog.prune` now raises
+  `audit.RetentionError` (`removed` names what it did remove) when it could not run or ran only in part (the live
+  file could not be rotated, a rotated file could not be removed); `handlers.prune_audit` returns it as `error`;
+  `prune` prints `Audit log: retention could not run: cannot open the lock file (Permission denied); see Hermes'
+  log.` (or `retention ran only in part: ...`) and exits 1, so a cron job notices; and `/librenms status` warns
+  that the audit log can be neither rotated nor pruned when the lock file cannot be used or the directory does not
+  let the account rename the log (`audit.retention_problem`; the warning names no directory, Hermes' log names the
+  file). The `--help` exit-status line says so.
+- `prune --dry-run` lists the live log that the real run rotates and deletes. The dry run skipped rotation, so for
+  a log last written more than `audit_retention_days` ago (the upgrade case the 0.12.0 notes describe) it listed
+  nothing while the real run rotated the file and deleted it at once, and when a due rotation took one more
+  rotated file past `audit_keep_files` it left that one out too. It now counts the rotation the sweep would do,
+  under the name the rotation would take, and lists the live file as `audit.jsonl (would be rotated to
+  audit.jsonl.<UTC time> and removed)`.
+- The `AuditLog` docstring no longer calls the file safe to rotate with `copytruncate`: renaming loses no line
+  because every event opens the log by name; `copytruncate` can lose the lines written between its copy and its
+  truncate, as docs/audit.md says.
+
+### Changed
+- docs/audit.md (the group rule and what to do, the dry run, `prune` failing and status warning when retention
+  cannot run), SECURITY.md, README and docs/architecture.md (`prune`'s exit status) say so.
+- Tests: a group the account cannot give (a mocked `fchown` refusing it) leaves `0640` as `0600` with one warning,
+  `0644` as is; a dry run names the live log and counts its rotation toward `audit_keep_files`, under the `-2`
+  name within a taken second; prune and status with a planted lock symlink, another account's lock file, a
+  read-only directory (no lock file, then a lock file but no rename) and a lock another process holds (an error,
+  but no status warning); the documented fallbacks, untested so far: without `flock` events are written and
+  nothing is rotated, a failed rename keeps the event and is logged, a failed removal keeps the file for the next
+  sweep and a partial sweep still records what it removed; `prune` exiting 1 with the reason, and its dry run
+  naming the live log, through the CLI.
+
 ## [0.12.0] - 2026-10-29
 
 Audit log retention and rotation (finding feat-audit-retention).
