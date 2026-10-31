@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-10-31
+
+### Changed
+- The README's token section and the setup notes advise giving the token an expiry, so a copy that leaks stops
+  working on its own. From LibreNMS 26.9.0 the API Access page sets one when it creates a token (never by default),
+  changes it later and resets a token; on earlier releases API tokens never expire. The README says what to do when
+  the token expires.
+- A 401 from LibreNMS also says to check that the token has not expired, beside `LIBRENMS_TOKEN` and that its user
+  is enabled.
+
 ## [0.14.6] - 2026-10-30
 
 ### Fixed

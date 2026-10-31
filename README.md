@@ -108,6 +108,15 @@ that does the job:
 | Read only (`write_mode: read_only`) | A dedicated user with the `global-read` role |
 | Plan and apply | A dedicated user with a custom role holding only the permissions the enabled operations need. Never `admin` |
 
+Give the token an expiry too, so a copy that leaks stops working on its own. From LibreNMS 26.9.0
+the API Access page (**Settings → API Settings → API Access**) asks how long a new token lasts (7,
+30, 90 or 365 days, a number of days you choose, or never, the default), changes that later, and
+resets a token, which revokes it and shows a new one once. When the token expires or its user is
+disabled, every call fails with `LibreNMS rejected the token (HTTP 401)`: put a new token in
+`LIBRENMS_TOKEN` in the profile's `.env`, restart Hermes (a new CLI session, or the gateway that
+serves the profile) and check `/librenms status`. On earlier releases API tokens never expire: to
+rotate one, create another and delete the old.
+
 Even a `global-read` token can schedule a rediscovery and write eventlog entries, and a user allowed
 to unmask device credentials receives SNMP communities and passwords in device payloads. The plugin
 refuses the rediscovery route in `librenms_query` (and any path that would reach it through an

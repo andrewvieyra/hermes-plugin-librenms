@@ -6,7 +6,8 @@ depends on five choices:
 1. **A least-privilege token.** `LIBRENMS_TOKEN` carries every right of its LibreNMS user, and
    LibreNMS checks no per-token scope. Give the agent a dedicated user: the `global-read` role for
    `write_mode: read_only`, a custom role with only the permissions the enabled operations need for
-   writes, never `admin`. If the token you entered above is an admin's or your own, replace it in
+   writes, never `admin`. On LibreNMS 26.9.0 or later, give the token an expiry when you create it
+   (the default is never). If the token you entered above is an admin's or your own, replace it in
    this profile's `.env` (`~/.hermes/.env`, or `~/.hermes/profiles/<name>/.env`).
 2. **`operator_only` where others or automation reach the agent.** On a gateway other people talk to,
    and on a profile that runs cron jobs, webhooks or the API server, set `write_mode: operator_only`

@@ -978,7 +978,8 @@ class LibreNMSClient:
         """The error for an answer that says the request failed, classified by status and LibreNMS's message."""
         if status == 401:
             return LibreNMSError(
-                "LibreNMS rejected the token (HTTP 401); check LIBRENMS_TOKEN and that its user is enabled",
+                "LibreNMS rejected the token (HTTP 401); check LIBRENMS_TOKEN, that it has not expired and that "
+                "its user is enabled",
                 status=status,
                 body=self._scrub_obj(body),
                 method=method,

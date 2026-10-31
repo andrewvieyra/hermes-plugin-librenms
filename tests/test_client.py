@@ -1018,7 +1018,9 @@ class Errors(unittest.TestCase):
         exc = self.error(Resp(401, {"message": "Unauthenticated."}))
         self.assertEqual((exc.kind, exc.status), ("auth", 401))
         self.assertEqual(
-            str(exc), "LibreNMS rejected the token (HTTP 401); check LIBRENMS_TOKEN and that its user is enabled"
+            str(exc),
+            "LibreNMS rejected the token (HTTP 401); check LIBRENMS_TOKEN, that it has not expired and that its user "
+            "is enabled",
         )
 
     def test_403_from_the_handler_or_the_middleware(self):
